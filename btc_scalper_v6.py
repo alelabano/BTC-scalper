@@ -810,10 +810,18 @@ def check_signal():
             for _, row in df_15m.iloc[-6:][['close','high','low','volume']].iterrows():
                 ohlcv_str += f"C:{row['close']:.1f} H:{row['high']:.1f} L:{row['low']:.1f} V:{row['volume']:.0f}\n"
 
-            prompt = (f"BTC {direction} {sig_type} signal. Regime:{regime}. "
-                     f"RSI15m:{rsi5:.0f} RSI1h:{rsi1h:.0f} MACD15m:{macd5:.1f} Vol:{vol5:.1f}x BB:{bb5:.2f}\n"
+            mode_ctx = {
+                "RANGE": "Mean reversion scalp. TP fisso 0.4%, SL stretto. Cerchiamo rimbalzo su supporto/resistenza.",
+                "TREND": "Momentum pullback. TP con trailing, R:R 1:2. Cerchiamo continuazione del trend.",
+                "FLASH": "Volatility breakout. TP fulmineo 0.3%, entry/exit veloci. Volume spike o funding estremo.",
+            }.get(scalp_mode, "")
+
+            prompt = (f"BTC {direction} {sig_type} signal. Mode:{scalp_mode}. Regime:{regime}.\n"
+                     f"Strategy: {mode_ctx}\n"
+                     f"RSI15m:{rsi5:.0f} RSI1h:{rsi1h:.0f} ADX1h:{adx1h:.0f} MACD15m:{macd5:.1f} Vol:{vol5:.1f}x BB:{bb5:.2f}\n"
                      f"Last 6 candles 15m:\n{ohlcv_str}"
-                     f"Rate confidence 1-10 and suggest SL adjustment (tight/normal/wide).\n"
+                     f"Rate confidence 1-10. In {scalp_mode} mode, "
+                     f"{'suggest tight SL for quick scalp' if scalp_mode in ('RANGE','FLASH') else 'suggest SL adjustment (tight/normal/wide)'}.\n"
                      f"JSON only: {{\"confidence\":<1-10>,\"sl\":\"tight|normal|wide\",\"note\":\"<5 words>\"}}")
 
             def _ai_call():
@@ -2110,32 +2118,39 @@ def main():
                 if trade_mode == "TREND":
                     check_partial_close(last_pos_state, mid, sz_dec, px_dec)
 
-                # ── AI management ogni 2 minuti ──
-                mgmt_interval = 120
+                # ── AI management — interval adattivo per mode ──
+                trade_mode = last_pos_state.get("scalp_mode", "TREND")
+                mgmt_interval = {"FLASH": 30, "RANGE": 60, "TREND": 120}.get(trade_mode, 120)
                 last_mgmt = last_pos_state.get("last_mgmt", 0)
 
                 if time.time() - last_mgmt >= mgmt_interval:
                     last_pos_state["last_mgmt"] = time.time()
 
-                    # Fetch 5m fresco per contesto
-                    df_mgmt = fetch_df("5m", 1)
+                    # Fetch 15m (coerente col TF di entry)
+                    df_mgmt = fetch_df("15m", 1)
                     mgmt_ctx = ""
                     if df_mgmt is not None and len(df_mgmt) >= 5:
                         rm = df_mgmt.iloc[-1]
                         atr_now = float(rm['atr'])
                         last_pos_state["atr"] = atr_now
                         mgmt_ctx = (f"RSI:{rm['rsi']:.0f} MACD:{rm['macd_hist']:.1f} "
-                                   f"slope:{rm['ema_slope']:.4f} vol:{rm['vol_rel']:.1f}x")
+                                   f"slope:{rm['ema_slope']:.4f} vol:{rm['vol_rel']:.1f}x "
+                                   f"ADX:{rm.get('adx', 20):.0f}")
 
                     try:
                         api_key = os.getenv("ANTHROPIC_API_KEY", "")
                         if api_key and mgmt_ctx:
+                            mode_mgmt = {
+                                "FLASH": "FLASH mode: trade deve chiudere velocemente. EXIT se il momentum rallenta anche minimamente. No TIGHTEN.",
+                                "RANGE": "RANGE mode: TP fisso, il prezzo deve toccare il target. EXIT se il prezzo rompe il range. TIGHTEN se in profitto.",
+                                "TREND": "TREND mode: trailing attivo. TIGHTEN a breakeven se in profitto. EXIT solo se trend invertito chiaramente.",
+                            }.get(trade_mode, "")
+
                             prompt = (
-                                f"BTC {d} position. Entry:{entry:.1f} Current:{mid:.1f} PnL:{pnl_pct:+.1f}%\n"
-                                f"5m indicators: {mgmt_ctx}\n"
-                                f"Regime: {regime}\n"
-                                f"Decide: HOLD (keep SL/TP), TIGHTEN (move SL to breakeven+0.1% if profitable), "
-                                f"or EXIT (close now if momentum reversed).\n"
+                                f"BTC {d} position [{trade_mode}]. Entry:{entry:.1f} Current:{mid:.1f} PnL:{pnl_pct:+.1f}%\n"
+                                f"15m indicators: {mgmt_ctx}\n"
+                                f"Regime: {regime} | {mode_mgmt}\n"
+                                f"Decide: HOLD, TIGHTEN (SL→breakeven+0.1%), EXIT (close now).\n"
                                 f"JSON only: {{\"action\":\"HOLD|TIGHTEN|EXIT\",\"reason\":\"<5 words>\"}}"
                             )
                             resp = requests.post("https://api.anthropic.com/v1/messages",
