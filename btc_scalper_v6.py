@@ -1505,6 +1505,7 @@ def main():
     global _last_trade_ts
     log(f"🚀 BTC SCALPER V6")
     log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x SL:{SL_ATR_MULT}×ATR R:R=1:{TP_RR}")
+
     load_state()
 
     sz_dec, px_dec = get_meta()
@@ -1887,9 +1888,10 @@ def main():
         except Exception as e:
             log(f"Loop error: {e}")
 
-        # Heartbeat: Railway uccide container senza output
-        if cycle % 10 == 0:  # ogni 10 × 30s = 5 min
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ♥ alive cycle={cycle}", flush=True)
+        # Heartbeat OGNI ciclo — Railway killa senza output
+        print(f".", end="", flush=True)
+        if cycle % 10 == 0:
+            print(f" [cycle {cycle}]", flush=True)  # newline ogni 5min
 
         time.sleep(SCAN_INTERVAL)
 
