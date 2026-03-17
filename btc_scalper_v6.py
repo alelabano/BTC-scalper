@@ -419,23 +419,23 @@ def run_backtest():
     for sig_name, sig_dir, sig_cond in [
         # PULLBACK LONG: BULL setup + RSI pullback + MACD accelera
         ("PULLBACK_LONG", "LONG", lambda i: (
-            ema9_1h[i] > ema21_1h[i] and macd1h[i] > 0 and
-            40 <= rsi5[i] <= 58 and macd5[i] > macd5[i-1] and slope5[i] > 0 and vol5[i] >= 0.5
+            ema9_1h[i] > ema21_1h[i] and
+            35 <= rsi5[i] <= 62 and macd5[i] > macd5[i-1] and slope5[i] > 0 and vol5[i] >= 0.3
         )),
         # BREAKOUT LONG: BULL setup + HH + volume
         ("BREAKOUT_LONG", "LONG", lambda i: (
-            ema9_1h[i] > ema21_1h[i] and macd1h[i] > 0 and
-            rsi5[i] > 55 and rsi5[i] < 80 and macd5[i] > 0 and hh[i] > 0 and vol5[i] >= 1.0
+            ema9_1h[i] > ema21_1h[i] and
+            rsi5[i] > 50 and rsi5[i] < 80 and macd5[i] > 0 and hh[i] > 0 and vol5[i] >= 0.8
         )),
         # PULLBACK SHORT: BEAR setup + RSI rally + MACD decelera
         ("PULLBACK_SHORT", "SHORT", lambda i: (
-            ema9_1h[i] < ema21_1h[i] and macd1h[i] < 0 and
-            42 <= rsi5[i] <= 60 and macd5[i] < macd5[i-1] and slope5[i] < 0 and vol5[i] >= 0.5
+            ema9_1h[i] < ema21_1h[i] and
+            38 <= rsi5[i] <= 65 and macd5[i] < macd5[i-1] and slope5[i] < 0 and vol5[i] >= 0.3
         )),
         # BREAKDOWN SHORT: BEAR setup + LL + volume
         ("BREAKDOWN_SHORT", "SHORT", lambda i: (
-            ema9_1h[i] < ema21_1h[i] and macd1h[i] < 0 and
-            rsi5[i] < 45 and rsi5[i] > 20 and macd5[i] < 0 and ll[i] > 0 and vol5[i] >= 1.0
+            ema9_1h[i] < ema21_1h[i] and
+            rsi5[i] < 50 and rsi5[i] > 20 and macd5[i] < 0 and ll[i] > 0 and vol5[i] >= 0.8
         )),
         # REVERSAL LONG: RSI 1h basso + 5m inversione
         ("REVERSAL_LONG", "LONG", lambda i: (
@@ -562,24 +562,18 @@ def check_signal():
 
     if regime == "BULL":
         # ── LONG ONLY ──
-        # Setup 1h: EMA9 > EMA21 (trend up), MACD positivo
-        setup_ok = ema9_1h > ema21_1h and macd1h > 0
+        setup_ok = ema9_1h > ema21_1h  # removed macd1h > 0 requirement
 
         if setup_ok:
-            # Entry A: PULLBACK CONTINUATION
-            # 5m: prezzo ha dippato (RSI 40-55) e sta ripartendo
-            # MACD histogram gira positivo, slope EMA9 positivo
-            pullback = (40 <= rsi5 <= 58 and
-                       macd5 > macd5_prev and  # MACD accelera
-                       slope5 > 0 and           # EMA9 sale
-                       vol5 >= 0.5)             # volume decente
+            pullback = (35 <= rsi5 <= 62 and
+                       macd5 > macd5_prev and
+                       slope5 > 0 and
+                       vol5 >= 0.3)
 
-            # Entry B: BREAKOUT
-            # 5m: nuovo high + volume + MACD forte
-            breakout = (rsi5 > 55 and rsi5 < 80 and
+            breakout = (rsi5 > 50 and rsi5 < 80 and
                        macd5 > 0 and
-                       float(r['hh']) > 0 and    # higher high
-                       vol5 >= 1.0)              # volume spike
+                       float(r['hh']) > 0 and
+                       vol5 >= 0.8)
 
             if pullback and is_signal_allowed("PULLBACK", "LONG"):
                 direction = "LONG"; sig_type = "PULLBACK"
@@ -593,15 +587,15 @@ def check_signal():
         setup_ok = ema9_1h < ema21_1h and macd1h < 0
 
         if setup_ok:
-            pullback = (42 <= rsi5 <= 60 and
+            pullback = (38 <= rsi5 <= 65 and
                        macd5 < macd5_prev and
                        slope5 < 0 and
-                       vol5 >= 0.5)
+                       vol5 >= 0.3)
 
-            breakdown = (rsi5 < 45 and rsi5 > 20 and
+            breakdown = (rsi5 < 50 and rsi5 > 20 and
                         macd5 < 0 and
                         float(r['ll']) > 0 and
-                        vol5 >= 1.0)
+                        vol5 >= 0.8)
 
             if pullback and is_signal_allowed("PULLBACK", "SHORT"):
                 direction = "SHORT"; sig_type = "PULLBACK"
