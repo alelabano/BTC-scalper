@@ -656,16 +656,28 @@ def run_backtest():
     return results
 
 def is_signal_allowed(sig_type, direction):
-    """Check if this signal type has positive edge in backtest."""
+    """
+    Check if signal has edge. Usa pf_recent (ultimi 30 trade) come filtro primario
+    — reagisce al mercato attuale, non a 30gg fa.
+    Blocca solo se ENTRAMBI pf E pf_recent sono sotto soglia.
+    """
     key = f"{sig_type}_{direction}"
     bt = _bt_results.get(key, {})
     pf = bt.get("pf", 0)
+    pf_recent = bt.get("pf_recent", 0)
     n = bt.get("n", 0)
     if n < 10:
         return True  # not enough data — allow
-    if pf < 0.8:
-        return False  # negative edge — block
-    return True
+    # Passa se il recent mostra edge, anche se lo storico è debole
+    if pf_recent >= 0.9:
+        return True
+    # Blocca solo se entrambi sono sotto soglia
+    if pf < 0.7 and pf_recent < 0.7:
+        return False
+    # Edge debole ma non assente
+    if pf >= 0.8 or pf_recent >= 0.8:
+        return True
+    return False
 def check_signal():
     """
     Returns: (direction, signal_type, sl, tp, entry_px, atr, details) or None
