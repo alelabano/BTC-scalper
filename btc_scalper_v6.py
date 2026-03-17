@@ -1870,41 +1870,43 @@ def scanner_thread():
     log("[SCAN] Thread avviato")
     while True:
         try:
-            log("[SCAN] Aggiorno regime...")
             regime = update_regime()
-            log(f"[SCAN] Regime: {regime}")
-            
-            log("[SCAN] Aggiorno funding/OI...")
             update_funding_oi()
             fz = get_funding_z()
             oi = get_oi_change()
-            log(f"[SCAN] FZ:{fz:+.1f} OI:{oi:+.2%}")
-            
-            log("[SCAN] Running backtest...")
             run_backtest()
-            
             mid = get_mid()
             bal = get_balance()
-            log(f"[SCAN] ════════════════════════════════════════")
-            log(f"[SCAN] Regime:{_regime} | BTC ${mid:,.0f} | Bal ${bal:.2f}")
-            
+
+            # ADX per detect mode
+            adx_val = 20
+            try:
+                df_1h = fetch_df("1h", 5)
+                if df_1h is not None and len(df_1h) > 5 and 'adx' in df_1h.columns:
+                    adx_val = float(df_1h.iloc[-1]['adx'])
+            except: pass
+            mode = "FLASH" if abs(fz) > 2.5 else "TREND" if adx_val > 25 and regime in ("BULL","BEAR") else "RANGE"
+
+            log(f"[SCAN] ════════════════════════════════════════════════════")
+            log(f"[SCAN] Regime:{regime} | ADX:{adx_val:.0f} → {mode} mode | BTC ${mid:,.0f}")
+            log(f"[SCAN]  SIGNAL             PF    WR   N    STATUS")
             for k, v in _bt_results.items():
-                pf = v.get("pf", 0)
-                wr = v.get("wr", 0)
-                n = v.get("n", 0)
-                status = "✅" if pf >= 1.0 else "⚠️" if pf >= 0.8 else "❌"
-                log(f"[SCAN]   {status} {k:<20} PF:{pf:.2f} WR:{wr:.0%} N:{n}")
-            log(f"[SCAN] ════════════════════════════════════════")
-            
+                pf = v.get("pf", 0); wr = v.get("wr", 0); n = v.get("n", 0)
+                if pf >= 1.0: status = "✅ active"
+                elif pf >= 0.8: status = "⚠️ edge weak"
+                else: status = "❌ blocked"
+                log(f"[SCAN]  {k:<18} {pf:.2f}  {wr:.0%}  {n:<4} {status}")
+            log(f"[SCAN]  FZ:{fz:+.1f} | OI:{oi:+.2%} | Bal ${bal:.2f}")
+            log(f"[SCAN] ════════════════════════════════════════════════════")
+
         except Exception as e:
             log(f"[SCAN] Error: {e}")
             import traceback; traceback.print_exc()
-        
-        # SEMPRE sblocca gli altri thread, anche se il primo ciclo fallisce
+
         if not _scanner_ready.is_set():
             _scanner_ready.set()
             log("[SCAN] Ready flag set")
-        
+
         for i in range(30):
             time.sleep(10)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [SCAN] wait {(i+1)*10}s/300s", flush=True)
@@ -1923,32 +1925,45 @@ def processor_thread(sz_dec, px_dec):
             pos = get_position()
             mid = get_mid()
             
-            # Se in posizione → gestisci trade
             if pos is not None:
                 entry = pos["entry"]
                 szi = pos["szi"]
                 d = "LONG" if szi > 0 else "SHORT"
                 pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
-                log(f"[PROC] In posizione {d} @ {entry} PnL:{pnl_pct:+.1f}% | BTC ${mid:,.0f}")
+                log(f"[PROC] In {d} @ {entry:.0f} PnL:{pnl_pct:+.2f}% | BTC ${mid:,.0f}")
                 time.sleep(SCAN_INTERVAL)
                 continue
             
-            # Se flat → cerca segnale
             sig = check_signal()
             if sig is None:
-                log(f"[PROC] Nessun segnale | {_regime} | BTC ${mid:,.0f}")
+                # Log perché non c'è segnale — mostra indicatori
+                try:
+                    f_15m = fetch_df("15m", 1)
+                    if f_15m is not None and len(f_15m) >= 5:
+                        r = f_15m.iloc[-1]
+                        rsi = float(r['rsi']); macd = float(r['macd_hist'])
+                        slope = float(r['ema_slope']); adx = float(r.get('adx', 20))
+                        log(f"[PROC] RSI:{rsi:.0f} MACD:{macd:+.1f} slope:{slope:+.4f} ADX:{adx:.0f} → no signal")
+                    else:
+                        log(f"[PROC] no data → no signal")
+                except:
+                    log(f"[PROC] no signal | {_regime} | BTC ${mid:,.0f}")
                 time.sleep(SCAN_INTERVAL)
                 continue
             
             direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode = sig
-            log(f"[PROC] 📡 SIGNAL: {direction} {sig_type} [{scalp_mode}] | {details}")
+            sl_pct = sl_dist / entry_px * 100
+            tp_dist = abs(tp - entry_px)
+            tp_pct = tp_dist / entry_px * 100
+            rr = tp_dist / sl_dist if sl_dist > 0 else 0
+            log(f"[PROC] 📡 {direction} {sig_type} [{scalp_mode}]")
+            log(f"[PROC] [{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} | AI:{details.split('AI:')[1] if 'AI:' in details else '?'}")
+            log(f"[PROC] score:{setup} | {details}")
             
-            # Funding check
             if not is_funding_ok(direction):
                 time.sleep(SCAN_INTERVAL)
                 continue
             
-            # Pubblica segnale per l'executor
             global _current_signal
             _current_signal = {
                 "direction": direction, "sig_type": sig_type,
@@ -1957,7 +1972,7 @@ def processor_thread(sz_dec, px_dec):
                 "regime": sig_regime, "setup": setup,
                 "scalp_mode": scalp_mode, "ts": time.time()
             }
-            log(f"[PROC] Segnale pubblicato per Executor")
+            log(f"[PROC] → BTC [{direction}] [{sig_type}] [{scalp_mode}] published")
             
         except Exception as e:
             log(f"[PROC] Error: {e}")
@@ -2156,7 +2171,8 @@ def executor_thread(sz_dec, px_dec):
                 _current_signal = None  # consuma
                 
                 direction = sig["direction"]
-                log(f"[EXEC] 🎯 Esecuzione: {direction} {sig['sig_type']} [{sig['scalp_mode']}]")
+                sm = sig['scalp_mode']
+                log(f"[EXEC] 🎯 BTC {direction} {sig['sig_type']} [{sm}] @ {sig['entry_px']:,.0f}")
                 
                 success = open_trade(direction, sig["sl"], sig["tp"], sig["entry_px"],
                                      sig["sl_dist"], sz_dec, px_dec, sig["size_mult"], sig["scalp_mode"])
@@ -2175,9 +2191,10 @@ def executor_thread(sz_dec, px_dec):
                             "current_ts": 0, "atr": 0, "open_ts": time.time(), "close_reason": ""
                         })
                         save_pos_state(last_pos_state)
-                        log(f"[EXEC] ✅ Trade aperto e protetto")
+                        sl_pct = sig["sl_dist"]/sig["entry_px"]*100
+                        log(f"[EXEC] ✅ FILLED SL:{sig['sl']:,.0f}({sl_pct:.2f}%) TP:{sig['tp']:,.0f} risk:${RISK_USD}")
                 else:
-                    log(f"[EXEC] ❌ Trade fallito")
+                    log(f"[EXEC] ❌ Trade fallito — cooldown {COOLDOWN_SEC}s")
                     _last_trade_ts = time.time()
             
             # Status log
