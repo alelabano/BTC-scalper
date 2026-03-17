@@ -63,6 +63,7 @@ SLIPPAGE = 0.001               # 0.1% slippage base per limit orders
 GTC_TIMEOUT = 6                # secondi max attesa per GTC fill
 DRIFT_MAX_FAVORABLE = 0.004    # +0.4% max drift nella direzione del trade
 DRIFT_MAX_ADVERSE = 0.008      # -0.8% max drift contro → segnale invalidato
+PENDING_ORDER_TTL = 120        # 2 min max per ordini pendenti
 
 # Circuit breaker
 MAX_DAILY_LOSS = 20.0          # stop dopo -$20 giornaliero
@@ -203,17 +204,26 @@ _params = {}   # adaptive parameters from Redis
 _is_trading = False  # lock: blocca nuovi segnali mentre un ordine è in esecuzione
 
 def load_state():
-    global _trades_today, _consec_losses, _params
+    global _trades_today, _consec_losses, _params, _pending_order
     _trades_today = _rget("btc6:trades") or []
     now = time.time()
-    _trades_today = [t for t in _trades_today if now - t.get("ts", 0) < 86400]
+    _trades_today = [t for t in _trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400]
     _consec_losses = 0
     for t in reversed(_trades_today):
         if t.get("pnl", 0) < 0: _consec_losses += 1
         else: break
-    # Load adaptive params
     _params = _rget("btc6:params") or {}
-    log(f"State: {len(_trades_today)} trades, {_consec_losses} losses, params:{_params}")
+    # Load pending order
+    _pending_order = _rget("btc6:pending") or {}
+    if _pending_order:
+        age = now - _pending_order.get("placed_at", 0)
+        if age > PENDING_ORDER_TTL:
+            log(f"🧹 Pending order scaduto in Redis ({age:.0f}s) — clearing")
+            _pending_order = {}
+            _rset("btc6:pending", None)
+        else:
+            log(f"⏳ Pending order restored from Redis (age:{age:.0f}s)")
+    log(f"State: {len(_trades_today)} trades, {_consec_losses} losses")
 
 def save_trade(pnl, direction, entry, exit_px, sig_type="", sl_dist=0, regime="",
                extra=None):
@@ -1159,7 +1169,95 @@ def cleanup_orphan_orders():
             if oid:
                 cancel_trigger_order(oid)
                 log(f"  Cancelled {o.get('orderType')} #{oid}")
-        tg(f"🧹 Cancellati {len(triggers)} ordini BTC orfani", silent=True)  # fail-open: se non riesce a leggere, prova comunque
+        tg(f"🧹 Cancellati {len(triggers)} ordini BTC orfani", silent=True)
+
+# ================================================================
+# PENDING ORDERS TRACKING (from V4)
+# ================================================================
+_pending_order = {}  # {"oid": X, "placed_at": T, "sl": S, "tp": T, "direction": D, "sl_dist": SD}
+
+def set_pending(oid, sl, tp, direction, sl_dist, sig_type="", regime=""):
+    """Registra un ordine GTC che non è stato fillato immediatamente."""
+    global _pending_order
+    _pending_order = {
+        "oid": oid, "placed_at": time.time(),
+        "sl": sl, "tp": tp, "direction": direction,
+        "sl_dist": sl_dist, "type": sig_type, "regime": regime
+    }
+    _rset("btc6:pending", _pending_order)
+    log(f"⏳ Ordine pendente registrato (oid={oid})")
+
+def clear_pending():
+    global _pending_order
+    _pending_order = {}
+    _rset("btc6:pending", None)
+
+def check_pending(sz_dec, px_dec):
+    """
+    Controlla se un ordine pendente è stato fillato o è scaduto.
+    Se fillato → piazza SL/TP.
+    Se scaduto → cancella.
+    """
+    global _pending_order
+    if not _pending_order:
+        return None
+
+    oid = _pending_order.get("oid")
+    placed_at = _pending_order.get("placed_at", 0)
+    now = time.time()
+
+    # Check se è stato fillato (posizione aperta)
+    pos = get_position()
+    if pos is not None:
+        direction = _pending_order["direction"]
+        is_buy = direction == "LONG"
+        sl_px = rpx(_pending_order["sl"], px_dec)
+        tp_px = rpx(_pending_order["tp"], px_dec)
+        actual_size = rpx(abs(pos["szi"]), sz_dec)
+
+        log(f"✅ Pendente fillato → piazzo SL/TP")
+        try:
+            call(_exchange.order, COIN, not is_buy, actual_size, sl_px,
+                 {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
+                 True, timeout=15)
+            time.sleep(0.3)
+            call(_exchange.order, COIN, not is_buy, actual_size, tp_px,
+                 {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
+                 True, timeout=15)
+
+            entry = pos["entry"]
+            sl_pct = abs(entry - sl_px) / entry * 100
+            tp_pct = abs(tp_px - entry) / entry * 100
+            log(f"🔒 Pendente protetto: SL:{sl_px}({sl_pct:.1f}%) TP:{tp_px}({tp_pct:.1f}%)")
+            tg(f"🔒 <b>BTC</b> pendente fillato | SL:{sl_px} TP:{tp_px}", silent=True)
+        except Exception as e:
+            log(f"🚨 SL/TP pendente error: {e}")
+            tg(f"🚨 BTC pendente SL/TP ERROR!")
+
+        result = _pending_order.copy()
+        result["entry"] = pos["entry"]
+        result["szi"] = pos["szi"]
+        clear_pending()
+        return result
+
+    # Check se è scaduto
+    if now - placed_at > PENDING_ORDER_TTL:
+        log(f"⏱ Pendente scaduto dopo {PENDING_ORDER_TTL}s — cancello")
+        try:
+            if oid:
+                call(_exchange.cancel, COIN, oid, timeout=10)
+                log(f"  Cancelled GTC #{oid}")
+        except Exception as e:
+            log(f"  Cancel error: {e}")
+        tg(f"⏱ BTC ordine scaduto — cancellato", silent=True)
+        clear_pending()
+        return None
+
+    # Ancora in attesa
+    elapsed = int(now - placed_at)
+    if elapsed % 30 == 0:  # log ogni 30s
+        log(f"⏳ Pendente in attesa... {elapsed}s/{PENDING_ORDER_TTL}s")
+    return None
 
 # ================================================================
 # STARTUP RECOVERY
@@ -1698,6 +1796,27 @@ def main():
             pos = get_position()
             mid = get_mid()
             regime = update_regime()
+
+            # ── Check pending orders ──
+            if _pending_order:
+                pend_result = check_pending(sz_dec, px_dec)
+                if pend_result:
+                    # Pending fillato → setup pos_state
+                    last_pos_state = {
+                        "szi": pend_result["szi"], "entry": pend_result["entry"],
+                        "type": pend_result.get("type", ""), "regime": pend_result.get("regime", regime),
+                        "sl_dist": pend_result.get("sl_dist", 0),
+                        "sl_original": pend_result.get("sl", 0),
+                        "tp_original": pend_result.get("tp", 0),
+                        "last_mgmt": 0, "partial_done": False, "partial_close_px": 0,
+                        "partial_pnl_pct": 0, "trailing_active": False,
+                        "trailing_activated_at": 0, "trailing_moves": 0,
+                        "current_ts": 0, "atr": 0, "open_ts": time.time(),
+                        "close_reason": "", "setup_score": 0, "ai_confidence": 7,
+                    }
+                    save_pos_state(last_pos_state)
+                time.sleep(SCAN_INTERVAL)
+                continue
 
             # ── Detect trade close ──
             if last_pos_state is not None and pos is None:
