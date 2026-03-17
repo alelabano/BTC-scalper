@@ -1,0 +1,6 @@
+pandas
+numpy
+scikit-learn
+requests
+eth-account
+hyperliquid-python-sdk
