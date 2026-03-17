@@ -1002,6 +1002,8 @@ def get_effective_lev():
         return LEVERAGE
     except:
         return LEVERAGE
+
+def get_balance():
     try:
         s = call(_info.user_state, _account.address, timeout=10)
         return float(s["marginSummary"]["accountValue"])
