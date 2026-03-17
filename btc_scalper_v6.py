@@ -1907,10 +1907,13 @@ def main():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] cleanup done — entering loop", flush=True)
 
     cycle = 0
+    log("🔄 Entering main loop...")
 
     while True:
         try:
             cycle += 1
+            if cycle <= 3:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] cycle {cycle} start", flush=True)
             pos = get_position()
             mid = get_mid()
             regime = update_regime()
@@ -2283,19 +2286,28 @@ def main():
             log("🛑 Stopped"); break
         except Exception as e:
             log(f"Loop error: {e}")
+            import traceback; traceback.print_exc()
 
         # Heartbeat OGNI ciclo — Railway richiede newline
-        if cycle % 10 == 1:
-            bal = get_balance()
-            daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
-            n_today = len([t for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400])
-            pos_str = f"{'LONG' if pos['szi']>0 else 'SHORT'} @ {pos['entry']}" if pos else "flat"
-            log(f"#{cycle} ${bal:.2f} | {regime} | {pos_str} | "
-                    f"today: {n_today} trades ${daily_pnl:+.2f} | BTC ${mid:,.0f}")
-        else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] #{cycle}", flush=True)
+        try:
+            if cycle % 10 == 1:
+                bal = get_balance()
+                daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
+                n_today = len([t for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400])
+                pos_str = f"{'LONG' if pos['szi']>0 else 'SHORT'} @ {pos['entry']}" if pos else "flat"
+                log(f"#{cycle} ${bal:.2f} | {regime} | {pos_str} | "
+                        f"today: {n_today} trades ${daily_pnl:+.2f} | BTC ${mid:,.0f}")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] #{cycle}", flush=True)
+        except:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] #{cycle} (heartbeat error)", flush=True)
 
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        time.sleep(30)  # keep alive for logs
