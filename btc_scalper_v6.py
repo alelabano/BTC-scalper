@@ -1870,30 +1870,42 @@ def scanner_thread():
     log("[SCAN] Thread avviato")
     while True:
         try:
-            log("[SCAN] Aggiorno regime + backtest...")
-            update_regime()
+            log("[SCAN] Aggiorno regime...")
+            regime = update_regime()
+            log(f"[SCAN] Regime: {regime}")
+            
+            log("[SCAN] Aggiorno funding/OI...")
             update_funding_oi()
-            run_backtest()
             fz = get_funding_z()
             oi = get_oi_change()
+            log(f"[SCAN] FZ:{fz:+.1f} OI:{oi:+.2%}")
+            
+            log("[SCAN] Running backtest...")
+            run_backtest()
+            
             mid = get_mid()
             bal = get_balance()
-            log(f"[SCAN] Regime:{_regime} | FZ:{fz:+.1f} OI:{oi:+.2%} | BTC ${mid:,.0f} | Bal ${bal:.2f}")
+            log(f"[SCAN] ════════════════════════════════════════")
+            log(f"[SCAN] Regime:{_regime} | BTC ${mid:,.0f} | Bal ${bal:.2f}")
             
-            # Mostra segnali disponibili
             for k, v in _bt_results.items():
                 pf = v.get("pf", 0)
                 wr = v.get("wr", 0)
                 n = v.get("n", 0)
                 status = "✅" if pf >= 1.0 else "⚠️" if pf >= 0.8 else "❌"
                 log(f"[SCAN]   {status} {k:<20} PF:{pf:.2f} WR:{wr:.0%} N:{n}")
+            log(f"[SCAN] ════════════════════════════════════════")
             
-            _scanner_ready.set()
         except Exception as e:
             log(f"[SCAN] Error: {e}")
             import traceback; traceback.print_exc()
         
-        for i in range(30):  # 5 min = 30 × 10s, stampa ogni 10s
+        # SEMPRE sblocca gli altri thread, anche se il primo ciclo fallisce
+        if not _scanner_ready.is_set():
+            _scanner_ready.set()
+            log("[SCAN] Ready flag set")
+        
+        for i in range(30):
             time.sleep(10)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [SCAN] wait {(i+1)*10}s/300s", flush=True)
 
