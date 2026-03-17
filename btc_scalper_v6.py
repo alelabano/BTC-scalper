@@ -45,7 +45,7 @@ MAX_POSITIONS = 1              # 1 posizione alla volta
 COOLDOWN_SEC = 180             # 3 min tra trade
 
 # Timing
-SCAN_INTERVAL = 30             # check ogni 30s per entry veloci
+SCAN_INTERVAL = 10             # check ogni 10s (Railway killa se >15s senza output)
 REGIME_INTERVAL = 300          # ricalcola regime ogni 5 min
 
 # SL/TP — Dynamic Scalping Modes
