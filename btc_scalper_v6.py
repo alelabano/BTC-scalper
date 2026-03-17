@@ -1678,7 +1678,7 @@ def main():
 
             # ── Status log ──
             # ── Status log ──
-            if cycle % 40 == 1:
+            if cycle % 10 == 1:  # ogni 10 × 30s = 5 min
                 bal = get_balance()
                 daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t["ts"]<86400)
                 n_today = len([t for t in _trades_today if time.time()-t["ts"]<86400])
@@ -1886,6 +1886,10 @@ def main():
             log("🛑 Stopped"); break
         except Exception as e:
             log(f"Loop error: {e}")
+
+        # Heartbeat: Railway uccide container senza output
+        if cycle % 10 == 0:  # ogni 10 × 30s = 5 min
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ♥ alive cycle={cycle}", flush=True)
 
         time.sleep(SCAN_INTERVAL)
 
