@@ -1873,6 +1873,15 @@ def main():
     sz_dec, px_dec = get_meta()
     log(f"Meta: szDec={sz_dec} pxDec={px_dec}")
 
+    # Watchdog thread — stampa ogni 5s per tenere Railway alive
+    # (come scanner+processor nel V4 stampavano costantemente)
+    def _watchdog():
+        while True:
+            time.sleep(5)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ♥", flush=True)
+    threading.Thread(target=_watchdog, name="Watchdog", daemon=True).start()
+    log("♥ Watchdog started")
+
     # Run backtest all'avvio
     run_backtest()
     print(f"[{datetime.now().strftime('%H:%M:%S')}] backtest done", flush=True)
