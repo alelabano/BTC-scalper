@@ -1860,448 +1860,348 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
        f"Size:{actual_size} | Lev:{actual_lev}x | Risk:${RISK_USD*size_mult:.1f}")
     return True
 
+
 # ================================================================
-# MAIN LOOP
+# THREAD A — SCANNER (regime + backtest ogni 5 min)
 # ================================================================
-def main():
-    global _last_trade_ts
-    log(f"🚀 BTC SCALPER V6")
-    log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x Modes:RANGE/TREND/FLASH")
+_scanner_ready = threading.Event()
 
-    load_state()
+def scanner_thread():
+    log("[SCAN] Thread avviato")
+    while True:
+        try:
+            log("[SCAN] Aggiorno regime + backtest...")
+            update_regime()
+            update_funding_oi()
+            run_backtest()
+            fz = get_funding_z()
+            oi = get_oi_change()
+            mid = get_mid()
+            bal = get_balance()
+            log(f"[SCAN] Regime:{_regime} | FZ:{fz:+.1f} OI:{oi:+.2%} | BTC ${mid:,.0f} | Bal ${bal:.2f}")
+            
+            # Mostra segnali disponibili
+            for k, v in _bt_results.items():
+                pf = v.get("pf", 0)
+                wr = v.get("wr", 0)
+                n = v.get("n", 0)
+                status = "✅" if pf >= 1.0 else "⚠️" if pf >= 0.8 else "❌"
+                log(f"[SCAN]   {status} {k:<20} PF:{pf:.2f} WR:{wr:.0%} N:{n}")
+            
+            _scanner_ready.set()
+        except Exception as e:
+            log(f"[SCAN] Error: {e}")
+            import traceback; traceback.print_exc()
+        
+        for i in range(30):  # 5 min = 30 × 10s, stampa ogni 10s
+            time.sleep(10)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [SCAN] wait {(i+1)*10}s/300s", flush=True)
 
-    sz_dec, px_dec = get_meta()
-    log(f"Meta: szDec={sz_dec} pxDec={px_dec}")
 
-    # Watchdog thread — stampa ogni 5s per tenere Railway alive
-    # (come scanner+processor nel V4 stampavano costantemente)
-    def _watchdog():
-        while True:
-            time.sleep(5)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ♥", flush=True)
-    threading.Thread(target=_watchdog, name="Watchdog", daemon=True).start()
-    log("♥ Watchdog started")
+# ================================================================
+# THREAD B — PROCESSOR (check signal ogni 10s)
+# ================================================================
+def processor_thread(sz_dec, px_dec):
+    log("[PROC] Thread avviato — attendo Scanner...")
+    _scanner_ready.wait()
+    log("[PROC] Scanner pronto — avvio")
+    
+    while True:
+        try:
+            pos = get_position()
+            mid = get_mid()
+            
+            # Se in posizione → gestisci trade
+            if pos is not None:
+                entry = pos["entry"]
+                szi = pos["szi"]
+                d = "LONG" if szi > 0 else "SHORT"
+                pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
+                log(f"[PROC] In posizione {d} @ {entry} PnL:{pnl_pct:+.1f}% | BTC ${mid:,.0f}")
+                time.sleep(SCAN_INTERVAL)
+                continue
+            
+            # Se flat → cerca segnale
+            sig = check_signal()
+            if sig is None:
+                log(f"[PROC] Nessun segnale | {_regime} | BTC ${mid:,.0f}")
+                time.sleep(SCAN_INTERVAL)
+                continue
+            
+            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode = sig
+            log(f"[PROC] 📡 SIGNAL: {direction} {sig_type} [{scalp_mode}] | {details}")
+            
+            # Funding check
+            if not is_funding_ok(direction):
+                time.sleep(SCAN_INTERVAL)
+                continue
+            
+            # Pubblica segnale per l'executor
+            global _current_signal
+            _current_signal = {
+                "direction": direction, "sig_type": sig_type,
+                "sl": sl, "tp": tp, "entry_px": entry_px,
+                "sl_dist": sl_dist, "size_mult": size_mult,
+                "regime": sig_regime, "setup": setup,
+                "scalp_mode": scalp_mode, "ts": time.time()
+            }
+            log(f"[PROC] Segnale pubblicato per Executor")
+            
+        except Exception as e:
+            log(f"[PROC] Error: {e}")
+            import traceback; traceback.print_exc()
+        
+        time.sleep(SCAN_INTERVAL)
 
-    # Run backtest all'avvio
-    run_backtest()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] backtest done", flush=True)
 
-    # Recovery: load pos_state da Redis o detect posizione orfana
+# ================================================================
+# THREAD C — EXECUTOR (esegue trade, gestisce posizione)
+# ================================================================
+_current_signal = None
+
+def executor_thread(sz_dec, px_dec):
+    global _current_signal, _last_trade_ts
+    log("[EXEC] Thread avviato — attendo Scanner...")
+    _scanner_ready.wait()
+    log("[EXEC] Pronto")
+    
     last_pos_state = load_pos_state()
     if last_pos_state:
-        pos_check = get_position()
-        if pos_check:
-            log(f"🔍 Restored pos_state from Redis: {last_pos_state.get('type','?')} "
-                f"entry:{last_pos_state.get('entry',0)} trailing:{last_pos_state.get('trailing_active',False)}")
+        p = get_position()
+        if p:
+            log(f"[EXEC] 🔍 Posizione da Redis: {last_pos_state.get('type','?')} @ {last_pos_state.get('entry',0)}")
         else:
-            log(f"🔍 Redis had pos_state but no position — clearing")
             last_pos_state = None
             save_pos_state(None)
-    else:
+    if not last_pos_state:
         last_pos_state = recover_position(sz_dec, px_dec)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] recovery done", flush=True)
-
-    # Cleanup ordini orfani
+    
     cleanup_orphan_orders()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] cleanup done — entering loop", flush=True)
-
     cycle = 0
-    log("🔄 Entering main loop...")
-
+    
     while True:
         try:
             cycle += 1
-            if cycle <= 3:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] cycle {cycle} start", flush=True)
             pos = get_position()
             mid = get_mid()
-            regime = update_regime()
-
-            # ── Check pending orders ──
-            if _pending_order:
-                pend_result = check_pending(sz_dec, px_dec)
-                if pend_result:
-                    # Pending fillato → setup pos_state
-                    last_pos_state = {
-                        "szi": pend_result["szi"], "entry": pend_result["entry"],
-                        "type": pend_result.get("type", ""), "regime": pend_result.get("regime", regime),
-                        "sl_dist": pend_result.get("sl_dist", 0),
-                        "sl_original": pend_result.get("sl", 0),
-                        "tp_original": pend_result.get("tp", 0),
-                        "last_mgmt": 0, "partial_done": False, "partial_close_px": 0,
-                        "partial_pnl_pct": 0, "trailing_active": False,
-                        "trailing_activated_at": 0, "trailing_moves": 0,
-                        "current_ts": 0, "atr": 0, "open_ts": time.time(),
-                        "close_reason": "", "setup_score": 0, "ai_confidence": 7,
-                    }
-                    save_pos_state(last_pos_state)
-                time.sleep(SCAN_INTERVAL)
-                continue
-
+            bal = get_balance()
+            
             # ── Detect trade close ──
             if last_pos_state is not None and pos is None:
                 entry = last_pos_state["entry"]
                 szi = last_pos_state["szi"]
                 d = "LONG" if szi > 0 else "SHORT"
                 size_abs = abs(szi)
-
-                # Real exit price from fills API (precise)
+                
                 open_ts = last_pos_state.get("open_ts", time.time() - 3600)
                 real_exit, real_pnl = compute_real_exit(d, entry, open_ts)
-
+                
                 if real_exit > 0 and real_pnl != 0:
                     exit_px = real_exit
                     pnl_pct = real_pnl * 100
                     pnl_usd = real_pnl * size_abs * entry
                 else:
-                    # Fallback: mid price
                     exit_px = mid
                     pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
                     pnl_usd = pnl_pct/100 * size_abs * entry
-
-                # Determine close reason
+                
+                # Close reason
                 close_reason = last_pos_state.get("close_reason", "")
                 if not close_reason:
-                    # Deduce from PnL and SL/TP distances
-                    sl_dist = last_pos_state.get("sl_dist", 0)
-                    if sl_dist > 0:
-                        tp_dist = sl_dist * TP_RR
+                    sl_d = last_pos_state.get("sl_dist", 0)
+                    if sl_d > 0:
+                        tp_d = sl_d * TP_RR
                         if d == "LONG":
-                            hit_sl = mid <= entry - sl_dist * 0.9
-                            hit_tp = mid >= entry + tp_dist * 0.9
+                            hit_sl = mid <= entry - sl_d * 0.9
+                            hit_tp = mid >= entry + tp_d * 0.9
                         else:
-                            hit_sl = mid >= entry + sl_dist * 0.9
-                            hit_tp = mid <= entry - tp_dist * 0.9
-
-                        if hit_tp:
-                            close_reason = "🎯 Take Profit"
-                        elif hit_sl:
-                            close_reason = "🛑 Stop Loss"
-                        elif last_pos_state.get("trailing_active"):
-                            close_reason = "📈 Trailing Stop"
-                        elif last_pos_state.get("partial_done"):
-                            close_reason = "💰 Partial + Trail"
-                        else:
-                            close_reason = "❓ Unknown"
-                    else:
-                        close_reason = "❓ Unknown"
-
+                            hit_sl = mid >= entry + sl_d * 0.9
+                            hit_tp = mid <= entry - tp_d * 0.9
+                        if hit_tp: close_reason = "🎯 Take Profit"
+                        elif hit_sl: close_reason = "🛑 Stop Loss"
+                        elif last_pos_state.get("trailing_active"): close_reason = "📈 Trailing Stop"
+                        else: close_reason = "❓ Unknown"
+                
                 emoji = "✅" if pnl_usd > 0 else "❌"
                 sig_type = last_pos_state.get("type", "?")
                 trade_regime = last_pos_state.get("regime", "?")
-
-                # Durata trade
-                open_ts = last_pos_state.get("open_ts", time.time())
                 duration_s = time.time() - open_ts
-                if duration_s < 60:
-                    dur_str = f"{duration_s:.0f}s"
-                elif duration_s < 3600:
-                    dur_str = f"{duration_s/60:.0f}min"
-                else:
-                    dur_str = f"{duration_s/3600:.1f}h"
-
-                # Daily stats
-                now = time.time()
-                daily_trades = [t for t in _trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400]
-                daily_pnl = sum(t["pnl"] for t in daily_trades) + pnl_usd
-                daily_n = len(daily_trades) + 1
-                daily_wins = sum(1 for t in daily_trades if t["pnl"] > 0) + (1 if pnl_usd > 0 else 0)
-                daily_wr = daily_wins / daily_n * 100 if daily_n > 0 else 0
-
-                # Save completo con tutti i dettagli
-                save_trade(pnl_usd, d, entry, exit_px,
-                           sig_type=sig_type,
-                           sl_dist=last_pos_state.get("sl_dist", 0),
-                           regime=trade_regime,
-                           extra={
-                               "pnl_pct":              pnl_pct,
-                               "sl_original":           last_pos_state.get("sl_original", 0),
-                               "tp_original":           last_pos_state.get("tp_original", 0),
-                               "trailing_activated_at":  last_pos_state.get("trailing_activated_at", 0),
-                               "trailing_final_sl":      last_pos_state.get("current_ts", 0),
-                               "trailing_moves":         last_pos_state.get("trailing_moves", 0),
-                               "partial_close_px":       last_pos_state.get("partial_close_px", 0),
-                               "partial_pnl_pct":        last_pos_state.get("partial_pnl_pct", 0),
-                               "ai_confidence":          last_pos_state.get("ai_confidence", 0),
-                               "setup_score":            last_pos_state.get("setup_score", 0),
-                               "close_reason":           close_reason,
-                               "duration_s":             duration_s,
-                               "ts_open":                open_ts,
-                           })
-
-                # Clear pos_state da Redis
+                dur_str = f"{duration_s:.0f}s" if duration_s < 60 else f"{duration_s/60:.0f}min" if duration_s < 3600 else f"{duration_s/3600:.1f}h"
+                
+                save_trade(pnl_usd, d, entry, exit_px, sig_type=sig_type,
+                           sl_dist=last_pos_state.get("sl_dist", 0), regime=trade_regime,
+                           extra={"pnl_pct": pnl_pct, "sl_original": last_pos_state.get("sl_original",0),
+                                  "tp_original": last_pos_state.get("tp_original",0),
+                                  "trailing_activated_at": last_pos_state.get("trailing_activated_at",0),
+                                  "trailing_final_sl": last_pos_state.get("current_ts",0),
+                                  "trailing_moves": last_pos_state.get("trailing_moves",0),
+                                  "close_reason": close_reason, "duration_s": duration_s,
+                                  "ts_open": open_ts})
                 save_pos_state(None)
-
-                # Console log dettagliato
-                trail_info = ""
-                if last_pos_state.get("trailing_active"):
-                    trail_info = (f" | Trail: activated@{last_pos_state.get('trailing_activated_at',0):.1f}"
-                                  f" final_SL:{last_pos_state.get('current_ts',0):.1f}"
-                                  f" moves:{last_pos_state.get('trailing_moves',0)}")
-                partial_info = ""
-                if last_pos_state.get("partial_done"):
-                    partial_info = f" | Partial@{last_pos_state.get('partial_close_px',0):.1f}"
-
-                log(f"{emoji} CLOSED {d} {sig_type} | {close_reason}")
-                log(f"   Entry: {entry:.1f} → Exit: {exit_px:.1f} | PnL: ${pnl_usd:+.2f} ({pnl_pct:+.2f}%)")
-                log(f"   Duration: {dur_str} | Regime: {trade_regime}{trail_info}{partial_info}")
-                log(f"   Day: {daily_n} trades ${daily_pnl:+.2f} WR:{daily_wr:.0f}%")
-
-                # Telegram dettagliato
-                tg_trail = ""
-                if last_pos_state.get("trailing_active"):
-                    tg_trail = (f"\n📈 Trail: {last_pos_state.get('trailing_moves',0)} moves, "
-                                f"SL {last_pos_state.get('current_ts',0):.1f}")
-                tg_partial = ""
-                if last_pos_state.get("partial_done"):
-                    tg_partial = f"\n💰 Partial: 50% @ {last_pos_state.get('partial_close_px',0):.1f}"
-
-                tg_msg = (
-                    f"{emoji} <b>BTC {d} CLOSED</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 <b>PnL: ${pnl_usd:+.2f} ({pnl_pct:+.2f}%)</b>\n"
-                    f"🏷 Reason: {close_reason}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📍 Entry: {entry:.1f} → Exit: {exit_px:.1f}\n"
-                    f"🛡 SL: {last_pos_state.get('sl_original',0):.1f} | TP: {last_pos_state.get('tp_original',0):.1f}"
-                    f"{tg_trail}{tg_partial}\n"
-                    f"📐 Type: {sig_type} | Regime: {trade_regime}\n"
-                    f"⏱ Duration: {dur_str}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📅 Today: {daily_n} trades | WR: {daily_wr:.0f}%\n"
-                    f"💰 Daily PnL: <b>${daily_pnl:+.2f}</b>"
-                )
-                tg(tg_msg)
-
-            last_pos_state = pos
-
-            # ── Refresh backtest every hour ──
-            if cycle % 120 == 0:  # 120 × 30s = 1h
-                run_backtest()
-
-            # ── Cleanup ordini orfani ogni 10 min ──
-            if cycle % 20 == 0 and pos is None:  # 20 × 30s = 10min
-                cleanup_orphan_orders()
-
-            # ── Daily report ──
-            maybe_send_daily_report()
-
-            # ── TRADE MANAGEMENT (quando in posizione) ──
-            if pos is not None:
+                
+                log(f"[EXEC] {emoji} CLOSED {d} {sig_type} | {close_reason} | ${pnl_usd:+.2f} ({pnl_pct:+.2f}%) | {dur_str}")
+                tg(f"{emoji} <b>BTC {d} CLOSED</b>\n📊 PnL: ${pnl_usd:+.2f} ({pnl_pct:+.2f}%)\n🏷 {close_reason}\n📍 {entry:.1f}→{exit_px:.1f} | {dur_str}")
+                last_pos_state = None
+            
+            # ── Trade management (in posizione) ──
+            if pos is not None and last_pos_state:
                 entry = pos["entry"]
                 szi = pos["szi"]
                 d = "LONG" if szi > 0 else "SHORT"
                 pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
-                atr_now = last_pos_state.get("atr", 0) if last_pos_state else 0
-
-                # Init pos_state se necessario (recovery)
-                if last_pos_state is None:
-                    last_pos_state = pos.copy()
-                    last_pos_state.update({"type":"?","regime":regime,"sl_dist":entry*SL_MAX_PCT,
-                                           "last_mgmt":0,"partial_done":False,"trailing_active":False,"atr":0,"current_ts":0})
-
-                # Fetch ATR fresco
-                if cycle % 4 == 0:  # ogni 2min
-                    df_mgmt = fetch_df("5m", 1)
-                    if df_mgmt is not None and len(df_mgmt) >= 5:
-                        atr_now = float(df_mgmt.iloc[-1]['atr'])
-                        last_pos_state["atr"] = atr_now
-
-                # ── Trailing stop meccanico (solo TREND mode) ──
+                
                 trade_mode = last_pos_state.get("scalp_mode", "TREND")
+                atr_now = last_pos_state.get("atr", 0)
+                
+                # Refresh ATR
+                if cycle % 6 == 0:
+                    df_m = fetch_df("15m", 1)
+                    if df_m is not None and len(df_m) >= 5:
+                        atr_now = float(df_m.iloc[-1]['atr'])
+                        last_pos_state["atr"] = atr_now
+                
+                # Trailing (solo TREND)
                 if atr_now > 0 and trade_mode == "TREND":
                     update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
-
-                # ── Partial close (solo TREND mode) ──
+                
+                # Partial close (solo TREND)
                 if trade_mode == "TREND":
                     check_partial_close(last_pos_state, mid, sz_dec, px_dec)
-
-                # ── AI management — interval adattivo per mode ──
-                trade_mode = last_pos_state.get("scalp_mode", "TREND")
+                
+                # AI management
                 mgmt_interval = {"FLASH": 30, "RANGE": 60, "TREND": 120}.get(trade_mode, 120)
                 last_mgmt = last_pos_state.get("last_mgmt", 0)
-
                 if time.time() - last_mgmt >= mgmt_interval:
                     last_pos_state["last_mgmt"] = time.time()
-
-                    # Fetch 15m (coerente col TF di entry)
-                    df_mgmt = fetch_df("15m", 1)
-                    mgmt_ctx = ""
-                    if df_mgmt is not None and len(df_mgmt) >= 5:
-                        rm = df_mgmt.iloc[-1]
-                        atr_now = float(rm['atr'])
-                        last_pos_state["atr"] = atr_now
-                        mgmt_ctx = (f"RSI:{rm['rsi']:.0f} MACD:{rm['macd_hist']:.1f} "
-                                   f"slope:{rm['ema_slope']:.4f} vol:{rm['vol_rel']:.1f}x "
-                                   f"ADX:{rm.get('adx', 20):.0f}")
-
+                    # AI call per management (simplified — HOLD/TIGHTEN/EXIT)
                     try:
                         api_key = os.getenv("ANTHROPIC_API_KEY", "")
-                        if api_key and mgmt_ctx:
-                            mode_mgmt = {
-                                "FLASH": "FLASH mode: trade deve chiudere velocemente. EXIT se il momentum rallenta anche minimamente. No TIGHTEN.",
-                                "RANGE": "RANGE mode: TP fisso, il prezzo deve toccare il target. EXIT se il prezzo rompe il range. TIGHTEN se in profitto.",
-                                "TREND": "TREND mode: trailing attivo. TIGHTEN a breakeven se in profitto. EXIT solo se trend invertito chiaramente.",
-                            }.get(trade_mode, "")
-
-                            prompt = (
-                                f"BTC {d} position [{trade_mode}]. Entry:{entry:.1f} Current:{mid:.1f} PnL:{pnl_pct:+.1f}%\n"
-                                f"15m indicators: {mgmt_ctx}\n"
-                                f"Regime: {regime} | {mode_mgmt}\n"
-                                f"Decide: HOLD, TIGHTEN (SL→breakeven+0.1%), EXIT (close now).\n"
-                                f"JSON only: {{\"action\":\"HOLD|TIGHTEN|EXIT\",\"reason\":\"<5 words>\"}}"
-                            )
-                            resp = requests.post("https://api.anthropic.com/v1/messages",
-                                headers={"Content-Type": "application/json",
-                                         "x-api-key": api_key,
-                                         "anthropic-version": "2023-06-01"},
-                                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 100,
-                                      "messages": [{"role": "user", "content": prompt}]}, timeout=10)
-
-                            if resp.status_code == 200:
-                                txt = resp.json()["content"][0]["text"]
-                                start = txt.find("{"); end = txt.rfind("}")+1
-                                if start >= 0 and end > start:
-                                    mj = json.loads(txt[start:end])
-                                    action = mj.get("action", "HOLD").upper()
-                                    reason = mj.get("reason", "")
-
-                                    if action == "TIGHTEN" and pnl_pct > 0.1:
-                                        # Move SL to breakeven + 0.1%
-                                        new_sl = entry * (1.001 if d == "LONG" else 0.999)
-                                        new_sl = rpx(new_sl, px_dec)
-                                        try:
-                                            # Cancel old SL, place new
-                                            opens = call(_info.open_orders, _account.address, timeout=10)
+                        if api_key:
+                            df_m = fetch_df("15m", 1)
+                            if df_m is not None and len(df_m) >= 5:
+                                rm = df_m.iloc[-1]
+                                ctx = f"RSI:{rm['rsi']:.0f} MACD:{rm['macd_hist']:.1f} vol:{rm['vol_rel']:.1f}x"
+                                prompt = (f"BTC {d} [{trade_mode}]. Entry:{entry:.1f} Now:{mid:.1f} PnL:{pnl_pct:+.1f}%\n"
+                                         f"15m: {ctx}\nDecide: HOLD, TIGHTEN, EXIT.\n"
+                                         f"JSON: {{\"action\":\"HOLD|TIGHTEN|EXIT\",\"reason\":\"<5w>\"}}")
+                                resp = requests.post("https://api.anthropic.com/v1/messages",
+                                    headers={"Content-Type":"application/json","x-api-key":api_key,"anthropic-version":"2023-06-01"},
+                                    json={"model":"claude-haiku-4-5-20251001","max_tokens":100,
+                                          "messages":[{"role":"user","content":prompt}]}, timeout=10)
+                                if resp.status_code == 200:
+                                    txt = resp.json()["content"][0]["text"]
+                                    s = txt.find("{"); e = txt.rfind("}")+1
+                                    if s >= 0 and e > s:
+                                        aj = json.loads(txt[s:e])
+                                        action = aj.get("action","HOLD").upper()
+                                        reason = aj.get("reason","")
+                                        if action == "EXIT":
+                                            last_pos_state["close_reason"] = f"🤖 AI: {reason}"
+                                            size_abs = rpx(abs(szi), sz_dec)
+                                            close_px = rpx(mid * (0.997 if d=="LONG" else 1.003), px_dec)
+                                            call(_exchange.order, COIN, d!="LONG", size_abs, close_px,
+                                                 {"limit":{"tif":"Ioc"}}, False, timeout=15)
+                                            log(f"[EXEC] 🚪 AI EXIT {reason}")
+                                        elif action == "TIGHTEN" and pnl_pct > 0.1:
+                                            new_sl = entry * (1.001 if d=="LONG" else 0.999)
+                                            new_sl = rpx(new_sl, px_dec)
+                                            opens = get_open_orders()
                                             for o in opens:
-                                                if o.get("coin") == COIN and o.get("orderType") == "Stop Market":
+                                                if o.get("coin")==COIN and o.get("orderType")=="Stop Market":
                                                     call(_exchange.cancel, COIN, o["oid"], timeout=10)
                                             time.sleep(0.3)
                                             size_abs = rpx(abs(szi), sz_dec)
-                                            is_buy = d == "LONG"
-                                            call(_exchange.order, COIN, not is_buy, size_abs, new_sl,
-                                                 {"trigger": {"triggerPx": new_sl, "isMarket": True, "tpsl": "sl"}},
+                                            call(_exchange.order, COIN, d!="LONG", size_abs, new_sl,
+                                                 {"trigger":{"triggerPx":new_sl,"isMarket":True,"tpsl":"sl"}},
                                                  True, timeout=15)
-                                            log(f"🔒 TIGHTEN SL → {new_sl} (BE+0.1%) | {reason}")
-                                            tg(f"🔒 BTC SL → breakeven {new_sl} | {reason}", silent=True)
-                                        except Exception as e:
-                                            log(f"Tighten error: {e}")
-
-                                    elif action == "EXIT":
-                                        # Close position at market
-                                        last_pos_state["close_reason"] = f"🤖 AI Exit: {reason}"
-                                        try:
-                                            is_buy = d == "LONG"
-                                            size_abs = rpx(abs(szi), sz_dec)
-                                            close_px = rpx(mid * (0.997 if is_buy else 1.003), px_dec)
-                                            call(_exchange.order, COIN, not is_buy, size_abs, close_px,
-                                                 {"limit": {"tif": "Ioc"}}, False, timeout=15)
-                                            log(f"🚪 AI EXIT @ {mid:.1f} PnL:{pnl_pct:+.1f}% | {reason}")
-                                            tg(f"🚪 BTC AI EXIT PnL:{pnl_pct:+.1f}% | {reason}")
-                                            # Cancel remaining orders
-                                            time.sleep(1)
-                                            try:
-                                                opens = call(_info.open_orders, _account.address, timeout=10)
-                                                for o in opens:
-                                                    if o.get("coin") == COIN:
-                                                        call(_exchange.cancel, COIN, o["oid"], timeout=10)
-                                            except: pass
-                                        except Exception as e:
-                                            log(f"Exit error: {e}")
-
-                                    else:
-                                        if cycle % 8 == 0:
-                                            log(f"📊 HOLD PnL:{pnl_pct:+.1f}% | {reason}")
-
-                    except Exception as e:
-                        log(f"AI mgmt error: {e}")
-
+                                            log(f"[EXEC] 🔒 TIGHTEN SL→{new_sl} | {reason}")
+                                        else:
+                                            log(f"[EXEC] 📊 {action} | PnL:{pnl_pct:+.1f}% | {reason}")
+                    except Exception as ex:
+                        log(f"[EXEC] AI mgmt error: {ex}")
+                
+                log(f"[EXEC] #{cycle} {d} @ {entry:.0f} PnL:{pnl_pct:+.1f}% [{trade_mode}] | ${bal:.2f}")
                 time.sleep(SCAN_INTERVAL)
                 continue
-
-            # ── Circuit breaker ──
-            cb, reason = check_circuit_breaker()
+            
+            # ── Check for new signal ──
+            cb, cb_reason = check_circuit_breaker()
             if cb:
-                if cycle % 20 == 1:
-                    log(f"🛑 {reason}")
+                if cycle % 6 == 1: log(f"[EXEC] 🛑 {cb_reason}")
                 time.sleep(SCAN_INTERVAL)
                 continue
-
-            # ── Cooldown ──
+            
             if time.time() - _last_trade_ts < COOLDOWN_SEC:
                 time.sleep(SCAN_INTERVAL)
                 continue
-
-            # ── Trade lock: skip se un ordine è in esecuzione ──
+            
             if _is_trading:
                 time.sleep(SCAN_INTERVAL)
                 continue
-
-            # ── Check signal ──
-            sig = check_signal()
-            if sig is None:
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode = sig
-            log(f"📡 SIGNAL: {direction} {sig_type} [{scalp_mode}] | {regime} | {details}")
-
-            # ── Funding check ──
-            if not is_funding_ok(direction):
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            # ── Execute ──
-            success = open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult, scalp_mode)
-            if success:
-                p = get_position()
-                if p:
-                    last_pos_state = p
-                    last_pos_state["type"] = sig_type
-                    last_pos_state["sl_dist"] = sl_dist
-                    last_pos_state["sl_original"] = sl
-                    last_pos_state["tp_original"] = tp
-                    last_pos_state["regime"] = sig_regime
-                    last_pos_state["scalp_mode"] = scalp_mode
-                    last_pos_state["setup_score"] = setup
-                    last_pos_state["ai_confidence"] = ai_confidence if 'ai_confidence' in dir() else 7
-                    last_pos_state["last_mgmt"] = 0
-                    last_pos_state["partial_done"] = False
-                    last_pos_state["partial_close_px"] = 0
-                    last_pos_state["partial_pnl_pct"] = 0
-                    last_pos_state["trailing_active"] = False
-                    last_pos_state["trailing_activated_at"] = 0
-                    last_pos_state["trailing_moves"] = 0
-                    last_pos_state["current_ts"] = 0
-                    last_pos_state["atr"] = 0
-                    last_pos_state["open_ts"] = time.time()
-                    last_pos_state["close_reason"] = ""
-                    save_pos_state(last_pos_state)
-            else:
-                log(f"Trade failed — cooldown {COOLDOWN_SEC}s")
-                _last_trade_ts = time.time()  # prevent spam
-
-        except KeyboardInterrupt:
-            log("🛑 Stopped"); break
+            
+            sig = _current_signal
+            if sig and time.time() - sig.get("ts", 0) < 120:  # segnale fresco < 2min
+                _current_signal = None  # consuma
+                
+                direction = sig["direction"]
+                log(f"[EXEC] 🎯 Esecuzione: {direction} {sig['sig_type']} [{sig['scalp_mode']}]")
+                
+                success = open_trade(direction, sig["sl"], sig["tp"], sig["entry_px"],
+                                     sig["sl_dist"], sz_dec, px_dec, sig["size_mult"], sig["scalp_mode"])
+                if success:
+                    p = get_position()
+                    if p:
+                        last_pos_state = p
+                        last_pos_state.update({
+                            "type": sig["sig_type"], "sl_dist": sig["sl_dist"],
+                            "sl_original": sig["sl"], "tp_original": sig["tp"],
+                            "regime": sig["regime"], "scalp_mode": sig["scalp_mode"],
+                            "setup_score": sig["setup"], "ai_confidence": 7,
+                            "last_mgmt": 0, "partial_done": False, "partial_close_px": 0,
+                            "partial_pnl_pct": 0, "trailing_active": False,
+                            "trailing_activated_at": 0, "trailing_moves": 0,
+                            "current_ts": 0, "atr": 0, "open_ts": time.time(), "close_reason": ""
+                        })
+                        save_pos_state(last_pos_state)
+                        log(f"[EXEC] ✅ Trade aperto e protetto")
+                else:
+                    log(f"[EXEC] ❌ Trade fallito")
+                    _last_trade_ts = time.time()
+            
+            # Status log
+            daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
+            n_today = len([t for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400])
+            log(f"[EXEC] #{cycle} ${bal:.2f} | {_regime} | flat | {n_today} trades ${daily_pnl:+.2f} | BTC ${mid:,.0f}")
+            
         except Exception as e:
-            log(f"Loop error: {e}")
+            log(f"[EXEC] Error: {e}")
             import traceback; traceback.print_exc()
-
-        # Heartbeat OGNI ciclo — Railway richiede newline
-        try:
-            if cycle % 10 == 1:
-                bal = get_balance()
-                daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
-                n_today = len([t for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400])
-                pos_str = f"{'LONG' if pos['szi']>0 else 'SHORT'} @ {pos['entry']}" if pos else "flat"
-                log(f"#{cycle} ${bal:.2f} | {regime} | {pos_str} | "
-                        f"today: {n_today} trades ${daily_pnl:+.2f} | BTC ${mid:,.0f}")
-            else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] #{cycle}", flush=True)
-        except:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] #{cycle} (heartbeat error)", flush=True)
-
+        
         time.sleep(SCAN_INTERVAL)
+
+
+# ================================================================
+# MAIN — 3 thread come V4
+# ================================================================
+def main():
+    global _last_trade_ts
+    log("🚀 BTC SCALPER V7 — 3 Thread Architecture")
+    log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x Modes:RANGE/TREND/FLASH")
+    
+    load_state()
+    sz_dec, px_dec = get_meta()
+    
+    # Thread A: Scanner (regime + backtest ogni 5 min)
+    threading.Thread(target=scanner_thread, name="Scanner", daemon=True).start()
+    
+    # Thread B: Processor (check signal ogni 10s)
+    threading.Thread(target=processor_thread, args=(sz_dec, px_dec), name="Processor", daemon=True).start()
+    
+    # Thread C: Executor nel main thread
+    try:
+        executor_thread(sz_dec, px_dec)
+    except KeyboardInterrupt:
+        log("🛑 Stop")
 
 if __name__ == "__main__":
     try:
@@ -2309,4 +2209,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"FATAL: {e}", flush=True)
         import traceback; traceback.print_exc()
-        time.sleep(30)  # keep alive for logs
+        time.sleep(60)
