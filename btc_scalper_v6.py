@@ -1,19 +1,15 @@
 """
-btc_scalper_v6.py — Bot BTC-only scalping su 5m.
+btc_scalper_v6.py — Bot BTC-only scalping.
 
-DESIGN:
-  Solo BTC. Niente scanner, niente ranking, niente AI gatekeeper.
-  Segnali puramente meccanici su 3 TF (4h trend, 1h setup, 5m entry).
-  Entry frequenti (8+/giorno), risk $5 per trade, SL/TP meccanici.
+3 SCALPING MODES (auto-detected):
+  RANGE: ADX<20, mean reversion, TP fisso 0.4%
+  TREND: ADX>25, momentum pullback, trailing + R:R 1:2
+  FLASH: vol spike >3x, breakout puro, TP 0.3%, IoC diretto
 
-LOGICA:
-  4h → regime (BULL/BEAR/RANGE) + trend direction
-  1h → setup condition (momentum o reversal)
-  5m → entry trigger + SL/TP
-
-BULL:  solo LONG  — breakout + pullback continuation
-BEAR:  solo SHORT — breakdown + rally fade
-RANGE: entrambi   — reversal agli estremi
+TIMEFRAMES:
+  4h → regime (BULL/BEAR/RANGE)
+  1h → setup (EMA, RSI, ADX)
+  15m → entry trigger + SL/TP
 """
 
 import os, sys, time, json, threading, requests
@@ -317,7 +313,7 @@ def _update_adaptive_params():
     """
     global _params
     now = time.time()
-    recent = [t for t in _trades_today if now - t["ts"] < 86400]
+    recent = [t for t in _trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400]
     if len(recent) < 3:
         return
 
@@ -374,12 +370,12 @@ def get_sl_tp_adjustments():
 
 def check_circuit_breaker():
     now = time.time()
-    daily_pnl = sum(t["pnl"] for t in _trades_today if now - t["ts"] < 86400)
+    daily_pnl = sum(t["pnl"] for t in _trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400)
     if daily_pnl <= -MAX_DAILY_LOSS:
         return True, f"daily loss ${daily_pnl:.1f}"
     if _consec_losses >= MAX_CONSEC_LOSS:
         # Check if 30min pause has passed since last loss
-        last_loss_ts = max((t["ts"] for t in _trades_today if t["pnl"] < 0), default=0)
+        last_loss_ts = max((t.get("ts_close", t.get("ts", 0)) for t in _trades_today if t["pnl"] < 0), default=0)
         if now - last_loss_ts < 1800:
             return True, f"{_consec_losses} consec losses, pause {int((1800-(now-last_loss_ts))/60)}min"
     return False, ""
@@ -729,12 +725,6 @@ def check_signal():
         scalp_mode = "TREND"
     else:
         scalp_mode = "RANGE"
-
-    rsi1h  = float(h['rsi'])
-    macd1h = float(h['macd_hist'])
-    ema9_1h = float(h['ema9'])
-    ema21_1h = float(h['ema21'])
-    slope1h = float(h['ema_slope'])
 
     direction = None
     sig_type = None
@@ -1612,7 +1602,7 @@ def maybe_send_daily_report():
         return
 
     _last_report_ts = now
-    trades = [t for t in _trades_today if now - t["ts"] < 86400]
+    trades = [t for t in _trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400]
     if not trades:
         tg("📊 <b>Daily Report</b>\nNo trades today")
         return
