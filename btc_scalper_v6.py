@@ -136,6 +136,48 @@ def effective_price_dec(px, sl, tp, base_px_dec):
     return dec
 
 # ================================================================
+# FUNDING Z-SCORE & OI TRACKING (from V4)
+# ================================================================
+_funding_history = []   # list of BTC funding rates (last 42 readings)
+_oi_cache = 0.0
+_oi_prev = 0.0
+FUNDING_HISTORY_LEN = 42  # ~14h di readings ogni 20min
+
+def update_funding_oi():
+    """Fetch BTC funding rate e OI, aggiorna storico per z-score."""
+    global _funding_history, _oi_cache, _oi_prev
+    try:
+        ctx = call(_info.meta_and_asset_ctxs, timeout=15)
+        for a, c in zip(ctx[0]["universe"], ctx[1]):
+            if a["name"] == COIN:
+                funding = float(c.get("funding", 0) or 0)
+                _funding_history.append(funding)
+                if len(_funding_history) > FUNDING_HISTORY_LEN:
+                    _funding_history.pop(0)
+
+                _oi_prev = _oi_cache
+                _oi_cache = float(c.get("openInterest", 0) or 0)
+                break
+    except Exception as e:
+        log(f"update_funding_oi: {e}")
+
+def get_funding_z():
+    """Z-score del funding BTC: quanto è estremo rispetto alla storia recente."""
+    if len(_funding_history) < 3:
+        return 0.0
+    arr = np.array(_funding_history)
+    std = arr.std()
+    if std < 1e-10:
+        return 0.0
+    return float((_funding_history[-1] - arr.mean()) / std)
+
+def get_oi_change():
+    """Variazione % dell'OI BTC rispetto al reading precedente."""
+    if _oi_prev == 0:
+        return 0.0
+    return (_oi_cache - _oi_prev) / (_oi_prev + 1e-10)
+
+# ================================================================
 # REDIS STATE
 # ================================================================
 def _rget(key):
@@ -699,36 +741,67 @@ def check_signal():
 
     details += f" | AI:{ai_confidence}/10 {ai_note}"
 
-    # ── SL / TP con adjustment adattivi ──
+    # ── Funding z-score e OI ──
+    update_funding_oi()
+    fz = get_funding_z()
+    oi_chg = get_oi_change()
+    details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%}"
+
+    # ── SL / TP con lev_scale + adjustment adattivi ──
+    # lev_scale: se Hyperliquid applica leva diversa da richiesta,
+    # lo SL deve scalare per compensare (come V4).
+    # Il TP NON scala — deve restare raggiungibile.
+    actual_lev = get_effective_lev()
+    lev_scale = LEVERAGE / max(actual_lev, 1)
+    if lev_scale != 1.0:
+        log(f"⚠️ Lev {actual_lev}x vs {LEVERAGE}x → SL scala ×{lev_scale:.2f}")
+
     sl_adj_redis, tp_adj_redis = get_sl_tp_adjustments()
-    sl_mult_final = SL_ATR_MULT * sl_adj_redis * ai_sl_adj
-    tp_rr_final = TP_RR * tp_adj_redis
+    sl_mult_final = SL_ATR_MULT * sl_adj_redis * ai_sl_adj * lev_scale  # SL scala con leva
+    tp_rr_final = TP_RR * tp_adj_redis  # TP NON scala con leva
+    buffer = px * 0.002 * lev_scale  # buffer per swing SL
 
     sl_dist = atr5 * sl_mult_final
-    sl_dist = max(sl_dist, px * SL_MIN_PCT)
-    sl_dist = min(sl_dist, px * SL_MAX_PCT)
-    tp_dist = sl_dist * tp_rr_final
+    sl_dist = max(sl_dist, px * SL_MIN_PCT * lev_scale)
+    sl_dist = min(sl_dist, px * SL_MAX_PCT * lev_scale)
+    tp_dist = sl_dist * tp_rr_final / lev_scale  # TP basato su SL pre-scala
+
+    # TP floor e cap (non scalano con leva)
+    tp_floor = px * 0.003
+    tp_cap = px * 0.02  # max 2% per BTC scalping
+    tp_dist = max(tp_dist, tp_floor)
+    tp_dist = min(tp_dist, tp_cap)
 
     if direction == "LONG":
         swing_low = float(df_15m['low'].iloc[-10:].min())
-        swing_sl = px - swing_low + px * 0.001
-        if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px:
-            sl_dist = swing_sl * sl_adj_redis * ai_sl_adj
-            sl_dist = max(sl_dist, px * SL_MIN_PCT)
-            sl_dist = min(sl_dist, px * SL_MAX_PCT)
-            tp_dist = sl_dist * tp_rr_final
+        swing_sl = px - swing_low + buffer
+        if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px * lev_scale:
+            sl_dist = swing_sl
+            sl_dist = max(sl_dist, px * SL_MIN_PCT * lev_scale)
+            sl_dist = min(sl_dist, px * SL_MAX_PCT * lev_scale)
+            tp_dist = sl_dist * tp_rr_final / lev_scale
+            tp_dist = max(tp_dist, tp_floor)
+            tp_dist = min(tp_dist, tp_cap)
         sl = px - sl_dist
         tp = px + tp_dist
     else:
         swing_high = float(df_15m['high'].iloc[-10:].max())
-        swing_sl = swing_high - px + px * 0.001
-        if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px:
-            sl_dist = swing_sl * sl_adj_redis * ai_sl_adj
-            sl_dist = max(sl_dist, px * SL_MIN_PCT)
-            sl_dist = min(sl_dist, px * SL_MAX_PCT)
-            tp_dist = sl_dist * tp_rr_final
+        swing_sl = swing_high - px + buffer
+        if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px * lev_scale:
+            sl_dist = swing_sl
+            sl_dist = max(sl_dist, px * SL_MIN_PCT * lev_scale)
+            sl_dist = min(sl_dist, px * SL_MAX_PCT * lev_scale)
+            tp_dist = sl_dist * tp_rr_final / lev_scale
+            tp_dist = max(tp_dist, tp_floor)
+            tp_dist = min(tp_dist, tp_cap)
         sl = px + sl_dist
         tp = px - tp_dist
+
+    # Log SL/TP
+    sl_pct = sl_dist / px * 100
+    tp_pct = tp_dist / px * 100
+    rr = tp_dist / sl_dist if sl_dist > 0 else 0
+    log(f"SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} lev:{actual_lev}x")
 
     # Confidence sizing: AI confidence 1-10 → size multiplier 0.5-1.0
     size_mult = 0.5 + (ai_confidence - 1) * 0.055  # 1→0.5, 5→0.72, 10→1.0
@@ -742,9 +815,8 @@ def check_signal():
 
     ema50_1h = float(h.get('ema50', px))
     ema200_1h = float(h.get('ema200', px))
-    funding = get_funding()
     setup = compute_setup_score(direction, px, ema50_1h, ema200_1h,
-                                rsi5, ai_confidence, funding, liq)
+                                rsi5, ai_confidence, fz, liq)
     if setup < 40:
         log(f"⚠️ Setup score {setup}/100 — troppo basso")
         return None
@@ -825,7 +897,24 @@ def get_position():
     except: pass
     return None
 
-def get_balance():
+def get_effective_lev():
+    """
+    Legge la leva effettiva da Hyperliquid.
+    Hyperliquid può applicare leva diversa da quella richiesta.
+    """
+    try:
+        s = call(_info.user_state, _account.address, timeout=10)
+        for p in s.get("assetPositions", []):
+            pp = p.get("position", {})
+            if pp.get("coin") == COIN:
+                lev = pp.get("leverage", {})
+                if isinstance(lev, dict):
+                    return int(lev.get("value", LEVERAGE))
+                if isinstance(lev, (int, float)):
+                    return int(lev)
+        return LEVERAGE
+    except:
+        return LEVERAGE
     try:
         s = call(_info.user_state, _account.address, timeout=10)
         return float(s["marginSummary"]["accountValue"])
@@ -938,9 +1027,9 @@ def fetch_liquidity():
 # SETUP SCORE (from V4 — adapted for BTC-only)
 # ================================================================
 def compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
-                        funding_rate, liq=None):
+                        funding_z, liq=None):
     """
-    Score composito 0-100. Combina trend, RSI, AI, funding, liquidità.
+    Score composito 0-100. Combina trend, RSI, AI, funding z-score, liquidità.
     """
     score = 0
 
@@ -952,10 +1041,10 @@ def compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
         if px < ema200 and ema50 < ema200: score += 30
         elif px < ema200 or ema50 < ema200: score += 15
 
-    # RSI zone (20%) — momentum-adapted
+    # RSI zone (20%)
     if direction == "LONG":
-        if 40 <= rsi <= 60: score += 20    # pullback zone
-        elif rsi > 60: score += 10          # momentum
+        if 40 <= rsi <= 60: score += 20
+        elif rsi > 60: score += 10
     else:
         if 40 <= rsi <= 60: score += 20
         elif rsi < 40: score += 10
@@ -963,11 +1052,15 @@ def compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
     # AI confidence (25%)
     score += int((ai_score / 10) * 25)
 
-    # Funding (10%)
-    if direction == "LONG" and funding_rate < -0.0001: score += 10
-    elif direction == "LONG" and funding_rate < 0: score += 5
-    elif direction == "SHORT" and funding_rate > 0.0001: score += 10
-    elif direction == "SHORT" and funding_rate > 0: score += 5
+    # Funding z-score (10%)
+    if direction == "LONG":
+        if funding_z < -1.0: score += 10    # ti pagano per long
+        elif funding_z < 0: score += 5
+        elif funding_z > 2.0: score -= 10   # crowded long = pericolo
+    else:
+        if funding_z > 1.0: score += 10
+        elif funding_z > 0: score += 5
+        elif funding_z < -2.0: score -= 10
 
     # Liquidity (15% + bonus/penalty)
     if liq and liq.get("spread") is not None:
@@ -1266,16 +1359,28 @@ def check_partial_close(pos_state, mid, sz_dec, px_dec):
 # ================================================================
 def is_funding_ok(direction):
     """
-    Blocca entry se il funding è fortemente contro la posizione.
-    Funding > +0.03% e LONG = stai pagando per essere long → cautela.
+    Blocca entry se funding contro la posizione.
+    Usa sia il raw funding rate che il z-score.
     """
     funding = get_funding()
+    fz = get_funding_z()
+
+    # Raw funding check
     if direction == "LONG" and funding > FUNDING_BLOCK_THRESH:
         log(f"⚠️ Funding {funding*100:.3f}% contro LONG — skip")
         return False
     if direction == "SHORT" and funding < -FUNDING_BLOCK_THRESH:
         log(f"⚠️ Funding {funding*100:.3f}% contro SHORT — skip")
         return False
+
+    # Z-score check: funding estremo = crowded = rischio squeeze
+    if direction == "LONG" and fz > 2.5:
+        log(f"⚠️ Funding z-score {fz:+.1f} — crowded long, skip")
+        return False
+    if direction == "SHORT" and fz < -2.5:
+        log(f"⚠️ Funding z-score {fz:+.1f} — crowded short, skip")
+        return False
+
     return True
 
 # ================================================================
