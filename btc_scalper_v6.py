@@ -48,13 +48,13 @@ COOLDOWN_SEC = 180             # 3 min tra trade
 SCAN_INTERVAL = 30             # check ogni 30s per entry veloci
 REGIME_INTERVAL = 300          # ricalcola regime ogni 5 min
 
-# SL/TP
-SL_ATR_MULT = 1.5              # SL = 1.5 × ATR(14) su 5m
-TP_RR = 1.5                    # TP = SL × 1.5 (R:R 1:1.5)
-SL_MIN_PCT = 0.0015            # SL minimo 0.15% (evita SL troppo stretti)
-SL_MAX_PCT = 0.008             # SL massimo 0.8%
-TRAILING_ACTIVATE = 0.5        # attiva trailing dopo 50% del TP raggiunto
-TRAILING_ATR = 0.8             # trailing = 0.8 × ATR
+# SL/TP — adattati per BTC 15m (meno noise, più spazio)
+SL_ATR_MULT = 2.0              # SL = 2.0 × ATR(14) su 15m
+TP_RR = 1.8                    # TP = SL × 1.8 (R:R 1:1.8)
+SL_MIN_PCT = 0.003             # SL minimo 0.3% ($220 su BTC $74k)
+SL_MAX_PCT = 0.012             # SL massimo 1.2% ($888)
+TRAILING_ACTIVATE = 0.5
+TRAILING_ATR = 1.0             # trailing = 1.0 × ATR (più largo su 15m)
 PARTIAL_CLOSE_PCT = 0.6        # chiudi 50% posizione al 60% del TP
 FUNDING_BLOCK_THRESH = 0.0003  # blocca entry se funding > 0.03% contro
 
@@ -371,7 +371,7 @@ def run_backtest():
 
     log("📊 Running backtest...")
     df_1h = fetch_df("1h", 60)
-    df_5m = fetch_df("5m", 14)
+    df_5m = fetch_df("15m", 30)   # 30 giorni di 15m = ~2880 candele
     if df_1h is None or df_5m is None or len(df_5m) < 500 or len(df_1h) < 200:
         log("📊 Backtest: insufficient data")
         return _bt_results
@@ -413,7 +413,7 @@ def run_backtest():
     ema200_1h = merged['ema200_1h'].values.astype(np.float64)
 
     n = len(c)
-    fwd = 36  # 36 candele 5m = 3h max hold
+    fwd = 12  # 12 candele 15m = 3h max hold
     results = {}
 
     for sig_name, sig_dir, sig_cond in [
@@ -525,21 +525,21 @@ def check_signal():
     """
     regime = update_regime()
 
-    # Fetch 1h e 5m in parallelo
-    f_1h = _pool.submit(fetch_df, "1h", 30)
-    f_5m = _pool.submit(fetch_df, "5m", 3)
+    # Fetch 1h (setup) e 15m (entry) in parallelo
+    f_1h  = _pool.submit(fetch_df, "1h", 30)
+    f_15m = _pool.submit(fetch_df, "15m", 14)
     try:
-        df_1h = f_1h.result(timeout=20)
-        df_5m = f_5m.result(timeout=20)
+        df_1h  = f_1h.result(timeout=20)
+        df_15m = f_15m.result(timeout=20)
     except:
         return None
 
     if df_1h is None or len(df_1h) < 50: return None
-    if df_5m is None or len(df_5m) < 50: return None
+    if df_15m is None or len(df_15m) < 50: return None
 
-    h = df_1h.iloc[-1]    # 1h setup
-    r = df_5m.iloc[-1]    # 5m entry
-    r2 = df_5m.iloc[-2]   # 5m precedente (per conferma)
+    h = df_1h.iloc[-1]     # 1h setup
+    r = df_15m.iloc[-1]    # 15m entry
+    r2 = df_15m.iloc[-2]   # 15m precedente
 
     px    = float(r['close'])
     atr5  = float(r['atr'])
@@ -627,12 +627,12 @@ def check_signal():
         api_key = os.getenv("ANTHROPIC_API_KEY", "")
         if api_key:
             ohlcv_str = ""
-            for _, row in df_5m.iloc[-6:][['close','high','low','volume']].iterrows():
+            for _, row in df_15m.iloc[-6:][['close','high','low','volume']].iterrows():
                 ohlcv_str += f"C:{row['close']:.1f} H:{row['high']:.1f} L:{row['low']:.1f} V:{row['volume']:.0f}\n"
 
             prompt = (f"BTC {direction} {sig_type} signal. Regime:{regime}. "
-                     f"RSI5m:{rsi5:.0f} RSI1h:{rsi1h:.0f} MACD5m:{macd5:.1f} Vol:{vol5:.1f}x BB:{bb5:.2f}\n"
-                     f"Last 6 candles 5m:\n{ohlcv_str}"
+                     f"RSI15m:{rsi5:.0f} RSI1h:{rsi1h:.0f} MACD15m:{macd5:.1f} Vol:{vol5:.1f}x BB:{bb5:.2f}\n"
+                     f"Last 6 candles 15m:\n{ohlcv_str}"
                      f"Rate confidence 1-10 and suggest SL adjustment (tight/normal/wide).\n"
                      f"JSON only: {{\"confidence\":<1-10>,\"sl\":\"tight|normal|wide\",\"note\":\"<5 words>\"}}")
 
@@ -680,7 +680,7 @@ def check_signal():
     tp_dist = sl_dist * tp_rr_final
 
     if direction == "LONG":
-        swing_low = float(df_5m['low'].iloc[-10:].min())
+        swing_low = float(df_15m['low'].iloc[-10:].min())
         swing_sl = px - swing_low + px * 0.001
         if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px:
             sl_dist = swing_sl * sl_adj_redis * ai_sl_adj
@@ -690,7 +690,7 @@ def check_signal():
         sl = px - sl_dist
         tp = px + tp_dist
     else:
-        swing_high = float(df_5m['high'].iloc[-10:].max())
+        swing_high = float(df_15m['high'].iloc[-10:].max())
         swing_sl = swing_high - px + px * 0.001
         if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px:
             sl_dist = swing_sl * sl_adj_redis * ai_sl_adj
