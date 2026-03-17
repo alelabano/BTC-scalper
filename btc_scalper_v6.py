@@ -1508,6 +1508,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 # MAIN LOOP
 # ================================================================
 def main():
+    global _last_trade_ts
     log(f"🚀 BTC SCALPER V6")
     log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x SL:{SL_ATR_MULT}×ATR R:R=1:{TP_RR}")
     load_state()
