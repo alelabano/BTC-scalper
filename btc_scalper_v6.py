@@ -38,47 +38,47 @@ COIN = "BTC"
 LEVERAGE = 20
 RISK_USD = 5.0                 # $ rischiati per trade (SL hit = -$5)
 MAX_POSITIONS = 1              # 1 posizione alla volta
-COOLDOWN_SEC = 180             # 3 min tra trade
+COOLDOWN_SEC = 60              # 1 min tra trade (TP stretto = trade veloci)
 
 # Timing
 SCAN_INTERVAL = 10             # check ogni 10s (Railway killa se >15s senza output)
 REGIME_INTERVAL = 300          # ricalcola regime ogni 5 min
 
-# SL/TP — Dynamic Scalping Modes
-# Mode auto-detected ogni ciclo basato su volatilità, ADX, volume
+# SL/TP — ROE-based (con leva 20x)
+# TP 3% ROE = 0.15% price move = ~$111 su BTC $74k → $0.15 gain - $0.03 fee = $0.12 net
+# SL 2% ROE = 0.10% price move = ~$74 su BTC $74k → -$0.10 loss
+# R:R = 1:1.5 in ROE, ma con WR >55% su TP stretto = profittevole
+
+ROE_TP = 0.03           # 3% ROE target
+ROE_SL = 0.02           # 2% ROE max loss
+# Price move = ROE / leverage
+TP_PRICE_PCT = ROE_TP / LEVERAGE   # 0.15%
+SL_PRICE_PCT = ROE_SL / LEVERAGE   # 0.10%
 
 # MODE 1: RANGE SCALPING (Mean Reversion)
-# Quando: ADX < 20, prezzo tra BB, volatilità bassa
-# Strategia: compra supporto, vendi resistenza, TP fisso stretto
-RANGE_SL_ATR     = 1.5
-RANGE_TP_PCT     = 0.004       # TP fisso 0.4%
-RANGE_SL_MIN     = 0.002       # SL min 0.2%
-RANGE_SL_MAX     = 0.006       # SL max 0.6%
-RANGE_TRAILING   = False       # no trailing, TP fisso
+RANGE_SL_ATR  = 1.0
+RANGE_TP_PCT  = TP_PRICE_PCT  # 0.15%
+RANGE_SL_MIN  = SL_PRICE_PCT * 0.7   # 0.07%
+RANGE_SL_MAX  = SL_PRICE_PCT * 1.5   # 0.15%
 
 # MODE 2: TREND SCALPING (Momentum Pullback)
-# Quando: ADX > 25, regime direzionale, candele con volume
-# Strategia: entra sui pullback, trailing lascia correre
-TREND_SL_ATR     = 2.0
-TREND_TP_RR      = 2.0         # R:R 1:2 (lascia correre)
-TREND_SL_MIN     = 0.003       # SL min 0.3%
-TREND_SL_MAX     = 0.012       # SL max 1.2%
-TREND_TRAILING   = True        # trailing attivo
-TREND_TRAIL_ATR  = 1.0
-TREND_PARTIAL    = 0.6         # partial close al 60% TP
+TREND_SL_ATR  = 1.0
+TREND_TP_RR   = TP_PRICE_PCT / SL_PRICE_PCT  # 1.5
+TREND_SL_MIN  = SL_PRICE_PCT * 0.7
+TREND_SL_MAX  = SL_PRICE_PCT * 1.5
+TREND_TRAIL_ATR = 0.5
+TREND_PARTIAL = 0.6
 
 # MODE 3: FLASH SCALPING (Volatility Expansion)
-# Quando: volume spike >3x, funding z-score estremo, ATR spike
-# Strategia: breakout puro, TP fulmineo, ordini IoC market
-FLASH_SL_ATR     = 1.0         # SL stretto (momentum forte)
-FLASH_TP_PCT     = 0.003       # TP 0.3% — esci subito
-FLASH_SL_MIN     = 0.0015      # SL min 0.15%
-FLASH_SL_MAX     = 0.005       # SL max 0.5%
-FLASH_TRAILING   = False       # no trailing, esci veloce
-FLASH_USE_IOC    = True        # forza IoC, no GTC (velocità)
+FLASH_SL_ATR  = 0.8
+FLASH_TP_PCT  = TP_PRICE_PCT  # 0.15%
+FLASH_SL_MIN  = SL_PRICE_PCT * 0.5
+FLASH_SL_MAX  = SL_PRICE_PCT * 1.2
+FLASH_TRAILING = False
+FLASH_USE_IOC  = True
 
-# Defaults (usati dal backtest e come fallback)
-SL_ATR_MULT = TREND_SL_ATR     # default = TREND
+# Defaults
+SL_ATR_MULT = TREND_SL_ATR
 TP_RR = TREND_TP_RR
 SL_MIN_PCT = TREND_SL_MIN
 SL_MAX_PCT = TREND_SL_MAX
@@ -289,35 +289,96 @@ def update_fleet_daily_pnl(btc_pnl):
               "reason": f"Daily loss {loss_pct:.1f}% (${total:.2f})", "ts": time.time()})
         log(f"[FLEET] 🚨 KILL SWITCH — loss {loss_pct:.1f}% (${total:.2f})")
         tg(f"🚨 <b>KILL SWITCH</b> attivato\nLoss: {loss_pct:.1f}% (${total:.2f})")
+        execute_kill_switch()
 
 def compute_hourly_bias():
     """
-    AI analisi macro ogni ora: OI, Funding, regime → bias giornaliero.
-    LONG_ONLY: OI sale + funding negativo + regime BULL
-    SHORT_ONLY: OI scende + funding positivo alto + regime BEAR
-    NEUTRAL: tutto il resto
+    AI Macro Analysis — ogni ora analizza OI, Funding, regime e decide il bias.
+    Usa Claude Haiku per analisi contestuale, fallback a regole se AI non disponibile.
+    Il bias viene pubblicato su Redis per il Combined Bot.
     """
     fz = get_funding_z()
     oi = get_oi_change()
+    mid = get_mid()
+    funding_raw = get_funding()
 
-    if _regime == "BULL" and fz < 0 and oi > 0.01:
+    # Prova AI macro analysis
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if api_key:
+            prompt = (
+                f"You are a BTC market analyst for a trading fleet.\n"
+                f"Current data:\n"
+                f"- Regime 4h: {_regime}\n"
+                f"- BTC price: ${mid:,.0f}\n"
+                f"- Funding rate: {funding_raw*100:.4f}% (z-score: {fz:+.1f})\n"
+                f"- OI change: {oi:+.2%}\n"
+                f"- Funding history z-score interpretation: >2 = extremely crowded long, <-2 = crowded short\n\n"
+                f"Decide the BIAS for the altcoin fleet:\n"
+                f"- LONG_ONLY: BTC bullish, safe to go long on altcoins\n"
+                f"- SHORT_ONLY: BTC bearish, only short altcoins\n"
+                f"- NEUTRAL: mixed signals, both directions ok\n\n"
+                f"JSON only: {{\"bias\":\"LONG_ONLY|SHORT_ONLY|NEUTRAL\",\"reason\":\"<10 words>\",\"confidence\":<1-10>}}"
+            )
+            resp = requests.post("https://api.anthropic.com/v1/messages",
+                headers={"Content-Type":"application/json","x-api-key":api_key,
+                         "anthropic-version":"2023-06-01"},
+                json={"model":"claude-haiku-4-5-20251001","max_tokens":100,
+                      "messages":[{"role":"user","content":prompt}]}, timeout=15)
+            if resp.status_code == 200:
+                txt = resp.json()["content"][0]["text"]
+                s = txt.find("{"); e = txt.rfind("}")+1
+                if s >= 0 and e > s:
+                    aj = json.loads(txt[s:e])
+                    bias = aj.get("bias", "NEUTRAL").upper()
+                    reason = f"AI:{aj.get('reason','')} conf:{aj.get('confidence',5)}"
+                    if bias in ("LONG_ONLY","SHORT_ONLY","NEUTRAL"):
+                        publish_bias(bias, reason)
+                        log(f"[FLEET] 🧠 AI Bias: {bias} | {reason}")
+                        return bias
+    except Exception as ex:
+        log(f"[FLEET] AI bias error: {ex}")
+
+    # Fallback: regole meccaniche
+    if _regime == "BULL" and fz < 0:
         bias = "LONG_ONLY"
-        reason = f"BULL + FZ:{fz:+.1f}(paid to long) + OI↑{oi:+.1%}"
-    elif _regime == "BEAR" and fz > 1.5 and oi < -0.01:
-        bias = "SHORT_ONLY"
-        reason = f"BEAR + FZ:{fz:+.1f}(crowded long) + OI↓{oi:+.1%}"
+        reason = f"BULL + FZ:{fz:+.1f}"
     elif _regime == "BEAR" and fz > 0.5:
         bias = "SHORT_ONLY"
         reason = f"BEAR + FZ:{fz:+.1f}"
-    elif _regime == "BULL" and fz < -0.5:
-        bias = "LONG_ONLY"
-        reason = f"BULL + FZ:{fz:+.1f}"
     else:
         bias = "NEUTRAL"
         reason = f"{_regime} + FZ:{fz:+.1f} + OI:{oi:+.1%}"
 
     publish_bias(bias, reason)
     return bias
+
+def execute_kill_switch():
+    """
+    KILL SWITCH: chiude TUTTE le posizioni aperte su entrambi i bot.
+    Chiamato quando il daily loss supera il 3%.
+    """
+    pos = get_position()
+    if pos:
+        szi = pos["szi"]
+        d = "LONG" if szi > 0 else "SHORT"
+        mid = get_mid()
+        size_abs = rpx(abs(szi), _coin_meta.get("sz_dec", 5))
+        close_px = rpx(mid * (0.995 if d == "LONG" else 1.005),
+                       _coin_meta.get("px_dec", 1))
+        try:
+            call(_exchange.order, COIN, d != "LONG", size_abs, close_px,
+                 {"limit": {"tif": "Ioc"}}, False, timeout=15)
+            log(f"[FLEET] 🚨 KILL: chiuso {d} BTC @ {mid:.0f}")
+            tg(f"🚨 <b>KILL SWITCH</b> — chiuso BTC {d}")
+            # Cancella tutti gli ordini
+            for o in get_open_orders():
+                if o.get("coin") == COIN:
+                    try: call(_exchange.cancel, COIN, o["oid"], timeout=10)
+                    except: pass
+        except Exception as e:
+            log(f"[FLEET] KILL error: {e}")
+            tg(f"🚨 KILL SWITCH ERROR: {e}")
 
 def load_state():
     global _trades_today, _consec_losses, _params, _pending_order
@@ -623,7 +684,7 @@ def run_backtest():
     adx1h = merged['adx_1h'].values.astype(np.float64)
 
     n = len(c)
-    fwd = 12  # 12 candele 15m = 3h max hold
+    fwd = 12  # 12 candele 15m = 3h — TP 0.15% si raggiunge in minuti
     results = {}
 
     for sig_name, sig_dir, sig_cond in [
@@ -694,7 +755,7 @@ def run_backtest():
                 tp_d = px_i * m_tp_fixed
             else:
                 tp_d = sl_d * m_tp_rr
-            tp_d = max(tp_d, px_i * 0.002)  # floor 0.2%
+            tp_d = max(tp_d, px_i * TP_PRICE_PCT * 0.8)  # floor
 
             if sig_dir == "LONG":
                 tp_hits = np.where(h[i+1:i+fwd] >= px_i + tp_d)[0]
@@ -987,7 +1048,7 @@ def check_signal():
         tp_dist = sl_dist * TREND_TP_RR * tp_adj_redis / lev_scale
 
     # TP floor (non scalano con leva)
-    tp_dist = max(tp_dist, px * 0.002)  # min 0.2%
+    tp_dist = max(tp_dist, px * TP_PRICE_PCT * 0.8)  # floor 80% del TP target
 
     # Swing SL override (se migliore dell'ATR)
     if direction == "LONG":
