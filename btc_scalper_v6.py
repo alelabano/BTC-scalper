@@ -48,15 +48,49 @@ COOLDOWN_SEC = 180             # 3 min tra trade
 SCAN_INTERVAL = 30             # check ogni 30s per entry veloci
 REGIME_INTERVAL = 300          # ricalcola regime ogni 5 min
 
-# SL/TP — adattati per BTC 15m (meno noise, più spazio)
-SL_ATR_MULT = 2.0              # SL = 2.0 × ATR(14) su 15m
-TP_RR = 1.8                    # TP = SL × 1.8 (R:R 1:1.8)
-SL_MIN_PCT = 0.003             # SL minimo 0.3% ($220 su BTC $74k)
-SL_MAX_PCT = 0.012             # SL massimo 1.2% ($888)
+# SL/TP — Dynamic Scalping Modes
+# Mode auto-detected ogni ciclo basato su volatilità, ADX, volume
+
+# MODE 1: RANGE SCALPING (Mean Reversion)
+# Quando: ADX < 20, prezzo tra BB, volatilità bassa
+# Strategia: compra supporto, vendi resistenza, TP fisso stretto
+RANGE_SL_ATR     = 1.5
+RANGE_TP_PCT     = 0.004       # TP fisso 0.4%
+RANGE_SL_MIN     = 0.002       # SL min 0.2%
+RANGE_SL_MAX     = 0.006       # SL max 0.6%
+RANGE_TRAILING   = False       # no trailing, TP fisso
+
+# MODE 2: TREND SCALPING (Momentum Pullback)
+# Quando: ADX > 25, regime direzionale, candele con volume
+# Strategia: entra sui pullback, trailing lascia correre
+TREND_SL_ATR     = 2.0
+TREND_TP_RR      = 2.0         # R:R 1:2 (lascia correre)
+TREND_SL_MIN     = 0.003       # SL min 0.3%
+TREND_SL_MAX     = 0.012       # SL max 1.2%
+TREND_TRAILING   = True        # trailing attivo
+TREND_TRAIL_ATR  = 1.0
+TREND_PARTIAL    = 0.6         # partial close al 60% TP
+
+# MODE 3: FLASH SCALPING (Volatility Expansion)
+# Quando: volume spike >3x, funding z-score estremo, ATR spike
+# Strategia: breakout puro, TP fulmineo, ordini IoC market
+FLASH_SL_ATR     = 1.0         # SL stretto (momentum forte)
+FLASH_TP_PCT     = 0.003       # TP 0.3% — esci subito
+FLASH_SL_MIN     = 0.0015      # SL min 0.15%
+FLASH_SL_MAX     = 0.005       # SL max 0.5%
+FLASH_TRAILING   = False       # no trailing, esci veloce
+FLASH_USE_IOC    = True        # forza IoC, no GTC (velocità)
+
+# Defaults (usati dal backtest e come fallback)
+SL_ATR_MULT = TREND_SL_ATR     # default = TREND
+TP_RR = TREND_TP_RR
+SL_MIN_PCT = TREND_SL_MIN
+SL_MAX_PCT = TREND_SL_MAX
 TRAILING_ACTIVATE = 0.5
-TRAILING_ATR = 1.0             # trailing = 1.0 × ATR (più largo su 15m)
-PARTIAL_CLOSE_PCT = 0.6        # chiudi 50% posizione al 60% del TP
-FUNDING_BLOCK_THRESH = 0.0003  # blocca entry se funding > 0.03% contro
+TRAILING_ATR = TREND_TRAIL_ATR
+PARTIAL_CLOSE_PCT = TREND_PARTIAL
+
+FUNDING_BLOCK_THRESH = 0.0003
 
 # Order execution
 SLIPPAGE = 0.001               # 0.1% slippage base per limit orders
@@ -388,6 +422,17 @@ def build(df):
     df['hh'] = (df['high'] > df['high'].rolling(10).max().shift(1)).astype(int)
     df['ll'] = (df['low']  < df['low'].rolling(10).min().shift(1)).astype(int)
 
+    # ADX — Average Directional Index (trend strength)
+    plus_dm = df['high'].diff()
+    minus_dm = -df['low'].diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+    atr14 = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.rolling(14).mean() / (atr14 + 1e-10))
+    minus_di = 100 * (minus_dm.rolling(14).mean() / (atr14 + 1e-10))
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+    df['adx'] = dx.rolling(14).mean()
+
     return df.dropna(subset=['rsi','atr','ema200'])
 
 def fetch_df(tf, days):
@@ -631,6 +676,34 @@ def check_signal():
     slope5 = float(r['ema_slope'])
     vol5  = float(r['vol_rel'])
     bb5   = float(r['bb_pos'])
+    adx15 = float(r.get('adx', 20))
+
+    rsi1h  = float(h['rsi'])
+    macd1h = float(h['macd_hist'])
+    ema9_1h = float(h['ema9'])
+    ema21_1h = float(h['ema21'])
+    slope1h = float(h['ema_slope'])
+    adx1h  = float(h.get('adx', 20))
+
+    # ══════════════════════════════════════════════════════════
+    # DETECT SCALP MODE
+    # ══════════════════════════════════════════════════════════
+    fz = get_funding_z()
+
+    # MODE 3: FLASH — volume spike >3x O funding z-score estremo (>2.5)
+    if vol5 >= 3.0 or abs(fz) > 2.5:
+        scalp_mode = "FLASH"
+    # MODE 2: TREND — ADX > 25 e regime direzionale
+    elif adx1h > 25 and regime in ("BULL", "BEAR"):
+        scalp_mode = "TREND"
+    # MODE 1: RANGE — ADX < 20, prezzo tra le BB
+    elif adx1h < 20 and -0.8 < bb5 < 0.8:
+        scalp_mode = "RANGE"
+    # Fallback: TREND se ADX > 20, RANGE altrimenti
+    elif adx1h >= 20:
+        scalp_mode = "TREND"
+    else:
+        scalp_mode = "RANGE"
 
     rsi1h  = float(h['rsi'])
     macd1h = float(h['macd_hist'])
@@ -751,67 +824,71 @@ def check_signal():
 
     details += f" | AI:{ai_confidence}/10 {ai_note}"
 
-    # ── Funding z-score e OI ──
+    # ── Funding z-score e OI (already called for mode detect) ──
     update_funding_oi()
-    fz = get_funding_z()
     oi_chg = get_oi_change()
-    details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%}"
+    details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
-    # ── SL / TP con lev_scale + adjustment adattivi ──
-    # lev_scale: se Hyperliquid applica leva diversa da richiesta,
-    # lo SL deve scalare per compensare (come V4).
-    # Il TP NON scala — deve restare raggiungibile.
+    # ── SL / TP — MODE ADAPTIVE + lev_scale ──
     actual_lev = get_effective_lev()
     lev_scale = LEVERAGE / max(actual_lev, 1)
     if lev_scale != 1.0:
-        log(f"⚠️ Lev {actual_lev}x vs {LEVERAGE}x → SL scala ×{lev_scale:.2f}")
+        log(f"⚠️ Lev {actual_lev}x vs {LEVERAGE}x → SL ×{lev_scale:.2f}")
 
     sl_adj_redis, tp_adj_redis = get_sl_tp_adjustments()
-    sl_mult_final = SL_ATR_MULT * sl_adj_redis * ai_sl_adj * lev_scale  # SL scala con leva
-    tp_rr_final = TP_RR * tp_adj_redis  # TP NON scala con leva
-    buffer = px * 0.002 * lev_scale  # buffer per swing SL
+    buffer = px * 0.002 * lev_scale
 
-    sl_dist = atr5 * sl_mult_final
-    sl_dist = max(sl_dist, px * SL_MIN_PCT * lev_scale)
-    sl_dist = min(sl_dist, px * SL_MAX_PCT * lev_scale)
-    tp_dist = sl_dist * tp_rr_final / lev_scale  # TP basato su SL pre-scala
+    if scalp_mode == "FLASH":
+        # FLASH: SL stretto, TP fisso 0.3%, no trailing
+        sl_atr_m = FLASH_SL_ATR * lev_scale * sl_adj_redis * ai_sl_adj
+        sl_dist = atr5 * sl_atr_m
+        sl_dist = max(sl_dist, px * FLASH_SL_MIN * lev_scale)
+        sl_dist = min(sl_dist, px * FLASH_SL_MAX * lev_scale)
+        tp_dist = px * FLASH_TP_PCT * tp_adj_redis
 
-    # TP floor e cap (non scalano con leva)
-    tp_floor = px * 0.003
-    tp_cap = px * 0.02  # max 2% per BTC scalping
-    tp_dist = max(tp_dist, tp_floor)
-    tp_dist = min(tp_dist, tp_cap)
+    elif scalp_mode == "RANGE":
+        # RANGE: SL da ATR, TP fisso 0.4%
+        sl_atr_m = RANGE_SL_ATR * lev_scale * sl_adj_redis * ai_sl_adj
+        sl_dist = atr5 * sl_atr_m
+        sl_dist = max(sl_dist, px * RANGE_SL_MIN * lev_scale)
+        sl_dist = min(sl_dist, px * RANGE_SL_MAX * lev_scale)
+        tp_dist = px * RANGE_TP_PCT * tp_adj_redis
 
+    else:  # TREND
+        # TREND: SL da ATR, TP da R:R (trailing farà il resto)
+        sl_atr_m = TREND_SL_ATR * lev_scale * sl_adj_redis * ai_sl_adj
+        sl_dist = atr5 * sl_atr_m
+        sl_dist = max(sl_dist, px * TREND_SL_MIN * lev_scale)
+        sl_dist = min(sl_dist, px * TREND_SL_MAX * lev_scale)
+        tp_dist = sl_dist * TREND_TP_RR * tp_adj_redis / lev_scale
+
+    # TP floor (non scalano con leva)
+    tp_dist = max(tp_dist, px * 0.002)  # min 0.2%
+
+    # Swing SL override (se migliore dell'ATR)
     if direction == "LONG":
         swing_low = float(df_15m['low'].iloc[-10:].min())
         swing_sl = px - swing_low + buffer
-        if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px * lev_scale:
+        sl_min = px * (FLASH_SL_MIN if scalp_mode=="FLASH" else RANGE_SL_MIN if scalp_mode=="RANGE" else TREND_SL_MIN)
+        sl_max = px * (FLASH_SL_MAX if scalp_mode=="FLASH" else RANGE_SL_MAX if scalp_mode=="RANGE" else TREND_SL_MAX) * lev_scale
+        if sl_min < swing_sl < sl_max:
             sl_dist = swing_sl
-            sl_dist = max(sl_dist, px * SL_MIN_PCT * lev_scale)
-            sl_dist = min(sl_dist, px * SL_MAX_PCT * lev_scale)
-            tp_dist = sl_dist * tp_rr_final / lev_scale
-            tp_dist = max(tp_dist, tp_floor)
-            tp_dist = min(tp_dist, tp_cap)
         sl = px - sl_dist
         tp = px + tp_dist
     else:
         swing_high = float(df_15m['high'].iloc[-10:].max())
         swing_sl = swing_high - px + buffer
-        if SL_MIN_PCT * px < swing_sl < SL_MAX_PCT * px * lev_scale:
+        sl_min = px * (FLASH_SL_MIN if scalp_mode=="FLASH" else RANGE_SL_MIN if scalp_mode=="RANGE" else TREND_SL_MIN)
+        sl_max = px * (FLASH_SL_MAX if scalp_mode=="FLASH" else RANGE_SL_MAX if scalp_mode=="RANGE" else TREND_SL_MAX) * lev_scale
+        if sl_min < swing_sl < sl_max:
             sl_dist = swing_sl
-            sl_dist = max(sl_dist, px * SL_MIN_PCT * lev_scale)
-            sl_dist = min(sl_dist, px * SL_MAX_PCT * lev_scale)
-            tp_dist = sl_dist * tp_rr_final / lev_scale
-            tp_dist = max(tp_dist, tp_floor)
-            tp_dist = min(tp_dist, tp_cap)
         sl = px + sl_dist
         tp = px - tp_dist
 
-    # Log SL/TP
     sl_pct = sl_dist / px * 100
     tp_pct = tp_dist / px * 100
     rr = tp_dist / sl_dist if sl_dist > 0 else 0
-    log(f"SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} lev:{actual_lev}x")
+    log(f"[{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} ADX:{adx1h:.0f} lev:{actual_lev}x")
 
     # Confidence sizing: AI confidence 1-10 → size multiplier 0.5-1.0
     size_mult = 0.5 + (ai_confidence - 1) * 0.055  # 1→0.5, 5→0.72, 10→1.0
@@ -837,7 +914,7 @@ def check_signal():
         liq_str = f" spread:{liq['spread']:.3%} imb:{liq['imbalance']:.0%}"
         details += liq_str
 
-    return (direction, sig_type, sl, tp, px, atr5, details, sl_dist, size_mult, regime, setup)
+    return (direction, sig_type, sl, tp, px, atr5, details, sl_dist, size_mult, regime, setup, scalp_mode)
 
 # ================================================================
 # EXECUTION
@@ -1538,7 +1615,7 @@ def maybe_send_daily_report():
     tg(report)
     log(f"📊 Daily report sent: {len(trades)} trades ${total:+.2f}")
 
-def open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0):
+def open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0, scalp_mode="TREND"):
     global _last_trade_ts, _is_trading
 
     # Lock: previeni race condition (ordini doppi)
@@ -1548,11 +1625,11 @@ def open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1
     _is_trading = True
 
     try:
-        return _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult)
+        return _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult, scalp_mode)
     finally:
         _is_trading = False
 
-def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0):
+def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0, scalp_mode="TREND"):
     global _last_trade_ts
     is_buy = direction == "LONG"
 
@@ -1589,7 +1666,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         pass
 
     # Calcola decimali effettivi — garantisce SL ≠ entry ≠ TP dopo round
-    eff_dec = effective_price_dec(entry, sl, sl + (sl - entry) * TP_RR if entry > sl else entry - (entry - sl) * TP_RR, px_dec)
+    eff_dec = effective_price_dec(entry, sl, tp, px_dec)
 
     sl_px = rpx(sl, eff_dec)
     tp_px = rpx(tp, eff_dec)
@@ -1603,70 +1680,70 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         tp_px = rpx(tp, eff_dec)
         log(f"⚠️ px_dec alzato a {eff_dec} per distinguere SL/TP")
 
-    log(f"{'🟢' if is_buy else '🔴'} ORDER {COIN} {direction} @ {entry} size:{size} "
-        f"SL:{sl_px}({sl_dist/entry*100:.2f}%) TP:{tp_px}({sl_dist*TP_RR/entry*100:.2f}%) "
+    tp_rr_display = tp_dist / sl_dist if sl_dist > 0 else 0
+    log(f"{'🟢' if is_buy else '🔴'} ORDER {COIN} {direction} [{scalp_mode}] @ {entry} size:{size} "
+        f"SL:{sl_px}({sl_dist/entry*100:.2f}%) TP:{tp_px}({tp_dist/entry*100:.2f}%) R:R=1:{tp_rr_display:.1f} "
         f"risk:${RISK_USD*size_mult:.1f} notional:${notional:.0f}")
 
     # ══════════════════════════════════════════════════════════════
-    # EXECUTION: GTC Maker → IoC Taker fallback
-    # ══════════════════════════════════════════════════════════════
-    # Step 1: GTC limit @ mid ± SLIPPAGE (0.1%) — fee Maker basse
-    #         Attende GTC_TIMEOUT (6s). Se fillato = ottimo.
-    # Step 2: Se non fillato, cancella GTC e usa IoC @ slippage dinamico
-    #         basato su ATR (volatilità). Fill garantito, fee Taker.
+    # EXECUTION — mode-adaptive
+    # FLASH: IoC diretto (velocità, no GTC)
+    # RANGE/TREND: GTC Maker → IoC fallback
     # ══════════════════════════════════════════════════════════════
 
     filled = False
 
-    # ── STEP 1: GTC MAKER ──
-    try:
-        fresh_mid = get_mid()
-        if fresh_mid <= 0: return False
+    # ── STEP 1: GTC MAKER (skip in FLASH mode) ──
+    if scalp_mode == "FLASH":
+        log(f"⚡ FLASH mode — skip GTC, direct IoC")
+    else:
+        try:
+            fresh_mid = get_mid()
+            if fresh_mid <= 0: return False
 
-        drift = (fresh_mid - entry_px) / entry_px
-        if (is_buy and drift > DRIFT_MAX_FAVORABLE) or (not is_buy and drift < -DRIFT_MAX_FAVORABLE):
-            log(f"Drift {drift:+.3%} — too late"); return False
-        if (is_buy and drift < -DRIFT_MAX_ADVERSE) or (not is_buy and drift > DRIFT_MAX_ADVERSE):
-            log(f"Drift {drift:+.3%} — invalidated"); return False
+            drift = (fresh_mid - entry_px) / entry_px
+            if (is_buy and drift > DRIFT_MAX_FAVORABLE) or (not is_buy and drift < -DRIFT_MAX_FAVORABLE):
+                log(f"Drift {drift:+.3%} — too late"); return False
+            if (is_buy and drift < -DRIFT_MAX_ADVERSE) or (not is_buy and drift > DRIFT_MAX_ADVERSE):
+                log(f"Drift {drift:+.3%} — invalidated"); return False
 
-        # Ricalcola SL/TP da fresh mid
-        if abs(drift) > 0.001:
-            if is_buy:
-                sl_px = rpx(fresh_mid - sl_dist, eff_dec)
-                tp_px = rpx(fresh_mid + sl_dist * TP_RR, eff_dec)
-            else:
-                sl_px = rpx(fresh_mid + sl_dist, eff_dec)
-                tp_px = rpx(fresh_mid - sl_dist * TP_RR, eff_dec)
+            if abs(drift) > 0.001:
+                if is_buy:
+                    sl_px = rpx(fresh_mid - sl_dist, eff_dec)
+                    tp_px = rpx(fresh_mid + tp_dist, eff_dec)
+                else:
+                    sl_px = rpx(fresh_mid + sl_dist, eff_dec)
+                    tp_px = rpx(fresh_mid - tp_dist, eff_dec)
 
-        gtc_px = rpx(fresh_mid * (1 + SLIPPAGE) if is_buy else fresh_mid * (1 - SLIPPAGE), eff_dec)
-        res = call(_exchange.order, COIN, is_buy, size, gtc_px,
-                   {"limit": {"tif": "Gtc"}}, False, timeout=15)
-        log(f"GTC Maker @ {gtc_px}: {res}")
+            gtc_px = rpx(fresh_mid * (1 + SLIPPAGE) if is_buy else fresh_mid * (1 - SLIPPAGE), eff_dec)
+            res = call(_exchange.order, COIN, is_buy, size, gtc_px,
+                       {"limit": {"tif": "Gtc"}}, False, timeout=15)
+            log(f"GTC Maker @ {gtc_px}: {res}")
 
-        oid_gtc = None
-        if res and res.get("status") == "ok":
-            for s in res.get("response",{}).get("data",{}).get("statuses",[]):
-                if "filled" in s:
-                    filled = True
-                    log(f"✅ GTC instant fill (maker)")
-                    break
-                if "resting" in s:
-                    oid_gtc = s["resting"]["oid"]
-
-            if not filled and oid_gtc:
-                for tick in range(GTC_TIMEOUT * 2):
-                    time.sleep(0.5)
-                    p = get_position()
-                    if p and p.get("szi", 0) != 0:
+            oid_gtc = None
+            if res and res.get("status") == "ok":
+                for s in res.get("response",{}).get("data",{}).get("statuses",[]):
+                    if "filled" in s:
                         filled = True
-                        log(f"✅ GTC filled in {(tick+1)*0.5:.1f}s (maker)")
+                        log(f"✅ GTC instant fill (maker)")
                         break
-                if not filled:
-                    try: call(_exchange.cancel, COIN, oid_gtc, timeout=10)
-                    except: pass
-                    log(f"GTC not filled in {GTC_TIMEOUT}s")
-    except Exception as e:
-        log(f"GTC error: {e}")
+                    if "resting" in s:
+                        oid_gtc = s["resting"]["oid"]
+
+                if not filled and oid_gtc:
+                    for tick in range(GTC_TIMEOUT * 2):
+                        time.sleep(0.5)
+                        p = get_position()
+                        if p and p.get("szi", 0) != 0:
+                            filled = True
+                            log(f"✅ GTC filled in {(tick+1)*0.5:.1f}s (maker)")
+                            break
+                    if not filled:
+                        try: call(_exchange.cancel, COIN, oid_gtc, timeout=10)
+                        except: pass
+                        log(f"GTC not filled in {GTC_TIMEOUT}s")
+        except Exception as e:
+            log(f"GTC error: {e}")
 
     # ── STEP 2: IoC TAKER (fallback) ──
     if not filled:
@@ -1761,7 +1838,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 def main():
     global _last_trade_ts
     log(f"🚀 BTC SCALPER V6")
-    log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x SL:{SL_ATR_MULT}×ATR R:R=1:{TP_RR}")
+    log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x Modes:RANGE/TREND/FLASH")
 
     load_state()
 
@@ -1997,12 +2074,14 @@ def main():
                         atr_now = float(df_mgmt.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
-                # ── Trailing stop meccanico ──
-                if atr_now > 0:
+                # ── Trailing stop meccanico (solo TREND mode) ──
+                trade_mode = last_pos_state.get("scalp_mode", "TREND")
+                if atr_now > 0 and trade_mode == "TREND":
                     update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
 
-                # ── Partial close ──
-                check_partial_close(last_pos_state, mid, sz_dec, px_dec)
+                # ── Partial close (solo TREND mode) ──
+                if trade_mode == "TREND":
+                    check_partial_close(last_pos_state, mid, sz_dec, px_dec)
 
                 # ── AI management ogni 2 minuti ──
                 mgmt_interval = 120
@@ -2124,8 +2203,8 @@ def main():
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup = sig
-            log(f"📡 SIGNAL: {direction} {sig_type} | {regime} | {details}")
+            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode = sig
+            log(f"📡 SIGNAL: {direction} {sig_type} [{scalp_mode}] | {regime} | {details}")
 
             # ── Funding check ──
             if not is_funding_ok(direction):
@@ -2133,7 +2212,7 @@ def main():
                 continue
 
             # ── Execute ──
-            success = open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult)
+            success = open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult, scalp_mode)
             if success:
                 p = get_position()
                 if p:
@@ -2143,6 +2222,7 @@ def main():
                     last_pos_state["sl_original"] = sl
                     last_pos_state["tp_original"] = tp
                     last_pos_state["regime"] = sig_regime
+                    last_pos_state["scalp_mode"] = scalp_mode
                     last_pos_state["setup_score"] = setup
                     last_pos_state["ai_confidence"] = ai_confidence if 'ai_confidence' in dir() else 7
                     last_pos_state["last_mgmt"] = 0
