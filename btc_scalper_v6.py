@@ -2100,18 +2100,7 @@ def processor_thread(sz_dec, px_dec):
             
             sig = check_signal()
             if sig is None:
-                # Log perché non c'è segnale — mostra indicatori
-                try:
-                    f_15m = fetch_df("15m", 1)
-                    if f_15m is not None and len(f_15m) >= 5:
-                        r = f_15m.iloc[-1]
-                        rsi = float(r['rsi']); macd = float(r['macd_hist'])
-                        slope = float(r['ema_slope']); adx = float(r.get('adx', 20))
-                        log(f"[PROC] RSI:{rsi:.0f} MACD:{macd:+.1f} slope:{slope:+.4f} ADX:{adx:.0f} → no signal")
-                    else:
-                        log(f"[PROC] no data → no signal")
-                except:
-                    log(f"[PROC] no signal | {_regime} | BTC ${mid:,.0f}")
+                log(f"[PROC] no signal | {_regime} | BTC ${mid:,.0f}")
                 time.sleep(SCAN_INTERVAL)
                 continue
             
