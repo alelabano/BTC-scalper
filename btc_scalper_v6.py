@@ -1885,6 +1885,7 @@ def main():
 
     # Run backtest all'avvio
     run_backtest()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] backtest done", flush=True)
 
     # Recovery: load pos_state da Redis o detect posizione orfana
     last_pos_state = load_pos_state()
@@ -1899,9 +1900,11 @@ def main():
             save_pos_state(None)
     else:
         last_pos_state = recover_position(sz_dec, px_dec)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] recovery done", flush=True)
 
     # Cleanup ordini orfani
     cleanup_orphan_orders()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] cleanup done — entering loop", flush=True)
 
     cycle = 0
 
