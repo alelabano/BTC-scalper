@@ -230,8 +230,94 @@ def _rset(key, val):
 _trades_today = []
 _last_trade_ts = 0
 _consec_losses = 0
-_params = {}   # adaptive parameters from Redis
-_is_trading = False  # lock: blocca nuovi segnali mentre un ordine è in esecuzione
+_params = {}
+_is_trading = False
+
+# ================================================================
+# SHARED REDIS — BTC Scalper = Radar, Combined Bot = Fleet
+# ================================================================
+# Keys condivise tra i 2 worker:
+#   fleet:bias        → "LONG_ONLY" | "SHORT_ONLY" | "NEUTRAL" (set dal BTC Scalper)
+#   fleet:btc_regime  → "BULL" | "BEAR" | "RANGE" (regime 4h dal BTC Scalper)
+#   fleet:btc_pos     → {"direction":"LONG","size":0.01,"entry":74000} o null
+#   fleet:kill_switch → true/false (emergency stop per entrambi)
+#   fleet:daily_pnl   → {"btc": -3.2, "alt": 1.5, "total": -1.7, "ts": ...}
+#   fleet:dominance   → {"btc_dom_trend": "UP"|"DOWN"|"FLAT", "ts": ...}
+
+def publish_bias(bias, reason=""):
+    """BTC Scalper pubblica il bias giornaliero per il Combined Bot."""
+    data = {"bias": bias, "reason": reason, "ts": time.time()}
+    _rset("fleet:bias", data)
+    log(f"[FLEET] Bias pubblicato: {bias} | {reason}")
+
+def publish_btc_regime(regime):
+    """Pubblica regime BTC 4h — Combined Bot lo legge."""
+    _rset("fleet:btc_regime", {"regime": regime, "ts": time.time()})
+
+def publish_btc_position(pos):
+    """Pubblica posizione BTC — Combined Bot evita correlazione."""
+    if pos:
+        d = "LONG" if pos["szi"] > 0 else "SHORT"
+        _rset("fleet:btc_pos", {"direction": d, "size": abs(pos["szi"]),
+                                 "entry": pos["entry"], "ts": time.time()})
+    else:
+        _rset("fleet:btc_pos", None)
+
+def check_kill_switch():
+    """Controlla se il kill switch globale è attivo."""
+    ks = _rget("fleet:kill_switch")
+    if ks and ks.get("active"):
+        return True, ks.get("reason", "kill switch")
+    return False, ""
+
+def update_fleet_daily_pnl(btc_pnl):
+    """Aggiorna PnL giornaliero condiviso. Attiva kill switch se > 3% loss."""
+    existing = _rget("fleet:daily_pnl") or {}
+    alt_pnl = existing.get("alt", 0)
+    total = btc_pnl + alt_pnl
+    bal = get_balance()
+    loss_pct = abs(total) / max(bal, 1) * 100 if total < 0 else 0
+
+    _rset("fleet:daily_pnl", {
+        "btc": round(btc_pnl, 2), "alt": round(alt_pnl, 2),
+        "total": round(total, 2), "loss_pct": round(loss_pct, 1),
+        "ts": time.time()
+    })
+
+    if loss_pct >= 3.0:
+        _rset("fleet:kill_switch", {"active": True,
+              "reason": f"Daily loss {loss_pct:.1f}% (${total:.2f})", "ts": time.time()})
+        log(f"[FLEET] 🚨 KILL SWITCH — loss {loss_pct:.1f}% (${total:.2f})")
+        tg(f"🚨 <b>KILL SWITCH</b> attivato\nLoss: {loss_pct:.1f}% (${total:.2f})")
+
+def compute_hourly_bias():
+    """
+    AI analisi macro ogni ora: OI, Funding, regime → bias giornaliero.
+    LONG_ONLY: OI sale + funding negativo + regime BULL
+    SHORT_ONLY: OI scende + funding positivo alto + regime BEAR
+    NEUTRAL: tutto il resto
+    """
+    fz = get_funding_z()
+    oi = get_oi_change()
+
+    if _regime == "BULL" and fz < 0 and oi > 0.01:
+        bias = "LONG_ONLY"
+        reason = f"BULL + FZ:{fz:+.1f}(paid to long) + OI↑{oi:+.1%}"
+    elif _regime == "BEAR" and fz > 1.5 and oi < -0.01:
+        bias = "SHORT_ONLY"
+        reason = f"BEAR + FZ:{fz:+.1f}(crowded long) + OI↓{oi:+.1%}"
+    elif _regime == "BEAR" and fz > 0.5:
+        bias = "SHORT_ONLY"
+        reason = f"BEAR + FZ:{fz:+.1f}"
+    elif _regime == "BULL" and fz < -0.5:
+        bias = "LONG_ONLY"
+        reason = f"BULL + FZ:{fz:+.1f}"
+    else:
+        bias = "NEUTRAL"
+        reason = f"{_regime} + FZ:{fz:+.1f} + OI:{oi:+.1%}"
+
+    publish_bias(bias, reason)
+    return bias
 
 def load_state():
     global _trades_today, _consec_losses, _params, _pending_order
@@ -1911,6 +1997,11 @@ def scanner_thread():
             log(f"[SCAN]  FZ:{fz:+.1f} | OI:{oi:+.2%} | Bal ${bal:.2f}")
             log(f"[SCAN] ════════════════════════════════════════════════════")
 
+            # ── FLEET: pubblica regime e bias per Combined Bot ──
+            publish_btc_regime(regime)
+            bias = compute_hourly_bias()
+            log(f"[SCAN] [FLEET] Bias: {bias} | Regime: {regime}")
+
         except Exception as e:
             log(f"[SCAN] Error: {e}")
             import traceback; traceback.print_exc()
@@ -2080,6 +2171,11 @@ def executor_thread(sz_dec, px_dec):
                 
                 log(f"[EXEC] {emoji} CLOSED {d} {sig_type} | {close_reason} | ${pnl_usd:+.2f} ({pnl_pct:+.2f}%) | {dur_str}")
                 tg(f"{emoji} <b>BTC {d} CLOSED</b>\n📊 PnL: ${pnl_usd:+.2f} ({pnl_pct:+.2f}%)\n🏷 {close_reason}\n📍 {entry:.1f}→{exit_px:.1f} | {dur_str}")
+
+                # FLEET: aggiorna PnL condiviso
+                daily_btc_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
+                update_fleet_daily_pnl(daily_btc_pnl)
+
                 last_pos_state = None
             
             # ── Trade management (in posizione) ──
@@ -2163,6 +2259,16 @@ def executor_thread(sz_dec, px_dec):
                 time.sleep(SCAN_INTERVAL)
                 continue
             
+            # ── FLEET: pubblica posizione BTC ──
+            publish_btc_position(pos)
+
+            # ── Kill switch globale ──
+            ks, ks_reason = check_kill_switch()
+            if ks:
+                if cycle % 6 == 1: log(f"[EXEC] 🚨 KILL SWITCH: {ks_reason}")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
             # ── Check for new signal ──
             cb, cb_reason = check_circuit_breaker()
             if cb:
