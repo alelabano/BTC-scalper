@@ -2070,16 +2070,6 @@ def main():
 
             last_pos_state = pos
 
-            # ── Status log ──
-            # ── Status log ──
-            if cycle % 10 == 1:  # ogni 10 × 30s = 5 min
-                bal = get_balance()
-                daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t["ts"]<86400)
-                n_today = len([t for t in _trades_today if time.time()-t["ts"]<86400])
-                pos_str = f"{'LONG' if pos['szi']>0 else 'SHORT'} @ {pos['entry']}" if pos else "flat"
-                log(f"#{cycle} ${bal:.2f} | {regime} | {pos_str} | "
-                    f"today: {n_today} trades ${daily_pnl:+.2f} | BTC ${mid:,.0f}")
-
             # ── Refresh backtest every hour ──
             if cycle % 120 == 0:  # 120 × 30s = 1h
                 run_backtest()
@@ -2291,10 +2281,16 @@ def main():
         except Exception as e:
             log(f"Loop error: {e}")
 
-        # Heartbeat OGNI ciclo — Railway killa senza output
-        print(f".", end="", flush=True)
-        if cycle % 10 == 0:
-            print(f" [cycle {cycle}]", flush=True)  # newline ogni 5min
+        # Heartbeat OGNI ciclo — Railway richiede newline
+        if cycle % 10 == 1:
+            bal = get_balance()
+            daily_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
+            n_today = len([t for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400])
+            pos_str = f"{'LONG' if pos['szi']>0 else 'SHORT'} @ {pos['entry']}" if pos else "flat"
+            log(f"#{cycle} ${bal:.2f} | {regime} | {pos_str} | "
+                    f"today: {n_today} trades ${daily_pnl:+.2f} | BTC ${mid:,.0f}")
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] #{cycle}", flush=True)
 
         time.sleep(SCAN_INTERVAL)
 
