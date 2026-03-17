@@ -97,13 +97,43 @@ def call(fn, *a, timeout=15, **kw):
     except FuturesTimeout: raise TimeoutError(f"Timeout {fn.__name__}")
 
 def round_to_precision(value, precision):
-    """Arrotonda al numero esatto di decimali accettati dall'exchange."""
+    """Arrotonda al numero esatto di decimali accettati dall'exchange.
+    Usa format string come V4 — più preciso di round() per float."""
     if precision == 0:
         return int(round(float(value)))
-    return round(float(value), precision)
+    try:
+        return float(f"{float(value):.{int(precision)}f}")
+    except:
+        return round(float(value), 2)
 
 # Alias breve per uso interno
 rpx = round_to_precision
+
+def min_decimals_for_price(px):
+    """
+    Calcola i decimali minimi perché round(px) mantenga significatività.
+    Es: px=0.048 con dec=2 → 0.05 (errore 4%) → serve dec=3.
+    Per BTC ($73692) → dec=0 è sufficiente.
+    """
+    if px <= 0: return 6
+    for d in range(0, 10):
+        rounded = round(px, d)
+        if rounded > 0 and abs(rounded - px) / px < 0.005:
+            return d
+    return 6
+
+def effective_price_dec(px, sl, tp, base_px_dec):
+    """
+    Calcola i decimali effettivi per garantire che entry, SL e TP
+    siano DISTINTI dopo arrotondamento. Se SL==entry dopo round → alza decimali.
+    """
+    dec = max(base_px_dec, min_decimals_for_price(px))
+    e = rpx(px, dec)
+    s = rpx(sl, dec)
+    t = rpx(tp, dec)
+    if s == e or t == e:
+        dec = min(dec + 2, 8)
+    return dec
 
 # ================================================================
 # REDIS STATE
@@ -730,12 +760,12 @@ def check_signal():
 # ================================================================
 # EXECUTION
 # ================================================================
-_coin_meta = {}  # cached: szDecimals, priceDecimals, maxLeverage
+_coin_meta = {}
 
 def get_meta():
     """
-    Recupera szDecimals, priceDecimals e maxLeverage da Hyperliquid.
-    Cache in _coin_meta per accesso rapido.
+    Recupera szDecimals e maxLeverage da Hyperliquid.
+    priceDecimals non esiste nell'API — calcolato dal tick size.
     """
     global _coin_meta
     for attempt in range(3):
@@ -743,29 +773,41 @@ def get_meta():
             m = call(_info.meta, timeout=15)
             for a in m["universe"]:
                 if a["name"] == COIN:
+                    sz_dec = int(a["szDecimals"])
+                    max_lev = int(a.get("maxLeverage", 50))
+
+                    # Price decimals: Hyperliquid non ha questo campo.
+                    # BTC usa 1 decimale ($73692.0), ma per SL/TP precisi
+                    # calcoliamo dal prezzo corrente.
+                    px_dec = 1  # default BTC
+                    try:
+                        mid = float(call(_info.all_mids, timeout=10).get(COIN, 0))
+                        if mid > 0:
+                            # Conta decimali significativi dal prezzo
+                            px_str = f"{mid:.10f}".rstrip('0')
+                            if '.' in px_str:
+                                px_dec = len(px_str.split('.')[1])
+                                px_dec = max(1, min(px_dec, 6))  # clamp 1-6
+                    except: pass
+
                     _coin_meta = {
-                        "sz_dec":      int(a["szDecimals"]),
-                        "px_dec":      int(a.get("priceDecimals", 1)),
-                        "max_lev":     int(a.get("maxLeverage", 50)),
-                        "name":        a["name"],
+                        "sz_dec":  sz_dec,
+                        "px_dec":  px_dec,
+                        "max_lev": max_lev,
                     }
-                    log(f"✅ Meta {COIN}: szDec={_coin_meta['sz_dec']} "
-                        f"pxDec={_coin_meta['px_dec']} maxLev={_coin_meta['max_lev']}x")
+                    log(f"✅ Meta {COIN}: szDec={sz_dec} pxDec={px_dec} maxLev={max_lev}x")
 
-                    # Warn se la leva richiesta supera il max
-                    if LEVERAGE > _coin_meta["max_lev"]:
-                        log(f"⚠️ LEVERAGE {LEVERAGE}x > maxLeverage {_coin_meta['max_lev']}x — "
-                            f"Hyperliquid applicherà {_coin_meta['max_lev']}x")
-                        tg(f"⚠️ Leva {LEVERAGE}x > max {_coin_meta['max_lev']}x per {COIN}")
+                    if LEVERAGE > max_lev:
+                        log(f"⚠️ LEVERAGE {LEVERAGE}x > max {max_lev}x")
+                        tg(f"⚠️ Leva {LEVERAGE}x > max {max_lev}x per {COIN}")
 
-                    return _coin_meta["sz_dec"], _coin_meta["px_dec"]
+                    return sz_dec, px_dec
         except Exception as e:
             if attempt < 2: time.sleep(3 * (attempt + 1))
             else: log(f"get_meta failed: {e}")
     return 5, 1  # BTC defaults
 
 def get_max_leverage():
-    """Returns max leverage for BTC from cached meta."""
     return _coin_meta.get("max_lev", 50)
 
 def get_position():
@@ -1343,8 +1385,20 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         # No existing position, leverage should be set
         pass
 
-    sl_px = rpx(sl, px_dec)
-    tp_px = rpx(tp, px_dec)
+    # Calcola decimali effettivi — garantisce SL ≠ entry ≠ TP dopo round
+    eff_dec = effective_price_dec(entry, sl, sl + (sl - entry) * TP_RR if entry > sl else entry - (entry - sl) * TP_RR, px_dec)
+
+    sl_px = rpx(sl, eff_dec)
+    tp_px = rpx(tp, eff_dec)
+    entry_rounded = rpx(entry, eff_dec)
+
+    # Verifica finale: SL e TP devono essere distinti da entry
+    if (is_buy and (sl_px >= entry_rounded or tp_px <= entry_rounded)) or \
+       (not is_buy and (sl_px <= entry_rounded or tp_px >= entry_rounded)):
+        eff_dec = min(eff_dec + 2, 8)
+        sl_px = rpx(sl, eff_dec)
+        tp_px = rpx(tp, eff_dec)
+        log(f"⚠️ px_dec alzato a {eff_dec} per distinguere SL/TP")
 
     log(f"{'🟢' if is_buy else '🔴'} ORDER {COIN} {direction} @ {entry} size:{size} "
         f"SL:{sl_px}({sl_dist/entry*100:.2f}%) TP:{tp_px}({sl_dist*TP_RR/entry*100:.2f}%) "
@@ -1375,13 +1429,13 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         # Ricalcola SL/TP da fresh mid
         if abs(drift) > 0.001:
             if is_buy:
-                sl_px = rpx(fresh_mid - sl_dist, px_dec)
-                tp_px = rpx(fresh_mid + sl_dist * TP_RR, px_dec)
+                sl_px = rpx(fresh_mid - sl_dist, eff_dec)
+                tp_px = rpx(fresh_mid + sl_dist * TP_RR, eff_dec)
             else:
-                sl_px = rpx(fresh_mid + sl_dist, px_dec)
-                tp_px = rpx(fresh_mid - sl_dist * TP_RR, px_dec)
+                sl_px = rpx(fresh_mid + sl_dist, eff_dec)
+                tp_px = rpx(fresh_mid - sl_dist * TP_RR, eff_dec)
 
-        gtc_px = rpx(fresh_mid * (1 + SLIPPAGE) if is_buy else fresh_mid * (1 - SLIPPAGE), px_dec)
+        gtc_px = rpx(fresh_mid * (1 + SLIPPAGE) if is_buy else fresh_mid * (1 - SLIPPAGE), eff_dec)
         res = call(_exchange.order, COIN, is_buy, size, gtc_px,
                    {"limit": {"tif": "Gtc"}}, False, timeout=15)
         log(f"GTC Maker @ {gtc_px}: {res}")
