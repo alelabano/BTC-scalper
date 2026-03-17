@@ -740,52 +740,51 @@ def check_signal():
     sig_type = None
     details = ""
 
-    if regime == "BULL":
-        # ── LONG ONLY ──
-        setup_ok = ema9_1h > ema21_1h  # removed macd1h > 0 requirement
+    # In RANGE mode (ADX < 20): entrambe le direzioni permesse
+    # In TREND/FLASH mode: rispetta il regime (BULL→LONG, BEAR→SHORT)
+    allow_long = (regime in ("BULL", "RANGE") or scalp_mode == "RANGE")
+    allow_short = (regime in ("BEAR", "RANGE") or scalp_mode == "RANGE")
 
-        if setup_ok:
-            pullback = (35 <= rsi5 <= 62 and
-                       macd5 > macd5_prev and
-                       slope5 > 0 and
-                       vol5 >= 0.3)
+    # ── LONG SIGNALS ──
+    if allow_long and ema9_1h > ema21_1h:
+        pullback = (35 <= rsi5 <= 62 and
+                   macd5 > macd5_prev and
+                   slope5 > 0 and
+                   vol5 >= 0.3)
 
-            breakout = (rsi5 > 50 and rsi5 < 80 and
-                       macd5 > 0 and
-                       float(r['hh']) > 0 and
-                       vol5 >= 0.8)
+        breakout = (rsi5 > 50 and rsi5 < 80 and
+                   macd5 > 0 and
+                   float(r['hh']) > 0 and
+                   vol5 >= 0.8)
 
-            if pullback and is_signal_allowed("PULLBACK", "LONG"):
-                direction = "LONG"; sig_type = "PULLBACK"
-                details = f"RSI5:{rsi5:.0f} MACD↑ slope:{slope5:.4f}"
-            elif breakout and is_signal_allowed("BREAKOUT", "LONG"):
-                direction = "LONG"; sig_type = "BREAKOUT"
-                details = f"RSI5:{rsi5:.0f} HH vol:{vol5:.1f}x"
+        if pullback and is_signal_allowed("PULLBACK", "LONG"):
+            direction = "LONG"; sig_type = "PULLBACK"
+            details = f"RSI15:{rsi5:.0f} MACD↑ slope:{slope5:.4f}"
+        elif breakout and is_signal_allowed("BREAKOUT", "LONG"):
+            direction = "LONG"; sig_type = "BREAKOUT"
+            details = f"RSI15:{rsi5:.0f} HH vol:{vol5:.1f}x"
 
-    elif regime == "BEAR":
-        # ── SHORT ONLY ──
-        setup_ok = ema9_1h < ema21_1h and macd1h < 0
+    # ── SHORT SIGNALS ──
+    if direction is None and allow_short and ema9_1h < ema21_1h:
+        pullback = (38 <= rsi5 <= 65 and
+                   macd5 < macd5_prev and
+                   slope5 < 0 and
+                   vol5 >= 0.3)
 
-        if setup_ok:
-            pullback = (38 <= rsi5 <= 65 and
-                       macd5 < macd5_prev and
-                       slope5 < 0 and
-                       vol5 >= 0.3)
+        breakdown = (rsi5 < 50 and rsi5 > 20 and
+                    macd5 < 0 and
+                    float(r['ll']) > 0 and
+                    vol5 >= 0.8)
 
-            breakdown = (rsi5 < 50 and rsi5 > 20 and
-                        macd5 < 0 and
-                        float(r['ll']) > 0 and
-                        vol5 >= 0.8)
+        if pullback and is_signal_allowed("PULLBACK", "SHORT"):
+            direction = "SHORT"; sig_type = "PULLBACK"
+            details = f"RSI15:{rsi5:.0f} MACD↓ slope:{slope5:.4f}"
+        elif breakdown and is_signal_allowed("BREAKDOWN", "SHORT"):
+            direction = "SHORT"; sig_type = "BREAKDOWN"
+            details = f"RSI15:{rsi5:.0f} LL vol:{vol5:.1f}x"
 
-            if pullback and is_signal_allowed("PULLBACK", "SHORT"):
-                direction = "SHORT"; sig_type = "PULLBACK"
-                details = f"RSI5:{rsi5:.0f} MACD↓ slope:{slope5:.4f}"
-            elif breakdown and is_signal_allowed("BREAKDOWN", "SHORT"):
-                direction = "SHORT"; sig_type = "BREAKDOWN"
-                details = f"RSI5:{rsi5:.0f} LL vol:{vol5:.1f}x"
-
-    else:  # RANGE
-        # ── REVERSAL ──
+    # ── REVERSAL (solo in RANGE regime/mode) ──
+    if direction is None and (regime == "RANGE" or scalp_mode == "RANGE"):
         if rsi1h < 38:
             if (rsi5 < 35 and macd5 > macd5_prev and slope5 > -0.001):
                 if is_signal_allowed("REVERSAL", "LONG"):
