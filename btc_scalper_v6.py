@@ -293,64 +293,49 @@ def update_fleet_daily_pnl(btc_pnl):
 
 def compute_hourly_bias():
     """
-    AI Macro Analysis — ogni ora analizza OI, Funding, regime e decide il bias.
-    Usa Claude Haiku per analisi contestuale, fallback a regole se AI non disponibile.
-    Il bias viene pubblicato su Redis per il Combined Bot.
+    Bias per il fleet — combina regime 4h + momentum breve termine.
+    Se BTC scende >0.3% in 1h → non può essere LONG_ONLY (anche se regime è BULL).
+    Se BTC sale >0.3% in 1h → non può essere SHORT_ONLY (anche se regime è BEAR).
     """
     fz = get_funding_z()
     oi = get_oi_change()
     mid = get_mid()
-    funding_raw = get_funding()
 
-    # Prova AI macro analysis
+    # Momentum breve termine: variazione 1h
+    short_momentum = 0
     try:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if api_key:
-            prompt = (
-                f"You are a BTC market analyst for a trading fleet.\n"
-                f"Current data:\n"
-                f"- Regime 4h: {_regime}\n"
-                f"- BTC price: ${mid:,.0f}\n"
-                f"- Funding rate: {funding_raw*100:.4f}% (z-score: {fz:+.1f})\n"
-                f"- OI change: {oi:+.2%}\n"
-                f"- Funding history z-score interpretation: >2 = extremely crowded long, <-2 = crowded short\n\n"
-                f"Decide the BIAS for the altcoin fleet:\n"
-                f"- LONG_ONLY: BTC bullish, safe to go long on altcoins\n"
-                f"- SHORT_ONLY: BTC bearish, only short altcoins\n"
-                f"- NEUTRAL: mixed signals, both directions ok\n\n"
-                f"JSON only: {{\"bias\":\"LONG_ONLY|SHORT_ONLY|NEUTRAL\",\"reason\":\"<10 words>\",\"confidence\":<1-10>}}"
-            )
-            resp = requests.post("https://api.anthropic.com/v1/messages",
-                headers={"Content-Type":"application/json","x-api-key":api_key,
-                         "anthropic-version":"2023-06-01"},
-                json={"model":"claude-haiku-4-5-20251001","max_tokens":100,
-                      "messages":[{"role":"user","content":prompt}]}, timeout=15)
-            if resp.status_code == 200:
-                txt = resp.json()["content"][0]["text"]
-                s = txt.find("{"); e = txt.rfind("}")+1
-                if s >= 0 and e > s:
-                    aj = json.loads(txt[s:e])
-                    bias = aj.get("bias", "NEUTRAL").upper()
-                    reason = f"AI:{aj.get('reason','')} conf:{aj.get('confidence',5)}"
-                    if bias in ("LONG_ONLY","SHORT_ONLY","NEUTRAL"):
-                        publish_bias(bias, reason)
-                        log(f"[FLEET] 🧠 AI Bias: {bias} | {reason}")
-                        return bias
-    except Exception as ex:
-        log(f"[FLEET] AI bias error: {ex}")
+        df_1h = fetch_df("1h", 2)
+        if df_1h is not None and len(df_1h) >= 2:
+            px_now = float(df_1h.iloc[-1]['close'])
+            px_1h_ago = float(df_1h.iloc[-2]['close'])
+            short_momentum = (px_now - px_1h_ago) / px_1h_ago
+    except: pass
 
-    # Fallback: regole meccaniche
-    if _regime == "BULL" and fz < 0:
+    # Regole chiare:
+    # 1. BTC scende >0.3% in 1h → SHORT_ONLY (indipendente dal regime 4h)
+    # 2. BTC sale >0.3% in 1h → LONG_ONLY (indipendente dal regime 4h)
+    # 3. Regime BEAR + funding crowded → SHORT_ONLY
+    # 4. Regime BULL + funding favorevole → LONG_ONLY
+    # 5. Tutto il resto → NEUTRAL
+
+    if short_momentum < -0.003:  # scende >0.3% in 1h
+        bias = "SHORT_ONLY"
+        reason = f"BTC {short_momentum:+.2%} in 1h (dropping)"
+    elif short_momentum > 0.003:  # sale >0.3% in 1h
         bias = "LONG_ONLY"
-        reason = f"BULL + FZ:{fz:+.1f}"
+        reason = f"BTC {short_momentum:+.2%} in 1h (rising)"
     elif _regime == "BEAR" and fz > 0.5:
         bias = "SHORT_ONLY"
-        reason = f"BEAR + FZ:{fz:+.1f}"
+        reason = f"BEAR + FZ:{fz:+.1f} crowded"
+    elif _regime == "BULL" and fz < 0 and short_momentum >= 0:
+        bias = "LONG_ONLY"
+        reason = f"BULL + FZ:{fz:+.1f} + momentum flat/up"
     else:
         bias = "NEUTRAL"
-        reason = f"{_regime} + FZ:{fz:+.1f} + OI:{oi:+.1%}"
+        reason = f"{_regime} + mom:{short_momentum:+.2%} + FZ:{fz:+.1f}"
 
     publish_bias(bias, reason)
+    log(f"[FLEET] Bias: {bias} | {reason}")
     return bias
 
 def execute_kill_switch():
