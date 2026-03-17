@@ -507,9 +507,9 @@ def run_backtest():
     df_1h['t_hour'] = pd.to_datetime(df_1h['t'], unit='ms').dt.floor('h')
     df_5m['t_hour'] = pd.to_datetime(df_5m['t'], unit='ms').dt.floor('h')
 
-    # Merge 1h indicators onto 5m (forward fill)
-    h_cols = df_1h[['t_hour','rsi','macd_hist','ema9','ema21','ema_slope','ema50','ema200']].copy()
-    h_cols.columns = ['t_hour','rsi_1h','macd_1h','ema9_1h','ema21_1h','slope_1h','ema50_1h','ema200_1h']
+    # Merge 1h indicators onto 15m (forward fill)
+    h_cols = df_1h[['t_hour','rsi','macd_hist','ema9','ema21','ema_slope','ema50','ema200','adx']].copy()
+    h_cols.columns = ['t_hour','rsi_1h','macd_1h','ema9_1h','ema21_1h','slope_1h','ema50_1h','ema200_1h','adx_1h']
     merged = pd.merge_asof(
         df_5m.sort_values('t_hour'), h_cols.sort_values('t_hour'),
         on='t_hour', direction='backward'
@@ -538,6 +538,7 @@ def run_backtest():
     slope1h = merged['slope_1h'].values.astype(np.float64)
     ema50_1h = merged['ema50_1h'].values.astype(np.float64)
     ema200_1h = merged['ema200_1h'].values.astype(np.float64)
+    adx1h = merged['adx_1h'].values.astype(np.float64)
 
     n = len(c)
     fwd = 12  # 12 candele 15m = 3h max hold
@@ -585,9 +586,33 @@ def run_backtest():
             px_i = c[i]; atr_i = atr5[i]
             if atr_i <= 0: i += 1; continue
 
-            sl_d = max(atr_i * SL_ATR_MULT, px_i * SL_MIN_PCT)
-            sl_d = min(sl_d, px_i * SL_MAX_PCT)
-            tp_d = sl_d * TP_RR
+            # ── Detect mode per questa candela ──
+            adx_i = adx1h[i] if not np.isnan(adx1h[i]) else 20
+            vol_i = vol5[i]
+            bb_i = bb[i] if not np.isnan(bb[i]) else 0
+            e9 = ema9_1h[i]; e21 = ema21_1h[i]
+            is_trend = (e9 > e21) or (e9 < e21)  # direzionale
+
+            if vol_i >= 3.0:
+                m_sl_atr, m_sl_min, m_sl_max = FLASH_SL_ATR, FLASH_SL_MIN, FLASH_SL_MAX
+                m_tp_fixed = FLASH_TP_PCT
+                m_tp_rr = 0  # usa tp_fixed
+            elif adx_i > 25 and is_trend:
+                m_sl_atr, m_sl_min, m_sl_max = TREND_SL_ATR, TREND_SL_MIN, TREND_SL_MAX
+                m_tp_fixed = 0
+                m_tp_rr = TREND_TP_RR
+            else:
+                m_sl_atr, m_sl_min, m_sl_max = RANGE_SL_ATR, RANGE_SL_MIN, RANGE_SL_MAX
+                m_tp_fixed = RANGE_TP_PCT
+                m_tp_rr = 0  # usa tp_fixed
+
+            sl_d = max(atr_i * m_sl_atr, px_i * m_sl_min)
+            sl_d = min(sl_d, px_i * m_sl_max)
+            if m_tp_fixed > 0:
+                tp_d = px_i * m_tp_fixed
+            else:
+                tp_d = sl_d * m_tp_rr
+            tp_d = max(tp_d, px_i * 0.002)  # floor 0.2%
 
             if sig_dir == "LONG":
                 tp_hits = np.where(h[i+1:i+fwd] >= px_i + tp_d)[0]
