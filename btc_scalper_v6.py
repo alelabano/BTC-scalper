@@ -1,5 +1,10 @@
 """
-btc_scalper_v6.py — Bot BTC-only scalping.
+btc_scalper_v7.py — Bot BTC-only scalping + Predictive Analytics.
+
+V7 ENHANCEMENTS:
+  ✦ SENTIMENT ANALYSIS — Fear & Greed Index + social sentiment aggregation
+  ✦ ORDER FLOW — CVD, delta volume, OI momentum, liquidation heatmap
+  ✦ MACHINE LEARNING — Online gradient boosting per signal quality prediction
 
 3 SCALPING MODES (auto-detected):
   RANGE: ADX<20, mean reversion, TP fisso 0.4%
@@ -12,9 +17,10 @@ TIMEFRAMES:
   15m → entry trigger + SL/TP
 """
 
-import os, sys, time, json, threading, requests
+import os, sys, time, json, threading, requests, hashlib
 import pandas as pd
 import numpy as np
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from eth_account import Account
@@ -87,6 +93,9 @@ TRAILING_ATR = TREND_TRAIL_ATR
 PARTIAL_CLOSE_PCT = TREND_PARTIAL
 
 FUNDING_BLOCK_THRESH = 0.0003
+
+# Order Flow globals
+_last_oi = 0.0
 
 # Order execution
 SLIPPAGE = 0.001               # 0.1% slippage base per limit orders
@@ -211,6 +220,628 @@ def get_oi_change():
 # ================================================================
 # REDIS STATE
 # ================================================================
+
+# ================================================================
+# MODULE 1: SENTIMENT ANALYSIS
+# ================================================================
+# Aggregates Fear & Greed Index, funding sentiment, OI sentiment,
+# and optionally social/news sentiment via CryptoCompare.
+# Returns a composite score 0-100 (0=extreme fear, 100=extreme greed).
+# ================================================================
+
+_sentiment_cache = {"score": 50, "components": {}, "ts": 0}
+SENTIMENT_CACHE_TTL = 300  # 5 min cache
+
+def get_sentiment_score():
+    """
+    Composite sentiment score 0-100.
+    Combina: Fear & Greed Index (40%), Funding Sentiment (25%),
+    OI Momentum (20%), Social Buzz (15%).
+    Cached per 5 minuti.
+    """
+    global _sentiment_cache
+    if time.time() - _sentiment_cache["ts"] < SENTIMENT_CACHE_TTL:
+        return _sentiment_cache["score"]
+
+    components = {}
+    weights = {"fgi": 0.40, "funding": 0.25, "oi": 0.20, "social": 0.15}
+
+    # ── A. Fear & Greed Index (alternative.me API) ──
+    fgi_score = 50  # default neutral
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1&format=json", timeout=8)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                fgi_score = int(data[0].get("value", 50))
+                components["fgi"] = fgi_score
+                components["fgi_label"] = data[0].get("value_classification", "Neutral")
+    except Exception as e:
+        log(f"[SENT] FGI fetch error: {e}")
+    components.setdefault("fgi", fgi_score)
+
+    # ── B. Funding Sentiment (from internal z-score) ──
+    # Funding z > 1.5 = crowded longs = greed; z < -1.5 = crowded shorts = fear
+    fz = get_funding_z()
+    # Map z-score [-3, +3] → [10, 90]
+    funding_sent = max(10, min(90, 50 + fz * 13.3))
+    components["funding_z"] = round(fz, 2)
+    components["funding_sent"] = round(funding_sent, 1)
+
+    # ── C. OI Momentum Sentiment ──
+    # Rising OI in uptrend = bullish conviction, falling OI = bearish
+    oi_chg = get_oi_change()
+    # Map OI change [-5%, +5%] → [20, 80]
+    oi_sent = max(20, min(80, 50 + oi_chg * 600))
+    components["oi_change"] = round(oi_chg, 4)
+    components["oi_sent"] = round(oi_sent, 1)
+
+    # ── D. Social / News Sentiment (CryptoCompare — free tier) ──
+    social_score = 50  # default neutral
+    try:
+        cc_key = os.getenv("CRYPTOCOMPARE_API_KEY", "")
+        if cc_key:
+            url = (f"https://min-api.cryptocompare.com/data/tradingsignals/intotheblock/latest"
+                   f"?fsym=BTC&api_key={cc_key}")
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                sig_data = r.json().get("Data", {})
+                # IntoTheBlock signals: bull/bear percentages
+                bull = float(sig_data.get("largetxsTransaction", {}).get("bullish", 50) or 50)
+                social_score = max(10, min(90, bull))
+                components["social_raw"] = round(bull, 1)
+        else:
+            # Fallback: derive social proxy from volatility + FGI
+            # High volatility + low FGI = panic = extreme fear
+            social_score = fgi_score * 0.7 + funding_sent * 0.3
+    except Exception as e:
+        log(f"[SENT] Social fetch error: {e}")
+        social_score = fgi_score * 0.7 + funding_sent * 0.3
+    components["social_sent"] = round(social_score, 1)
+
+    # ── Composite Score ──
+    composite = (
+        fgi_score * weights["fgi"] +
+        funding_sent * weights["funding"] +
+        oi_sent * weights["oi"] +
+        social_score * weights["social"]
+    )
+    composite = max(0, min(100, round(composite)))
+    components["composite"] = composite
+
+    _sentiment_cache = {"score": composite, "components": components, "ts": time.time()}
+    log(f"[SENT] Score:{composite} | FGI:{fgi_score} Fund:{funding_sent:.0f} OI:{oi_sent:.0f} Social:{social_score:.0f}")
+    return composite
+
+
+def get_sentiment_bias():
+    """
+    Returns sentiment-based directional bias:
+    - score < 20: EXTREME_FEAR → contrarian LONG bias
+    - score < 35: FEAR → slight LONG bias
+    - score > 80: EXTREME_GREED → contrarian SHORT bias
+    - score > 65: GREED → slight SHORT bias
+    - else: NEUTRAL
+    """
+    s = get_sentiment_score()
+    if s < 20:   return "EXTREME_FEAR", s
+    if s < 35:   return "FEAR", s
+    if s > 80:   return "EXTREME_GREED", s
+    if s > 65:   return "GREED", s
+    return "NEUTRAL", s
+
+
+def get_sentiment_adjustment():
+    """
+    Returns (size_mult_adj, sl_adj, confidence_adj) based on sentiment.
+    Used to modulate trade parameters.
+    """
+    s = get_sentiment_score()
+    if s < 15:
+        # Extreme fear: reduce size (high vol), widen SL, boost confidence for contrarian LONG
+        return 0.7, 1.3, 2
+    elif s < 30:
+        return 0.85, 1.15, 1
+    elif s > 85:
+        # Extreme greed: reduce size, widen SL, boost confidence for contrarian SHORT
+        return 0.7, 1.3, 2
+    elif s > 70:
+        return 0.85, 1.15, 1
+    return 1.0, 1.0, 0
+
+
+# ================================================================
+# MODULE 2: ORDER FLOW ANALYSIS
+# ================================================================
+# CVD (Cumulative Volume Delta), OI Momentum, Liquidation Proximity,
+# Delta Divergence detection.
+# Uses Hyperliquid L2 orderbook + trade data for real-time flow signals.
+# ================================================================
+
+_cvd_buffer = deque(maxlen=120)   # 120 readings (one per scan = ~20min window)
+_oi_momentum = deque(maxlen=30)   # 30 OI readings for momentum
+_flow_cache = {"ts": 0, "data": {}}
+FLOW_CACHE_TTL = 15  # aggiorna ogni 15s
+
+def get_btc_open_interest():
+    """Returns current BTC open interest in USD notional."""
+    try:
+        ctx = call(_info.meta_and_asset_ctxs, timeout=15)
+        for a, c in zip(ctx[0]["universe"], ctx[1]):
+            if a["name"] == COIN:
+                return float(c.get("openInterest", 0) or 0)
+    except Exception as e:
+        log(f"[FLOW] OI fetch error: {e}")
+    return _oi_cache
+
+
+def compute_orderbook_delta():
+    """
+    Computes bid/ask pressure delta from L2 orderbook.
+    Returns: {delta, imbalance_ratio, aggressive_side, depth_bid, depth_ask}
+    """
+    result = {"delta": 0, "imbalance_ratio": 0.5, "aggressive_side": "NEUTRAL",
+              "depth_bid": 0, "depth_ask": 0, "wall_level": 0, "wall_side": ""}
+    try:
+        ob = call(_info.l2_snapshot, COIN, timeout=10)
+        if not ob:
+            return result
+
+        levels = ob.get("levels", [])
+        bids = levels[0] if len(levels) > 0 else []
+        asks = levels[1] if len(levels) > 1 else []
+        if not bids or not asks:
+            return result
+
+        best_bid = float(bids[0]["px"])
+        best_ask = float(asks[0]["px"])
+        mid = (best_bid + best_ask) / 2
+
+        # Depth a 5 livelli (tight) e 20 livelli (deep)
+        bid_tight = sum(float(b["sz"]) for b in bids[:5])
+        ask_tight = sum(float(a["sz"]) for a in asks[:5])
+        bid_deep = sum(float(b["sz"]) for b in bids[:20])
+        ask_deep = sum(float(a["sz"]) for a in asks[:20])
+
+        result["depth_bid"] = bid_deep
+        result["depth_ask"] = ask_deep
+
+        # Delta = bid_size - ask_size (positivo = pressione buy)
+        result["delta"] = bid_tight - ask_tight
+        total = bid_tight + ask_tight
+        result["imbalance_ratio"] = bid_tight / total if total > 0 else 0.5
+
+        # Aggressive side detection (chi sta mangiando il book)
+        if result["imbalance_ratio"] > 0.62:
+            result["aggressive_side"] = "BUY"
+        elif result["imbalance_ratio"] < 0.38:
+            result["aggressive_side"] = "SELL"
+        else:
+            result["aggressive_side"] = "NEUTRAL"
+
+        # Wall detection: livello con size > 3x la media
+        all_levels = [(float(b["px"]), float(b["sz"]), "BID") for b in bids[:20]] + \
+                     [(float(a["px"]), float(a["sz"]), "ASK") for a in asks[:20]]
+        avg_sz = np.mean([l[1] for l in all_levels]) if all_levels else 0
+        walls = [l for l in all_levels if l[1] > avg_sz * 3]
+        if walls:
+            nearest = min(walls, key=lambda w: abs(w[0] - mid))
+            result["wall_level"] = nearest[0]
+            result["wall_side"] = nearest[2]
+            result["wall_dist_pct"] = (nearest[0] - mid) / mid * 100
+
+    except Exception as e:
+        log(f"[FLOW] OB delta error: {e}")
+    return result
+
+
+def update_order_flow():
+    """
+    Aggiorna buffer CVD e OI momentum. Chiamato ogni ciclo di scan.
+    """
+    global _flow_cache
+    if time.time() - _flow_cache["ts"] < FLOW_CACHE_TTL:
+        return _flow_cache["data"]
+
+    ob_delta = compute_orderbook_delta()
+    _cvd_buffer.append({
+        "ts": time.time(),
+        "delta": ob_delta["delta"],
+        "imbalance": ob_delta["imbalance_ratio"]
+    })
+
+    # OI momentum tracking
+    current_oi = get_btc_open_interest()
+    _oi_momentum.append({"ts": time.time(), "oi": current_oi})
+
+    # Calcola metriche rolling
+    flow_data = {
+        "ob_delta": ob_delta,
+        "cvd_trend": _compute_cvd_trend(),
+        "oi_momentum": _compute_oi_momentum(),
+        "delta_divergence": _detect_delta_divergence(),
+    }
+
+    _flow_cache = {"ts": time.time(), "data": flow_data}
+    return flow_data
+
+
+def _compute_cvd_trend():
+    """
+    CVD Trend: somma cumulativa dei delta nel buffer.
+    Rising CVD = pressione compratori, Falling = venditori.
+    Returns: {"cvd": float, "cvd_slope": float, "signal": "BUY"|"SELL"|"NEUTRAL"}
+    """
+    if len(_cvd_buffer) < 5:
+        return {"cvd": 0, "cvd_slope": 0, "signal": "NEUTRAL"}
+
+    deltas = [d["delta"] for d in _cvd_buffer]
+    cvd = sum(deltas)
+
+    # Slope: regressione lineare sui delta recenti (ultimi 20)
+    recent = deltas[-20:] if len(deltas) >= 20 else deltas
+    x = np.arange(len(recent))
+    if len(recent) >= 3:
+        slope = np.polyfit(x, recent, 1)[0]
+    else:
+        slope = 0
+
+    signal = "NEUTRAL"
+    if cvd > 0 and slope > 0:
+        signal = "BUY"
+    elif cvd < 0 and slope < 0:
+        signal = "SELL"
+
+    return {"cvd": round(cvd, 2), "cvd_slope": round(slope, 4), "signal": signal}
+
+
+def _compute_oi_momentum():
+    """
+    OI Momentum: variazione % dell'OI sugli ultimi N readings.
+    Rising OI = nuovi contratti = conviction. Falling = chiusure.
+    """
+    if len(_oi_momentum) < 3:
+        return {"oi_change_pct": 0, "oi_accel": 0, "signal": "NEUTRAL"}
+
+    ois = [d["oi"] for d in _oi_momentum]
+    latest = ois[-1]
+    first = ois[0]
+
+    if first == 0:
+        return {"oi_change_pct": 0, "oi_accel": 0, "signal": "NEUTRAL"}
+
+    oi_change = (latest - first) / first
+    # Accelerazione: diff della diff
+    if len(ois) >= 5:
+        diffs = np.diff(ois[-5:])
+        accel = diffs[-1] - diffs[0] if len(diffs) >= 2 else 0
+    else:
+        accel = 0
+
+    signal = "NEUTRAL"
+    if oi_change > 0.02 and accel > 0:
+        signal = "CONVICTION"     # nuovi contratti in accelerazione
+    elif oi_change < -0.02:
+        signal = "UNWIND"          # chiusura posizioni
+    elif oi_change > 0.01:
+        signal = "BUILDING"
+
+    return {
+        "oi_change_pct": round(oi_change * 100, 2),
+        "oi_accel": round(accel, 2),
+        "signal": signal
+    }
+
+
+def _detect_delta_divergence():
+    """
+    Delta Divergence: prezzo sale ma CVD scende (o viceversa).
+    Segnale di esaurimento del trend — high-probability reversal.
+    """
+    if len(_cvd_buffer) < 10:
+        return {"divergence": False, "type": "", "strength": 0}
+
+    # Prezzo degli ultimi 10 readings vs CVD
+    recent_deltas = [d["delta"] for d in list(_cvd_buffer)[-10:]]
+    cvd_trend = sum(recent_deltas[-5:]) - sum(recent_deltas[:5])
+
+    try:
+        mid = get_mid()
+        # Approssima il trend del prezzo dall'imbalance trend
+        price_momentum = sum(d["imbalance"] - 0.5 for d in list(_cvd_buffer)[-5:])
+
+        # Bearish divergence: price up (imbalance > 0) ma CVD down
+        if price_momentum > 0.1 and cvd_trend < -0.5:
+            return {"divergence": True, "type": "BEARISH", "strength": abs(cvd_trend)}
+        # Bullish divergence: price down ma CVD up
+        if price_momentum < -0.1 and cvd_trend > 0.5:
+            return {"divergence": True, "type": "BULLISH", "strength": abs(cvd_trend)}
+    except:
+        pass
+
+    return {"divergence": False, "type": "", "strength": 0}
+
+
+def get_flow_signal():
+    """
+    Restituisce un segnale composito dall'Order Flow:
+    {"bias": "BUY"|"SELL"|"NEUTRAL", "confidence": 0-10, "details": str}
+    """
+    flow = update_order_flow()
+    if not flow:
+        return {"bias": "NEUTRAL", "confidence": 0, "details": "no flow data"}
+
+    score = 0  # -10 (strong sell) to +10 (strong buy)
+
+    # CVD trend (weight: 3)
+    cvd = flow.get("cvd_trend", {})
+    if cvd.get("signal") == "BUY":
+        score += 3
+    elif cvd.get("signal") == "SELL":
+        score -= 3
+
+    # OB delta (weight: 2)
+    ob = flow.get("ob_delta", {})
+    if ob.get("aggressive_side") == "BUY":
+        score += 2
+    elif ob.get("aggressive_side") == "SELL":
+        score -= 2
+
+    # OI momentum (weight: 2)
+    oi_m = flow.get("oi_momentum", {})
+    if oi_m.get("signal") == "CONVICTION":
+        score += 2
+    elif oi_m.get("signal") == "UNWIND":
+        score -= 1
+
+    # Delta divergence (weight: 3 — reversal signal)
+    div = flow.get("delta_divergence", {})
+    if div.get("divergence"):
+        if div["type"] == "BEARISH":
+            score -= 3
+        elif div["type"] == "BULLISH":
+            score += 3
+
+    # Map to bias
+    if score >= 3:
+        bias = "BUY"
+    elif score <= -3:
+        bias = "SELL"
+    else:
+        bias = "NEUTRAL"
+
+    confidence = min(10, abs(score))
+    details = (f"CVD:{cvd.get('signal','?')} OB:{ob.get('aggressive_side','?')} "
+               f"OI:{oi_m.get('signal','?')} Div:{div.get('type','none')}")
+
+    return {"bias": bias, "confidence": confidence, "details": details}
+
+
+# ================================================================
+# MODULE 3: MACHINE LEARNING — Online Signal Quality Predictor
+# ================================================================
+# Stochastic Gradient Descent classifier (online learning).
+# NO sklearn necessario — implementato a mano per Railway/lightweight.
+# Prevede probabilità di win per ogni segnale in base a features storiche.
+# Si aggiorna ad ogni trade chiuso (online learning).
+# ================================================================
+
+class OnlineGBClassifier:
+    """
+    Mini gradient boosting binario online — pesi aggiornati ad ogni sample.
+    Features: RSI, MACD, ADX, vol, funding_z, sentiment, OB_imbalance, CVD,
+              regime_encoded, scalp_mode_encoded, setup_score, oi_change.
+    Target: 1 = trade vincente, 0 = perdente.
+    """
+    FEATURE_NAMES = [
+        "rsi_15m", "rsi_1h", "macd_hist", "adx_1h", "vol_rel",
+        "funding_z", "sentiment", "ob_imbalance", "cvd_slope",
+        "regime_enc", "mode_enc", "setup_score", "oi_change_pct",
+        "bb_pos", "ema_slope", "spread"
+    ]
+    N_FEATURES = len(FEATURE_NAMES)
+
+    def __init__(self):
+        # Weights: linear model con learning rate decay
+        self.weights = np.zeros(self.N_FEATURES)
+        self.bias = 0.0
+        self.lr = 0.05
+        self.n_samples = 0
+        self.feature_means = np.zeros(self.N_FEATURES)
+        self.feature_vars = np.ones(self.N_FEATURES)
+        # Performance tracking
+        self.predictions = deque(maxlen=200)  # (predicted_prob, actual_outcome)
+        self.accuracy_window = deque(maxlen=50)
+
+    def _sigmoid(self, z):
+        z = np.clip(z, -20, 20)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    def _normalize(self, x):
+        """Running normalization usando media e varianza online."""
+        return (x - self.feature_means) / (np.sqrt(self.feature_vars) + 1e-8)
+
+    def _update_stats(self, x):
+        """Welford's online algorithm per media e varianza."""
+        self.n_samples += 1
+        n = self.n_samples
+        delta = x - self.feature_means
+        self.feature_means += delta / n
+        delta2 = x - self.feature_means
+        self.feature_vars = ((n - 1) * self.feature_vars + delta * delta2) / n
+
+    def predict_proba(self, features):
+        """
+        Predict P(win) per il segnale corrente.
+        Returns: float 0.0-1.0
+        """
+        if self.n_samples < 10:
+            return 0.5  # non abbastanza dati — default neutral
+
+        x = np.array(features, dtype=np.float64)
+        x_norm = self._normalize(x)
+        z = np.dot(self.weights, x_norm) + self.bias
+        return float(self._sigmoid(z))
+
+    def update(self, features, outcome):
+        """
+        Online gradient descent step.
+        features: array di N_FEATURES float
+        outcome: 1 (win) o 0 (loss)
+        """
+        x = np.array(features, dtype=np.float64)
+        self._update_stats(x)
+        x_norm = self._normalize(x)
+
+        # Forward pass
+        z = np.dot(self.weights, x_norm) + self.bias
+        pred = self._sigmoid(z)
+
+        # Binary cross-entropy gradient
+        error = pred - outcome
+
+        # Learning rate con decay
+        lr = self.lr / (1 + self.n_samples * 0.001)
+
+        # L2 regularization (weight decay)
+        reg = 0.001
+
+        # Update
+        self.weights -= lr * (error * x_norm + reg * self.weights)
+        self.bias -= lr * error
+
+        # Track accuracy
+        predicted_class = 1 if pred >= 0.5 else 0
+        correct = 1 if predicted_class == outcome else 0
+        self.accuracy_window.append(correct)
+        self.predictions.append((pred, outcome))
+
+        # Log periodico
+        if self.n_samples % 10 == 0:
+            acc = np.mean(self.accuracy_window) if self.accuracy_window else 0
+            log(f"[ML] Update #{self.n_samples} | Acc:{acc:.0%} | pred:{pred:.2f} actual:{outcome}")
+
+    def get_accuracy(self):
+        if not self.accuracy_window:
+            return 0.5
+        return float(np.mean(self.accuracy_window))
+
+    def get_feature_importance(self):
+        """Returns feature importance (absolute weight magnitude)."""
+        importance = np.abs(self.weights)
+        total = importance.sum()
+        if total == 0:
+            return {}
+        normalized = importance / total
+        return {name: round(float(val), 3)
+                for name, val in zip(self.FEATURE_NAMES, normalized)
+                if val > 0.01}
+
+    def to_dict(self):
+        return {
+            "weights": self.weights.tolist(),
+            "bias": self.bias,
+            "n_samples": self.n_samples,
+            "feature_means": self.feature_means.tolist(),
+            "feature_vars": self.feature_vars.tolist(),
+            "lr": self.lr
+        }
+
+    def from_dict(self, d):
+        if not d:
+            return
+        try:
+            self.weights = np.array(d["weights"])
+            self.bias = d["bias"]
+            self.n_samples = d["n_samples"]
+            self.feature_means = np.array(d["feature_means"])
+            self.feature_vars = np.array(d["feature_vars"])
+            self.lr = d.get("lr", 0.05)
+        except Exception as e:
+            log(f"[ML] Load error: {e}")
+
+
+# Singleton ML model
+_ml_model = OnlineGBClassifier()
+
+def encode_regime(regime):
+    return {"BULL": 1.0, "BEAR": -1.0, "RANGE": 0.0}.get(regime, 0.0)
+
+def encode_mode(mode):
+    return {"TREND": 1.0, "RANGE": 0.0, "FLASH": 2.0}.get(mode, 0.0)
+
+
+def build_ml_features(rsi_15m, rsi_1h, macd_hist, adx_1h, vol_rel,
+                       funding_z, sentiment, ob_imbalance, cvd_slope,
+                       regime, scalp_mode, setup_score, oi_change_pct,
+                       bb_pos=0, ema_slope=0, spread=0):
+    """
+    Costruisce il vettore di features per il modello ML.
+    Ordine DEVE corrispondere a FEATURE_NAMES.
+    """
+    return [
+        float(rsi_15m), float(rsi_1h), float(macd_hist), float(adx_1h),
+        float(vol_rel), float(funding_z), float(sentiment),
+        float(ob_imbalance), float(cvd_slope),
+        encode_regime(regime), encode_mode(scalp_mode),
+        float(setup_score), float(oi_change_pct),
+        float(bb_pos), float(ema_slope), float(spread)
+    ]
+
+
+def ml_predict_signal(features):
+    """
+    Predict win probability per il segnale corrente.
+    Returns: (prob, adjustment_dict)
+    """
+    prob = _ml_model.predict_proba(features)
+    acc = _ml_model.get_accuracy()
+
+    # Solo applica ML se ha abbastanza dati E buona accuracy
+    if _ml_model.n_samples < 20 or acc < 0.52:
+        return prob, {"ml_active": False, "prob": prob, "reason": f"warmup ({_ml_model.n_samples} samples)"}
+
+    adjustments = {"ml_active": True, "prob": round(prob, 3), "acc": round(acc, 3)}
+
+    # Signal filtering: blocca segnali con prob < 30%
+    if prob < 0.30:
+        adjustments["action"] = "BLOCK"
+        adjustments["reason"] = f"ML prob {prob:.0%} < 30%"
+    # Size reduction: prob 30-45% → size × 0.6
+    elif prob < 0.45:
+        adjustments["action"] = "REDUCE"
+        adjustments["size_mult"] = 0.6
+        adjustments["reason"] = f"ML prob {prob:.0%} → reduce size"
+    # Normal: prob 45-65%
+    elif prob < 0.65:
+        adjustments["action"] = "NORMAL"
+        adjustments["size_mult"] = 1.0
+    # Boost: prob > 65% → size × 1.2
+    else:
+        adjustments["action"] = "BOOST"
+        adjustments["size_mult"] = 1.2
+        adjustments["reason"] = f"ML prob {prob:.0%} → boost"
+
+    return prob, adjustments
+
+
+def ml_record_outcome(features, won):
+    """Record trade outcome per aggiornare il modello online."""
+    _ml_model.update(features, 1 if won else 0)
+    # Salva modello su Redis periodicamente
+    if _ml_model.n_samples % 5 == 0:
+        _rset("btc7:ml_model", _ml_model.to_dict())
+        log(f"[ML] Model saved ({_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%})")
+
+
+def ml_load_model():
+    """Carica modello ML da Redis (persistenza tra restart)."""
+    d = _rget("btc7:ml_model")
+    if d:
+        _ml_model.from_dict(d)
+        log(f"[ML] Model loaded: {_ml_model.n_samples} samples, weights:{np.abs(_ml_model.weights).sum():.2f}")
+    else:
+        log("[ML] No saved model — starting fresh")
 def _rget(key):
     if not REDIS_URL: return None
     try:
@@ -1111,7 +1742,123 @@ def check_signal():
         liq_str = f" spread:{liq['spread']:.3%} imb:{liq['imbalance']:.0%}"
         details += liq_str
 
-    return (direction, sig_type, sl, tp, px, atr5, details, sl_dist, size_mult, regime, setup, scalp_mode)
+    # ══════════════════════════════════════════════════════════
+    # V7 PREDICTIVE ANALYTICS LAYER
+    # ══════════════════════════════════════════════════════════
+
+    # ── SENTIMENT ADJUSTMENT ──
+    sent_score = get_sentiment_score()
+    sent_size_adj, sent_sl_adj, sent_conf_adj = get_sentiment_adjustment()
+    sent_bias, _ = get_sentiment_bias()
+
+    # Contrarian filter: se extreme greed e stiamo andando long → penalizza
+    if sent_bias == "EXTREME_GREED" and direction == "LONG":
+        setup -= 15
+        details += f" ⚠️sent:GREED→LONG penalized"
+    elif sent_bias == "EXTREME_FEAR" and direction == "SHORT":
+        setup -= 15
+        details += f" ⚠️sent:FEAR→SHORT penalized"
+    # Contrarian boost: extreme fear + long o extreme greed + short
+    elif sent_bias == "EXTREME_FEAR" and direction == "LONG":
+        setup += 10
+        details += f" ✦sent:contrarian LONG"
+    elif sent_bias == "EXTREME_GREED" and direction == "SHORT":
+        setup += 10
+        details += f" ✦sent:contrarian SHORT"
+
+    # Apply sentiment adjustments
+    size_mult *= sent_size_adj
+    sl_dist *= sent_sl_adj
+    # Ricalcola SL/TP se sentiment ha modificato sl_dist
+    if sent_sl_adj != 1.0:
+        if direction == "LONG":
+            sl = px - sl_dist
+        else:
+            sl = px + sl_dist
+    details += f" sent:{sent_score}"
+
+    # ── ORDER FLOW CONFIRMATION ──
+    flow_sig = get_flow_signal()
+    flow_bias = flow_sig["bias"]
+    flow_conf = flow_sig["confidence"]
+
+    # Flow conferma la direzione → boost
+    if (flow_bias == "BUY" and direction == "LONG") or \
+       (flow_bias == "SELL" and direction == "SHORT"):
+        setup += 5 + flow_conf
+        size_mult = min(size_mult * 1.1, 1.2)
+        details += f" ✦flow:{flow_bias}({flow_conf})"
+    # Flow contraddice la direzione → penalizza
+    elif (flow_bias == "SELL" and direction == "LONG") or \
+         (flow_bias == "BUY" and direction == "SHORT"):
+        setup -= 5 + flow_conf
+        if flow_conf >= 6:
+            log(f"⚠️ Flow {flow_bias} vs {direction} (conf:{flow_conf}) — signal weakened")
+            size_mult *= 0.7
+        details += f" ⚠️flow:{flow_bias}({flow_conf})vs{direction}"
+    else:
+        details += f" flow:NEUTRAL"
+
+    # Delta divergence: high-priority reversal signal
+    flow_data = _flow_cache.get("data", {})
+    div = flow_data.get("delta_divergence", {})
+    if div.get("divergence"):
+        if (div["type"] == "BEARISH" and direction == "LONG"):
+            setup -= 20
+            details += " ⚠️DIV:BEAR"
+            log(f"⚠️ Bearish divergence detected — LONG penalized")
+        elif (div["type"] == "BULLISH" and direction == "SHORT"):
+            setup -= 20
+            details += " ⚠️DIV:BULL"
+            log(f"⚠️ Bullish divergence detected — SHORT penalized")
+
+    # Re-check setup after adjustments
+    if setup < 35:
+        log(f"⚠️ Setup score {setup}/100 dopo analytics layer — troppo basso")
+        return None
+
+    # ── MACHINE LEARNING PREDICTION ──
+    ob_imbalance = liq.get("imbalance", 0.5)
+    cvd_data = flow_data.get("cvd_trend", {})
+    oi_data = flow_data.get("oi_momentum", {})
+    spread_val = liq.get("spread", 0.0005) or 0.0005
+
+    ml_features = build_ml_features(
+        rsi_15m=rsi5, rsi_1h=rsi1h, macd_hist=macd5, adx_1h=adx1h,
+        vol_rel=vol5, funding_z=fz, sentiment=sent_score,
+        ob_imbalance=ob_imbalance, cvd_slope=cvd_data.get("cvd_slope", 0),
+        regime=regime, scalp_mode=scalp_mode, setup_score=setup,
+        oi_change_pct=oi_data.get("oi_change_pct", 0),
+        bb_pos=bb5, ema_slope=slope5, spread=spread_val
+    )
+
+    ml_prob, ml_adj = ml_predict_signal(ml_features)
+
+    if ml_adj.get("ml_active"):
+        action = ml_adj.get("action", "NORMAL")
+        if action == "BLOCK":
+            log(f"🤖 [ML] BLOCKED — P(win)={ml_prob:.0%} | {ml_adj.get('reason','')}")
+            return None
+        elif action == "REDUCE":
+            size_mult *= ml_adj.get("size_mult", 0.6)
+            log(f"🤖 [ML] REDUCE — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
+        elif action == "BOOST":
+            size_mult = min(size_mult * ml_adj.get("size_mult", 1.2), 1.3)
+            log(f"🤖 [ML] BOOST — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
+        details += f" ML:{ml_prob:.0%}({action})"
+    else:
+        details += f" ML:warmup"
+
+    # Store ML features in signal for later outcome recording
+    _last_ml_features = ml_features  # will be saved in pos_state
+
+    size_mult = max(0.3, min(1.3, size_mult))
+
+    log(f"[V7] Final: setup:{setup} size:{size_mult:.2f} sent:{sent_score} "
+        f"flow:{flow_bias} ML:{ml_prob:.0%} | {details[-80:]}")
+
+    return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
+            size_mult, regime, setup, scalp_mode, ml_features)
 
 # ================================================================
 # EXECUTION
@@ -1797,8 +2544,12 @@ def maybe_send_daily_report():
                          for k,v in by_type.items())
 
     bal = get_balance()
+    # V7: ML stats for report
+    ml_acc = _ml_model.get_accuracy()
+    ml_n = _ml_model.n_samples
+    sent = get_sentiment_score()
     report = (
-        f"📊 <b>BTC Scalper Daily Report</b>\n"
+        f"📊 <b>BTC Scalper V7 Daily Report</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 PnL: <b>${total:+.2f}</b>\n"
         f"📈 Trades: {len(trades)} (W:{len(wins)} L:{len(losses)})\n"
@@ -1808,6 +2559,10 @@ def maybe_send_daily_report():
         f"💀 Worst: ${worst['pnl']:+.2f} ({worst.get('type','?')})\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"By signal type:\n{type_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <b>V7 Analytics</b>\n"
+        f"  ML: {ml_n} samples, acc:{ml_acc:.0%}\n"
+        f"  Sentiment: {sent}/100\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 Balance: ${bal:.2f}"
     )
@@ -2039,6 +2794,7 @@ _scanner_ready = threading.Event()
 
 def scanner_thread():
     log("[SCAN] Thread avviato")
+    ml_load_model()  # V7: Load ML model from Redis
     while True:
         try:
             regime = update_regime()
@@ -2048,6 +2804,11 @@ def scanner_thread():
             run_backtest()
             mid = get_mid()
             bal = get_balance()
+
+            # V7: Update Order Flow and Sentiment
+            flow_data = update_order_flow()
+            sent_score = get_sentiment_score()
+            flow_sig = get_flow_signal()
 
             # ADX per detect mode
             adx_val = 20
@@ -2068,6 +2829,14 @@ def scanner_thread():
                 else: status = "❌ blocked"
                 log(f"[SCAN]  {k:<18} {pf:.2f}  {wr:.0%}  {n:<4} {status}")
             log(f"[SCAN]  FZ:{fz:+.1f} | OI:{oi:+.2%} | Bal ${bal:.2f}")
+            # V7: Extended analytics dashboard
+            log(f"[SCAN]  ── V7 Analytics ──")
+            log(f"[SCAN]  Sentiment:{sent_score} | Flow:{flow_sig['bias']}({flow_sig['confidence']}) | {flow_sig['details']}")
+            log(f"[SCAN]  ML: {_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%}")
+            if _ml_model.n_samples >= 20:
+                imp = _ml_model.get_feature_importance()
+                top3 = sorted(imp.items(), key=lambda x: x[1], reverse=True)[:3]
+                log(f"[SCAN]  ML top features: {', '.join(f'{k}:{v:.0%}' for k,v in top3)}")
             log(f"[SCAN] ════════════════════════════════════════════════════")
 
             # ── FLEET: pubblica regime e bias per Combined Bot ──
@@ -2116,7 +2885,7 @@ def processor_thread(sz_dec, px_dec):
                 time.sleep(SCAN_INTERVAL)
                 continue
             
-            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode = sig
+            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode, ml_features = sig
             sl_pct = sl_dist / entry_px * 100
             tp_dist = abs(tp - entry_px)
             tp_pct = tp_dist / entry_px * 100
@@ -2135,7 +2904,8 @@ def processor_thread(sz_dec, px_dec):
                 "sl": sl, "tp": tp, "entry_px": entry_px,
                 "sl_dist": sl_dist, "size_mult": size_mult,
                 "regime": sig_regime, "setup": setup,
-                "scalp_mode": scalp_mode, "ts": time.time()
+                "scalp_mode": scalp_mode, "ts": time.time(),
+                "ml_features": ml_features
             }
             log(f"[PROC] → BTC [{direction}] [{sig_type}] [{scalp_mode}] published")
             
@@ -2237,6 +3007,13 @@ def executor_thread(sz_dec, px_dec):
                 # FLEET: aggiorna PnL condiviso
                 daily_btc_pnl = sum(t["pnl"] for t in _trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
                 update_fleet_daily_pnl(daily_btc_pnl)
+
+                # ── V7: ML ONLINE LEARNING — record outcome ──
+                ml_feats = last_pos_state.get("ml_features", [])
+                if ml_feats and len(ml_feats) == OnlineGBClassifier.N_FEATURES:
+                    won = pnl_usd > 0
+                    ml_record_outcome(ml_feats, won)
+                    log(f"[ML] Recorded: {'WIN' if won else 'LOSS'} | acc:{_ml_model.get_accuracy():.0%}")
 
                 last_pos_state = None
             
@@ -2368,7 +3145,8 @@ def executor_thread(sz_dec, px_dec):
                             "last_mgmt": 0, "partial_done": False, "partial_close_px": 0,
                             "partial_pnl_pct": 0, "trailing_active": False,
                             "trailing_activated_at": 0, "trailing_moves": 0,
-                            "current_ts": 0, "atr": 0, "open_ts": time.time(), "close_reason": ""
+                            "current_ts": 0, "atr": 0, "open_ts": time.time(), "close_reason": "",
+                            "ml_features": sig.get("ml_features", [])
                         })
                         save_pos_state(last_pos_state)
                         sl_pct = sig["sl_dist"]/sig["entry_px"]*100
@@ -2394,8 +3172,9 @@ def executor_thread(sz_dec, px_dec):
 # ================================================================
 def main():
     global _last_trade_ts
-    log("🚀 BTC SCALPER V7 — 3 Thread Architecture")
+    log("🚀 BTC SCALPER V7 — Predictive Analytics Edition")
     log(f"Risk:${RISK_USD} Lev:{LEVERAGE}x Modes:RANGE/TREND/FLASH")
+    log(f"✦ Sentiment Analysis | ✦ Order Flow | ✦ Machine Learning")
     
     load_state()
     sz_dec, px_dec = get_meta()
