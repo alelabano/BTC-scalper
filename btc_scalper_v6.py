@@ -293,15 +293,13 @@ def update_fleet_daily_pnl(btc_pnl):
 
 def compute_hourly_bias():
     """
-    Bias per il fleet — combina regime 4h + momentum breve termine.
-    Se BTC scende >0.3% in 1h → non può essere LONG_ONLY (anche se regime è BULL).
-    Se BTC sale >0.3% in 1h → non può essere SHORT_ONLY (anche se regime è BEAR).
+    Versione V7 - Ottimizzata per catturare trend discendenti rapidi e lenti.
     """
     fz = get_funding_z()
-    oi = get_oi_change()
     mid = get_mid()
+    # _regime viene preso dalla variabile globale aggiornata dallo scanner_thread
 
-    # Momentum breve termine: variazione 1h
+    # 1. Recupero momentum con protezione
     short_momentum = 0
     try:
         df_1h = fetch_df("1h", 2)
@@ -309,35 +307,51 @@ def compute_hourly_bias():
             px_now = float(df_1h.iloc[-1]['close'])
             px_1h_ago = float(df_1h.iloc[-2]['close'])
             short_momentum = (px_now - px_1h_ago) / px_1h_ago
-    except: pass
+    except Exception as e:
+        log(f"[BIAS_ERR] Errore calcolo momentum: {e}")
 
-    # Regole chiare:
-    # 1. BTC scende >0.3% in 1h → SHORT_ONLY (indipendente dal regime 4h)
-    # 2. BTC sale >0.3% in 1h → LONG_ONLY (indipendente dal regime 4h)
-    # 3. Regime BEAR + funding crowded → SHORT_ONLY
-    # 4. Regime BULL + funding favorevole → LONG_ONLY
-    # 5. Tutto il resto → NEUTRAL
+    # ================================================================
+    # NUOVA LOGICA DI DECISIONE
+    # ================================================================
+    
+    # A. MOMENTUM AGGRESSIVO (Flash protection)
+    # Abbassato a 0.20% per essere più reattivo
+    if short_momentum < -0.0020:
+        bias = "SHORT_ONLY"
+        reason = f"FLASH DROP: BTC {short_momentum:+.2%}"
+    elif short_momentum > 0.0020:
+        bias = "LONG_ONLY"
+        reason = f"FLASH PUMP: BTC {short_momentum:+.2%}"
 
-    if short_momentum < -0.003:  # scende >0.3% in 1h
-        bias = "SHORT_ONLY"
-        reason = f"BTC {short_momentum:+.2%} in 1h (dropping)"
-    elif short_momentum > 0.003:  # sale >0.3% in 1h
-        bias = "LONG_ONLY"
-        reason = f"BTC {short_momentum:+.2%} in 1h (rising)"
-    elif _regime == "BEAR" and fz > 0.5:
-        bias = "SHORT_ONLY"
-        reason = f"BEAR + FZ:{fz:+.1f} crowded"
-    elif _regime == "BULL" and fz < 0 and short_momentum >= 0:
-        bias = "LONG_ONLY"
-        reason = f"BULL + FZ:{fz:+.1f} + momentum flat/up"
+    # B. REGIME BEAR (Trend primario negativo)
+    elif _regime == "BEAR":
+        # Se siamo in Bear, permettiamo Short a meno che non ci sia un forte ipervenduto (FZ molto basso)
+        if fz > -0.5:
+            bias = "SHORT_ONLY"
+            reason = f"BEAR REGIME + FZ:{fz:+.1f}"
+        else:
+            bias = "NEUTRAL"
+            reason = f"BEAR but FZ extreme low ({fz:+.1f})"
+
+    # C. REGIME BULL (Trend primario positivo)
+    elif _regime == "BULL":
+        # SE IL MOMENTUM È NEGATIVO (anche poco), NON FORZARE LONG
+        if short_momentum < -0.0005: # -0.05%
+            bias = "NEUTRAL" # Sblocca la possibilità di segnali SELL tecnici
+            reason = f"BULL under pressure (Mom:{short_momentum:+.2%})"
+        else:
+            bias = "LONG_ONLY"
+            reason = f"BULL + FZ:{fz:+.1f}"
+
+    # D. DEFAULT / RANGE
     else:
         bias = "NEUTRAL"
-        reason = f"{_regime} + mom:{short_momentum:+.2%} + FZ:{fz:+.1f}"
+        reason = f"RANGE/UNKNOWN (Mom:{short_momentum:+.2%})"
 
+    # Log e pubblicazione
     publish_bias(bias, reason)
     log(f"[FLEET] Bias: {bias} | {reason}")
     return bias
-
 def execute_kill_switch():
     """
     KILL SWITCH: chiude TUTTE le posizioni aperte su entrambi i bot.
