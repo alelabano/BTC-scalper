@@ -250,9 +250,17 @@ CRYPTOCOMPARE_CACHE_TTL = 300
 def _fetch_lunarcrush():
     """
     Fetch BTC Galaxy Score + Sentiment da LunarCrush API v4.
+    
+    Endpoint strategy (v4 docs):
+      1° tentativo: /coins/list/v2?sort=galaxy_score&limit=1&filter=BTC
+         → real-time (aggiornato ogni pochi secondi), ha galaxy_score + sentiment
+      2° fallback: /coins/btc/time-series/v2 (ultimo datapoint)
+         → aggiornato ogni ora, ha galaxy_score + sentiment + social metrics
+      3° fallback: /topic/bitcoin/v1
+         → dati topic-level (aggregato social su "bitcoin")
+    
     Galaxy Score: 0-100 (health composita: price + social + correlation).
     Sentiment: % post positivi pesata per interazioni (0-100).
-    Social Volume: numero assoluto di menzioni.
     """
     global _lunarcrush_cache
     if time.time() - _lunarcrush_cache["ts"] < LUNARCRUSH_CACHE_TTL:
@@ -260,41 +268,136 @@ def _fetch_lunarcrush():
 
     lc_key = os.getenv("LUNARCRUSH_API_KEY", "")
     if not lc_key:
-        return _lunarcrush_cache  # nessuna key → usa cache/default
+        return _lunarcrush_cache
 
+    headers = {"Authorization": f"Bearer {lc_key}"}
+
+    # ── Tentativo 1: coins/list/v2 (real-time, filtrato per BTC) ──
     try:
-        # API v4: /coins/btc/v1 — singolo asset, dati real-time
-        url = "https://lunarcrush.com/api4/public/coins/btc/v1"
-        headers = {"Authorization": f"Bearer {lc_key}"}
+        url = "https://lunarcrush.com/api4/public/coins/list/v2?sort=galaxy_score&limit=10"
         r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            items = r.json().get("data", [])
+            for item in items:
+                sym = (item.get("symbol", "") or item.get("s", "")).upper()
+                if sym == "BTC":
+                    result = _parse_lunarcrush_item(item, "coins/list/v2")
+                    if result:
+                        return _lunarcrush_cache
+            # BTC non trovato nei top 10 per galaxy — prova senza sort
+            url2 = "https://lunarcrush.com/api4/public/coins/list/v2?limit=1&search=btc"
+            r2 = requests.get(url2, headers=headers, timeout=10)
+            if r2.status_code == 200:
+                items2 = r2.json().get("data", [])
+                if items2:
+                    result = _parse_lunarcrush_item(items2[0], "coins/list/v2(search)")
+                    if result:
+                        return _lunarcrush_cache
+        elif r.status_code == 429:
+            log("[SENT] LunarCrush rate limited on coins/list")
+        else:
+            log(f"[SENT] LunarCrush coins/list HTTP {r.status_code}")
+    except Exception as e:
+        log(f"[SENT] LunarCrush coins/list error: {e}")
 
+    # ── Tentativo 2: time-series (ultimo datapoint, cached ~1h) ──
+    try:
+        url = "https://lunarcrush.com/api4/public/coins/btc/time-series/v2"
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data_list = r.json().get("data", [])
+            if data_list:
+                # Ultimo datapoint (più recente)
+                item = data_list[-1]
+                result = _parse_lunarcrush_item(item, "time-series/v2")
+                if result:
+                    return _lunarcrush_cache
+        elif r.status_code != 429:
+            log(f"[SENT] LunarCrush time-series HTTP {r.status_code}")
+    except Exception as e:
+        log(f"[SENT] LunarCrush time-series error: {e}")
+
+    # ── Tentativo 3: topic/bitcoin (aggregato social) ──
+    try:
+        url = "https://lunarcrush.com/api4/public/topic/bitcoin/v1"
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json().get("data", {})
-            galaxy = float(data.get("galaxy_score", 50) or 50)
-            sentiment = float(data.get("sentiment", 50) or 50)
-            social_vol = int(data.get("social_volume", 0) or 0)
-            alt_rank = int(data.get("alt_rank", 500) or 500)
-            social_dom = float(data.get("social_dominance", 0) or 0)
-
-            _lunarcrush_cache = {
-                "ts": time.time(),
-                "galaxy": galaxy,
-                "sentiment": sentiment,
-                "social_volume": social_vol,
-                "alt_rank": alt_rank,
-                "social_dominance": social_dom,
-            }
-            log(f"[SENT] LunarCrush OK: Galaxy:{galaxy:.0f} Sent:{sentiment:.0f}% "
-                f"SocVol:{social_vol} AltRank:{alt_rank}")
-        elif r.status_code == 429:
-            log(f"[SENT] LunarCrush rate limited — using cache")
-        else:
-            log(f"[SENT] LunarCrush HTTP {r.status_code}")
-
+            if data:
+                result = _parse_lunarcrush_item(data, "topic/bitcoin")
+                if result:
+                    return _lunarcrush_cache
+        elif r.status_code != 429:
+            log(f"[SENT] LunarCrush topic HTTP {r.status_code}")
     except Exception as e:
-        log(f"[SENT] LunarCrush error: {e}")
+        log(f"[SENT] LunarCrush topic error: {e}")
 
+    log("[SENT] LunarCrush: tutti gli endpoint falliti")
     return _lunarcrush_cache
+
+
+def _parse_lunarcrush_item(item, source=""):
+    """
+    Parsing unificato per qualsiasi endpoint LunarCrush.
+    I campi possono avere nomi leggermente diversi tra endpoint.
+    Returns True se il parsing ha avuto successo.
+    """
+    global _lunarcrush_cache
+
+    # Galaxy Score: cercato con diversi nomi possibili
+    galaxy = None
+    for key in ["galaxy_score", "gs", "galaxy"]:
+        val = item.get(key)
+        if val is not None:
+            galaxy = float(val)
+            break
+
+    # Sentiment: % positivo
+    sentiment = None
+    for key in ["sentiment", "average_sentiment", "sent"]:
+        val = item.get(key)
+        if val is not None:
+            sentiment = float(val)
+            break
+
+    # Almeno uno dei due deve esistere
+    if galaxy is None and sentiment is None:
+        log(f"[SENT] LunarCrush parse failed ({source}): no galaxy or sentiment in keys={list(item.keys())[:10]}")
+        return False
+
+    galaxy = galaxy if galaxy is not None else 50
+    sentiment = sentiment if sentiment is not None else 50
+
+    # Social volume
+    social_vol = 0
+    for key in ["social_volume", "social_mentions", "posts_created", "posts_active"]:
+        val = item.get(key)
+        if val is not None and float(val) > 0:
+            social_vol = int(float(val))
+            break
+
+    # Alt rank
+    alt_rank = int(float(item.get("alt_rank", 500) or 500))
+
+    # Social dominance
+    social_dom = float(item.get("social_dominance", 0) or 0)
+
+    # Interactions
+    interactions = int(float(item.get("interactions", item.get("interactions_24h", 0)) or 0))
+
+    _lunarcrush_cache = {
+        "ts": time.time(),
+        "galaxy": galaxy,
+        "sentiment": sentiment,
+        "social_volume": social_vol,
+        "alt_rank": alt_rank,
+        "social_dominance": social_dom,
+        "interactions": interactions,
+        "source": source,
+    }
+    log(f"[SENT] LunarCrush OK ({source}): Galaxy:{galaxy:.0f} Sent:{sentiment:.0f}% "
+        f"SocVol:{social_vol} AltRank:{alt_rank} Interact:{interactions}")
+    return True
 
 
 def _fetch_cryptocompare():
@@ -305,6 +408,9 @@ def _fetch_cryptocompare():
     - In/Out of the Money (profit/loss distribution)
     - Concentration (holder distribution)
     - Net Network Growth
+    
+    Endpoint: /data/tradingsignals/intotheblock/latest
+    API key passa nell'header (metodo raccomandato) o come query param.
     """
     global _cryptocompare_cache
     if time.time() - _cryptocompare_cache["ts"] < CRYPTOCOMPARE_CACHE_TTL:
@@ -315,32 +421,62 @@ def _fetch_cryptocompare():
         return _cryptocompare_cache
 
     try:
-        url = (f"https://min-api.cryptocompare.com/data/tradingsignals/intotheblock/latest"
-               f"?fsym=BTC&api_key={cc_key}")
-        r = requests.get(url, timeout=10)
+        # Metodo raccomandato: key nell'header Authorization
+        url = "https://min-api.cryptocompare.com/data/tradingsignals/intotheblock/latest?fsym=BTC"
+        headers = {"authorization": f"Apikey {cc_key}"}
+        r = requests.get(url, headers=headers, timeout=10)
 
         if r.status_code == 200:
-            data = r.json().get("Data", {})
+            resp = r.json()
+            # Check per errori API nella risposta JSON
+            if resp.get("Response") == "Error":
+                log(f"[SENT] CryptoCompare API error: {resp.get('Message', 'unknown')}")
+                return _cryptocompare_cache
 
-            # Estrai i segnali principali con safe defaults
+            data = resp.get("Data", {})
+
+            if not data:
+                log(f"[SENT] CryptoCompare: Data vuoto. Keys risposta: {list(resp.keys())}")
+                return _cryptocompare_cache
+
+            # Estrai i segnali principali
             signals = {}
             bull_scores = []
 
-            for key in ["largetxsTransaction", "addressesNetGrowth", "inOutVar",
-                        "concentrationVar", "largetxsVar"]:
+            # Tutti i possibili signal keys di IntoTheBlock
+            signal_keys = [
+                "largetxsTransaction", "addressesNetGrowth", "inOutVar",
+                "concentrationVar", "largetxsVar", "breakdownVar"
+            ]
+
+            for key in signal_keys:
                 sig = data.get(key, {})
-                if sig:
+                if sig and isinstance(sig, dict):
                     bull = float(sig.get("bullish", 0) or 0)
                     bear = float(sig.get("bearish", 0) or 0)
-                    signals[key] = {"bull": bull, "bear": bear}
+                    neutral = float(sig.get("neutral", 0) or 0)
+                    sentiment_val = sig.get("sentiment", "")
+                    signals[key] = {"bull": bull, "bear": bear, "sentiment": sentiment_val}
                     if bull + bear > 0:
                         bull_scores.append(bull / (bull + bear) * 100)
+                    elif sentiment_val:
+                        # Fallback: usa il campo "sentiment" testuale
+                        if sentiment_val.lower() == "bullish":
+                            bull_scores.append(75)
+                        elif sentiment_val.lower() == "bearish":
+                            bull_scores.append(25)
+                        else:
+                            bull_scores.append(50)
 
-            # Media pesata delle bull percentages
+            if not signals:
+                # Log delle keys effettive per debug
+                log(f"[SENT] CryptoCompare: nessun signal trovato. Data keys: {list(data.keys())[:15]}")
+
+            # Media delle bull percentages
             if bull_scores:
                 avg_bull = sum(bull_scores) / len(bull_scores)
             else:
-                avg_bull = 50  # neutral
+                avg_bull = 50
 
             _cryptocompare_cache = {
                 "ts": time.time(),
@@ -352,7 +488,7 @@ def _fetch_cryptocompare():
         elif r.status_code == 429:
             log(f"[SENT] CryptoCompare rate limited — using cache")
         else:
-            log(f"[SENT] CryptoCompare HTTP {r.status_code}")
+            log(f"[SENT] CryptoCompare HTTP {r.status_code}: {r.text[:200]}")
 
     except Exception as e:
         log(f"[SENT] CryptoCompare error: {e}")
