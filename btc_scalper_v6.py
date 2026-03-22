@@ -363,7 +363,8 @@ def compute_hourly_bias():
     # Log e pubblicazione
     publish_bias(bias, reason)
     log(f"[FLEET V7] Bias: {bias} | {reason}")
-    return biasdef execute_kill_switch():
+    return bias
+  def execute_kill_switch():
     """
     KILL SWITCH: chiude TUTTE le posizioni aperte su entrambi i bot.
     Chiamato quando il daily loss supera il 3%.
