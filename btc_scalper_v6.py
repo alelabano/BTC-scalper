@@ -352,11 +352,29 @@ def _fetch_social_sentiment():
     # ── B. Reddit r/bitcoin — keyword sentiment su hot posts ──
     reddit_score = 50  # default
     try:
-        url = "https://www.reddit.com/r/bitcoin/hot.json?limit=25"
-        headers_r = {"User-Agent": "BTC-Scalper-V7/1.0 (sentiment analysis)"}
-        r = requests.get(url, headers=headers_r, timeout=10)
+        # old.reddit.com è più affidabile da datacenter IPs
+        # + User-Agent browser-like per evitare 403
+        reddit_urls = [
+            "https://old.reddit.com/r/bitcoin/hot.json?limit=25",
+            "https://www.reddit.com/r/bitcoin/hot.json?limit=25",
+        ]
+        headers_r = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = None
+        for reddit_url in reddit_urls:
+            try:
+                r = requests.get(reddit_url, headers=headers_r, timeout=10)
+                if r.status_code == 200:
+                    break
+                log(f"[SENT] Reddit {reddit_url.split('/')[2]} HTTP {r.status_code}")
+            except:
+                continue
 
-        if r.status_code == 200:
+        if r and r.status_code == 200:
             posts = r.json().get("data", {}).get("children", [])
             if posts:
                 title_scores = []
@@ -404,10 +422,12 @@ def _fetch_social_sentiment():
                 scores.append(("reddit", reddit_score))
                 log(f"[SENT] Reddit OK: Score:{reddit_score:.0f} Bull:{bullish_count} "
                     f"Bear:{bearish_count} AvgUpvotes:{components['reddit_avg_score']:.0f}")
-        elif r.status_code == 429:
+        elif r and r.status_code == 429:
             log("[SENT] Reddit rate limited — using cache")
+        elif r:
+            log(f"[SENT] Reddit all endpoints failed (last: HTTP {r.status_code})")
         else:
-            log(f"[SENT] Reddit HTTP {r.status_code}")
+            log("[SENT] Reddit: no response from any endpoint")
 
     except Exception as e:
         log(f"[SENT] Reddit error: {e}")
