@@ -222,32 +222,166 @@ def get_oi_change():
 # ================================================================
 
 # ================================================================
-# MODULE 1: SENTIMENT ANALYSIS
+# MODULE 1: SENTIMENT ANALYSIS (V7.2 — Dual API)
 # ================================================================
-# Aggregates Fear & Greed Index, funding sentiment, OI sentiment,
-# and optionally social/news sentiment via CryptoCompare.
-# Returns a composite score 0-100 (0=extreme fear, 100=extreme greed).
+# 4 fonti con pesi calibrati per BTC scalping:
+#   A. Fear & Greed Index        (30%) — macro sentiment, contrarian
+#   B. LunarCrush Galaxy+Social  (30%) — social real-time (Twitter/Reddit/YT)
+#   C. Funding z-score interno   (25%) — posizionamento derivati
+#   D. CryptoCompare IntoTheBlock(15%) — on-chain bull/bear signals
+#
+# ENV VARS necessarie:
+#   LUNARCRUSH_API_KEY     — free Discover o $24/mo Individual
+#   CRYPTOCOMPARE_API_KEY  — free tier (~100k calls/mese)
+#
+# Entrambe opzionali: se mancano, il bot usa fallback interni.
 # ================================================================
 
 _sentiment_cache = {"score": 50, "components": {}, "ts": 0}
-SENTIMENT_CACHE_TTL = 300  # 5 min cache
+SENTIMENT_CACHE_TTL = 300  # 5 min cache — ~288 calls/day per API
+
+# Sub-caches per API con TTL indipendenti (evita burst se una è lenta)
+_lunarcrush_cache = {"ts": 0, "galaxy": 50, "sentiment": 50, "social_volume": 0}
+_cryptocompare_cache = {"ts": 0, "bull_pct": 50, "signals": {}}
+LUNARCRUSH_CACHE_TTL = 300
+CRYPTOCOMPARE_CACHE_TTL = 300
+
+
+def _fetch_lunarcrush():
+    """
+    Fetch BTC Galaxy Score + Sentiment da LunarCrush API v4.
+    Galaxy Score: 0-100 (health composita: price + social + correlation).
+    Sentiment: % post positivi pesata per interazioni (0-100).
+    Social Volume: numero assoluto di menzioni.
+    """
+    global _lunarcrush_cache
+    if time.time() - _lunarcrush_cache["ts"] < LUNARCRUSH_CACHE_TTL:
+        return _lunarcrush_cache
+
+    lc_key = os.getenv("LUNARCRUSH_API_KEY", "")
+    if not lc_key:
+        return _lunarcrush_cache  # nessuna key → usa cache/default
+
+    try:
+        # API v4: /coins/btc/v1 — singolo asset, dati real-time
+        url = "https://lunarcrush.com/api4/public/coins/btc/v1"
+        headers = {"Authorization": f"Bearer {lc_key}"}
+        r = requests.get(url, headers=headers, timeout=10)
+
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            galaxy = float(data.get("galaxy_score", 50) or 50)
+            sentiment = float(data.get("sentiment", 50) or 50)
+            social_vol = int(data.get("social_volume", 0) or 0)
+            alt_rank = int(data.get("alt_rank", 500) or 500)
+            social_dom = float(data.get("social_dominance", 0) or 0)
+
+            _lunarcrush_cache = {
+                "ts": time.time(),
+                "galaxy": galaxy,
+                "sentiment": sentiment,
+                "social_volume": social_vol,
+                "alt_rank": alt_rank,
+                "social_dominance": social_dom,
+            }
+            log(f"[SENT] LunarCrush OK: Galaxy:{galaxy:.0f} Sent:{sentiment:.0f}% "
+                f"SocVol:{social_vol} AltRank:{alt_rank}")
+        elif r.status_code == 429:
+            log(f"[SENT] LunarCrush rate limited — using cache")
+        else:
+            log(f"[SENT] LunarCrush HTTP {r.status_code}")
+
+    except Exception as e:
+        log(f"[SENT] LunarCrush error: {e}")
+
+    return _lunarcrush_cache
+
+
+def _fetch_cryptocompare():
+    """
+    Fetch IntoTheBlock trading signals da CryptoCompare.
+    Ritorna bull/bear percentages basate su:
+    - Large Transactions (whale activity)
+    - In/Out of the Money (profit/loss distribution)
+    - Concentration (holder distribution)
+    - Net Network Growth
+    """
+    global _cryptocompare_cache
+    if time.time() - _cryptocompare_cache["ts"] < CRYPTOCOMPARE_CACHE_TTL:
+        return _cryptocompare_cache
+
+    cc_key = os.getenv("CRYPTOCOMPARE_API_KEY", "")
+    if not cc_key:
+        return _cryptocompare_cache
+
+    try:
+        url = (f"https://min-api.cryptocompare.com/data/tradingsignals/intotheblock/latest"
+               f"?fsym=BTC&api_key={cc_key}")
+        r = requests.get(url, timeout=10)
+
+        if r.status_code == 200:
+            data = r.json().get("Data", {})
+
+            # Estrai i segnali principali con safe defaults
+            signals = {}
+            bull_scores = []
+
+            for key in ["largetxsTransaction", "addressesNetGrowth", "inOutVar",
+                        "concentrationVar", "largetxsVar"]:
+                sig = data.get(key, {})
+                if sig:
+                    bull = float(sig.get("bullish", 0) or 0)
+                    bear = float(sig.get("bearish", 0) or 0)
+                    signals[key] = {"bull": bull, "bear": bear}
+                    if bull + bear > 0:
+                        bull_scores.append(bull / (bull + bear) * 100)
+
+            # Media pesata delle bull percentages
+            if bull_scores:
+                avg_bull = sum(bull_scores) / len(bull_scores)
+            else:
+                avg_bull = 50  # neutral
+
+            _cryptocompare_cache = {
+                "ts": time.time(),
+                "bull_pct": round(avg_bull, 1),
+                "signals": signals,
+                "n_signals": len(bull_scores),
+            }
+            log(f"[SENT] CryptoCompare OK: Bull:{avg_bull:.0f}% ({len(bull_scores)} signals)")
+        elif r.status_code == 429:
+            log(f"[SENT] CryptoCompare rate limited — using cache")
+        else:
+            log(f"[SENT] CryptoCompare HTTP {r.status_code}")
+
+    except Exception as e:
+        log(f"[SENT] CryptoCompare error: {e}")
+
+    return _cryptocompare_cache
+
 
 def get_sentiment_score():
     """
-    Composite sentiment score 0-100.
-    Combina: Fear & Greed Index (40%), Funding Sentiment (25%),
-    OI Momentum (20%), Social Buzz (15%).
-    Cached per 5 minuti.
+    Composite sentiment score 0-100 (V7.2 — Dual API).
+
+    Pesi:
+      A. Fear & Greed Index          30%  (macro contrarian)
+      B. LunarCrush Galaxy+Sentiment 30%  (social real-time)
+      C. Funding z-score             25%  (derivatives positioning)
+      D. CryptoCompare IntoTheBlock  15%  (on-chain signals)
+
+    Fallback: se un'API manca, il suo peso viene redistribuito
+    proporzionalmente sulle altre fonti.
     """
     global _sentiment_cache
     if time.time() - _sentiment_cache["ts"] < SENTIMENT_CACHE_TTL:
         return _sentiment_cache["score"]
 
     components = {}
-    weights = {"fgi": 0.40, "funding": 0.25, "oi": 0.20, "social": 0.15}
+    sources = {}  # {name: (score, weight)}
 
-    # ── A. Fear & Greed Index (alternative.me API) ──
-    fgi_score = 50  # default neutral
+    # ── A. Fear & Greed Index (alternative.me — gratis, no key) ──
+    fgi_score = 50
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=1&format=json", timeout=8)
         if r.status_code == 200:
@@ -259,59 +393,83 @@ def get_sentiment_score():
     except Exception as e:
         log(f"[SENT] FGI fetch error: {e}")
     components.setdefault("fgi", fgi_score)
+    sources["fgi"] = (fgi_score, 0.30)
 
-    # ── B. Funding Sentiment (from internal z-score) ──
-    # Funding z > 1.5 = crowded longs = greed; z < -1.5 = crowded shorts = fear
+    # ── B. LunarCrush — Galaxy Score + Sentiment (social real-time) ──
+    lc = _fetch_lunarcrush()
+    lc_available = lc["ts"] > 0
+
+    if lc_available:
+        # Combina Galaxy Score (health globale) e Sentiment % (positività post)
+        # Galaxy è 0-100 ma centrato su ~50-60, quindi stretchiamo un po'
+        galaxy_norm = max(0, min(100, (lc["galaxy"] - 20) * 1.25))
+        # Sentiment è già 0-100
+        lc_score = galaxy_norm * 0.55 + lc["sentiment"] * 0.45
+        lc_score = max(5, min(95, lc_score))
+
+        components["lc_galaxy"] = round(lc["galaxy"], 1)
+        components["lc_sentiment"] = round(lc["sentiment"], 1)
+        components["lc_social_vol"] = lc.get("social_volume", 0)
+        components["lc_alt_rank"] = lc.get("alt_rank", 0)
+        components["lc_score"] = round(lc_score, 1)
+        sources["lunarcrush"] = (lc_score, 0.30)
+    else:
+        components["lc_score"] = None  # non disponibile
+
+    # ── C. Funding z-score interno (derivati) ──
     fz = get_funding_z()
     # Map z-score [-3, +3] → [10, 90]
     funding_sent = max(10, min(90, 50 + fz * 13.3))
     components["funding_z"] = round(fz, 2)
     components["funding_sent"] = round(funding_sent, 1)
+    sources["funding"] = (funding_sent, 0.25)
 
-    # ── C. OI Momentum Sentiment ──
-    # Rising OI in uptrend = bullish conviction, falling OI = bearish
-    oi_chg = get_oi_change()
-    # Map OI change [-5%, +5%] → [20, 80]
-    oi_sent = max(20, min(80, 50 + oi_chg * 600))
-    components["oi_change"] = round(oi_chg, 4)
-    components["oi_sent"] = round(oi_sent, 1)
+    # ── D. CryptoCompare IntoTheBlock (on-chain) ──
+    cc = _fetch_cryptocompare()
+    cc_available = cc["ts"] > 0
 
-    # ── D. Social / News Sentiment (CryptoCompare — free tier) ──
-    social_score = 50  # default neutral
-    try:
-        cc_key = os.getenv("CRYPTOCOMPARE_API_KEY", "")
-        if cc_key:
-            url = (f"https://min-api.cryptocompare.com/data/tradingsignals/intotheblock/latest"
-                   f"?fsym=BTC&api_key={cc_key}")
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                sig_data = r.json().get("Data", {})
-                # IntoTheBlock signals: bull/bear percentages
-                bull = float(sig_data.get("largetxsTransaction", {}).get("bullish", 50) or 50)
-                social_score = max(10, min(90, bull))
-                components["social_raw"] = round(bull, 1)
-        else:
-            # Fallback: derive social proxy from volatility + FGI
-            # High volatility + low FGI = panic = extreme fear
-            social_score = fgi_score * 0.7 + funding_sent * 0.3
-    except Exception as e:
-        log(f"[SENT] Social fetch error: {e}")
-        social_score = fgi_score * 0.7 + funding_sent * 0.3
-    components["social_sent"] = round(social_score, 1)
+    if cc_available:
+        cc_score = max(5, min(95, cc["bull_pct"]))
+        components["cc_bull_pct"] = cc["bull_pct"]
+        components["cc_n_signals"] = cc.get("n_signals", 0)
+        components["cc_score"] = round(cc_score, 1)
+        sources["cryptocompare"] = (cc_score, 0.15)
+    else:
+        components["cc_score"] = None
 
-    # ── Composite Score ──
-    composite = (
-        fgi_score * weights["fgi"] +
-        funding_sent * weights["funding"] +
-        oi_sent * weights["oi"] +
-        social_score * weights["social"]
-    )
+    # ── Composite con redistribuzione pesi se API mancanti ──
+    total_weight = sum(w for _, w in sources.values())
+    if total_weight <= 0:
+        composite = 50  # fallback totale
+    else:
+        composite = sum(score * (weight / total_weight)
+                        for score, weight in sources.values())
     composite = max(0, min(100, round(composite)))
     components["composite"] = composite
 
+    # Dettaglio fonti attive
+    active = [k for k in sources]
+    missing = []
+    if not lc_available:
+        missing.append("LC")
+    if not cc_available:
+        missing.append("CC")
+    components["active_sources"] = active
+    components["missing_sources"] = missing
+
     _sentiment_cache = {"score": composite, "components": components, "ts": time.time()}
-    log(f"[SENT] Score:{composite} | FGI:{fgi_score} Fund:{funding_sent:.0f} OI:{oi_sent:.0f} Social:{social_score:.0f}")
+
+    # Log dettagliato
+    lc_str = f"LC:{lc_score:.0f}" if lc_available else "LC:off"
+    cc_str = f"CC:{cc_score:.0f}" if cc_available else "CC:off"
+    log(f"[SENT] Score:{composite} | FGI:{fgi_score} {lc_str} "
+        f"Fund:{funding_sent:.0f} {cc_str} | {len(sources)} sources")
     return composite
+
+
+def get_sentiment_detail():
+    """Ritorna i componenti dettagliati dell'ultimo calcolo sentiment."""
+    return _sentiment_cache.get("components", {})
 
 
 def get_sentiment_bias():
@@ -322,32 +480,59 @@ def get_sentiment_bias():
     - score > 80: EXTREME_GREED → contrarian SHORT bias
     - score > 65: GREED → slight SHORT bias
     - else: NEUTRAL
+
+    In V7.2 tiene conto anche di LunarCrush Galaxy Score per conferma:
+    se Galaxy < 30, la fear è confermata socialmente → bias più forte.
     """
     s = get_sentiment_score()
-    if s < 20:   return "EXTREME_FEAR", s
-    if s < 35:   return "FEAR", s
-    if s > 80:   return "EXTREME_GREED", s
-    if s > 65:   return "GREED", s
+    lc = _lunarcrush_cache
+
+    # Galaxy Score basso rinforza il segnale contrarian
+    galaxy_extreme = lc.get("galaxy", 50) < 30 or lc.get("galaxy", 50) > 75
+
+    if s < 20:
+        return "EXTREME_FEAR", s
+    if s < 35:
+        # Se Galaxy conferma fear, promuovi a extreme
+        if galaxy_extreme and lc.get("galaxy", 50) < 30:
+            return "EXTREME_FEAR", s
+        return "FEAR", s
+    if s > 80:
+        return "EXTREME_GREED", s
+    if s > 65:
+        if galaxy_extreme and lc.get("galaxy", 50) > 75:
+            return "EXTREME_GREED", s
+        return "GREED", s
     return "NEUTRAL", s
 
 
 def get_sentiment_adjustment():
     """
     Returns (size_mult_adj, sl_adj, confidence_adj) based on sentiment.
-    Used to modulate trade parameters.
+    V7.2: modulato anche da LunarCrush social volume spike.
     """
     s = get_sentiment_score()
+    lc = _lunarcrush_cache
+
+    # Social volume spike detection: se il volume social è molto alto,
+    # il mercato è "rumoroso" → riduci size per cautela
+    social_vol = lc.get("social_volume", 0)
+    vol_penalty = 1.0
+    # Se abbiamo storico, un volume >2x media recente = spike
+    # Per ora usiamo una soglia assoluta conservativa
+    if social_vol > 50000:  # BTC tipicamente 10k-30k
+        vol_penalty = 0.85
+        log(f"[SENT] Social volume spike: {social_vol} → size ×0.85")
+
     if s < 15:
-        # Extreme fear: reduce size (high vol), widen SL, boost confidence for contrarian LONG
-        return 0.7, 1.3, 2
+        return 0.7 * vol_penalty, 1.3, 2
     elif s < 30:
-        return 0.85, 1.15, 1
+        return 0.85 * vol_penalty, 1.15, 1
     elif s > 85:
-        # Extreme greed: reduce size, widen SL, boost confidence for contrarian SHORT
-        return 0.7, 1.3, 2
+        return 0.7 * vol_penalty, 1.3, 2
     elif s > 70:
-        return 0.85, 1.15, 1
-    return 1.0, 1.0, 0
+        return 0.85 * vol_penalty, 1.15, 1
+    return 1.0 * vol_penalty, 1.0, 0
 
 
 # ================================================================
@@ -2544,12 +2729,15 @@ def maybe_send_daily_report():
                          for k,v in by_type.items())
 
     bal = get_balance()
-    # V7: ML stats for report
+    # V7.2: Sentiment + ML stats for report
     ml_acc = _ml_model.get_accuracy()
     ml_n = _ml_model.n_samples
     sent = get_sentiment_score()
+    sd = get_sentiment_detail()
+    lc_info = f"Galaxy:{sd.get('lc_galaxy','off')} Sent:{sd.get('lc_sentiment','off')}%"
+    cc_info = f"Bull:{sd.get('cc_bull_pct','off')}%"
     report = (
-        f"📊 <b>BTC Scalper V7 Daily Report</b>\n"
+        f"📊 <b>BTC Scalper V7.2 Daily Report</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 PnL: <b>${total:+.2f}</b>\n"
         f"📈 Trades: {len(trades)} (W:{len(wins)} L:{len(losses)})\n"
@@ -2560,9 +2748,12 @@ def maybe_send_daily_report():
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"By signal type:\n{type_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>V7 Analytics</b>\n"
+        f"🤖 <b>V7.2 Analytics</b>\n"
         f"  ML: {ml_n} samples, acc:{ml_acc:.0%}\n"
         f"  Sentiment: {sent}/100\n"
+        f"  🌙 LunarCrush: {lc_info}\n"
+        f"  📊 CryptoCompare: {cc_info}\n"
+        f"  FGI: {sd.get('fgi','?')} | Funding: {sd.get('funding_sent','?')}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 Balance: ${bal:.2f}"
     )
@@ -2830,8 +3021,16 @@ def scanner_thread():
                 log(f"[SCAN]  {k:<18} {pf:.2f}  {wr:.0%}  {n:<4} {status}")
             log(f"[SCAN]  FZ:{fz:+.1f} | OI:{oi:+.2%} | Bal ${bal:.2f}")
             # V7: Extended analytics dashboard
-            log(f"[SCAN]  ── V7 Analytics ──")
-            log(f"[SCAN]  Sentiment:{sent_score} | Flow:{flow_sig['bias']}({flow_sig['confidence']}) | {flow_sig['details']}")
+            log(f"[SCAN]  ── V7.2 Analytics ──")
+            sent_detail = get_sentiment_detail()
+            lc_g = sent_detail.get("lc_galaxy", "off")
+            lc_s = sent_detail.get("lc_sentiment", "off")
+            cc_b = sent_detail.get("cc_bull_pct", "off")
+            missing = sent_detail.get("missing_sources", [])
+            miss_str = f" ⚠️missing:{','.join(missing)}" if missing else ""
+            log(f"[SCAN]  Sentiment:{sent_score} | FGI:{sent_detail.get('fgi','?')} "
+                f"LC_Galaxy:{lc_g} LC_Sent:{lc_s} CC_Bull:{cc_b} Fund:{sent_detail.get('funding_sent','?')}{miss_str}")
+            log(f"[SCAN]  Flow:{flow_sig['bias']}({flow_sig['confidence']}) | {flow_sig['details']}")
             log(f"[SCAN]  ML: {_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%}")
             if _ml_model.n_samples >= 20:
                 imp = _ml_model.get_feature_importance()
