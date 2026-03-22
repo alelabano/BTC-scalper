@@ -222,182 +222,212 @@ def get_oi_change():
 # ================================================================
 
 # ================================================================
-# MODULE 1: SENTIMENT ANALYSIS (V7.2 — Dual API)
+# MODULE 1: SENTIMENT ANALYSIS (V7.2 — Free APIs)
 # ================================================================
 # 4 fonti con pesi calibrati per BTC scalping:
-#   A. Fear & Greed Index        (30%) — macro sentiment, contrarian
-#   B. LunarCrush Galaxy+Social  (30%) — social real-time (Twitter/Reddit/YT)
-#   C. Funding z-score interno   (25%) — posizionamento derivati
-#   D. CryptoCompare IntoTheBlock(15%) — on-chain bull/bear signals
+#   A. Fear & Greed Index          (30%) — macro sentiment, contrarian
+#   B. CoinGecko + Reddit Social   (30%) — social real-time (free)
+#   C. Funding z-score interno     (25%) — posizionamento derivati
+#   D. CryptoCompare IntoTheBlock  (15%) — on-chain bull/bear signals
 #
 # ENV VARS necessarie:
-#   LUNARCRUSH_API_KEY     — free Discover o $24/mo Individual
 #   CRYPTOCOMPARE_API_KEY  — free tier (~100k calls/mese)
+#   COINGECKO_API_KEY      — opzionale (free v3 funziona senza key)
 #
-# Entrambe opzionali: se mancano, il bot usa fallback interni.
+# Tutte le API sono gratuite. Zero costi operativi.
 # ================================================================
 
 _sentiment_cache = {"score": 50, "components": {}, "ts": 0}
 SENTIMENT_CACHE_TTL = 300  # 5 min cache — ~288 calls/day per API
 
 # Sub-caches per API con TTL indipendenti (evita burst se una è lenta)
-_lunarcrush_cache = {"ts": 0, "galaxy": 50, "sentiment": 50, "social_volume": 0}
+_social_cache = {"ts": 0, "score": 50, "components": {}}
 _cryptocompare_cache = {"ts": 0, "bull_pct": 50, "signals": {}}
-LUNARCRUSH_CACHE_TTL = 300
+SOCIAL_CACHE_TTL = 300      # 5 min
 CRYPTOCOMPARE_CACHE_TTL = 300
 
+# ── Keyword sentiment scoring per Reddit titles ──
+_BULLISH_WORDS = {
+    "bull", "bullish", "moon", "pump", "rally", "breakout", "surge", "ath",
+    "buy", "buying", "long", "green", "recovery", "bounce", "accumulate",
+    "institutional", "adoption", "etf", "halving", "uptrend", "support"
+}
+_BEARISH_WORDS = {
+    "bear", "bearish", "dump", "crash", "sell", "selling", "short", "red",
+    "fear", "panic", "liquidat", "capitulat", "reject", "resistance",
+    "bubble", "scam", "fraud", "ban", "regulation", "downtrend", "broke"
+}
 
-def _fetch_lunarcrush():
+
+def _score_title(title):
     """
-    Fetch BTC Galaxy Score + Sentiment da LunarCrush API v4.
-    
-    Endpoint strategy (v4 docs):
-      1° tentativo: /coins/list/v2?sort=galaxy_score&limit=1&filter=BTC
-         → real-time (aggiornato ogni pochi secondi), ha galaxy_score + sentiment
-      2° fallback: /coins/btc/time-series/v2 (ultimo datapoint)
-         → aggiornato ogni ora, ha galaxy_score + sentiment + social metrics
-      3° fallback: /topic/bitcoin/v1
-         → dati topic-level (aggregato social su "bitcoin")
-    
-    Galaxy Score: 0-100 (health composita: price + social + correlation).
-    Sentiment: % post positivi pesata per interazioni (0-100).
+    Score un titolo Reddit: +1 per word bullish, -1 per bearish.
+    Returns: float in [-1, +1] normalizzato.
     """
-    global _lunarcrush_cache
-    if time.time() - _lunarcrush_cache["ts"] < LUNARCRUSH_CACHE_TTL:
-        return _lunarcrush_cache
+    words = set(title.lower().split())
+    bull = sum(1 for w in words if any(bw in w for bw in _BULLISH_WORDS))
+    bear = sum(1 for w in words if any(bw in w for bw in _BEARISH_WORDS))
+    total = bull + bear
+    if total == 0:
+        return 0.0
+    return (bull - bear) / total  # [-1, +1]
 
-    lc_key = os.getenv("LUNARCRUSH_API_KEY", "")
-    if not lc_key:
-        return _lunarcrush_cache
 
-    headers = {"Authorization": f"Bearer {lc_key}"}
+def _fetch_social_sentiment():
+    """
+    Sostituto gratuito di LunarCrush — combina:
+    
+    A. CoinGecko /coins/bitcoin — sentiment_votes + community_data
+       - sentiment_votes_up_percentage (0-100)
+       - community_data: reddit_subscribers, reddit_posts_48h, reddit_comments_48h
+       - Free Demo: 30 calls/min, 10k/mese (no key needed per v3 public)
+    
+    B. Reddit r/bitcoin/hot.json — keyword sentiment sui titoli top 25 post
+       - No auth needed (public JSON endpoint)
+       - Rate limit: ~10 req/min senza auth
+       - Analisi keyword: bullish/bearish word scoring
+    
+    Returns: aggiorna _social_cache con score composito e componenti.
+    """
+    global _social_cache
+    if time.time() - _social_cache["ts"] < SOCIAL_CACHE_TTL:
+        return _social_cache
 
-    # ── Tentativo 1: coins/list/v2 (real-time, filtrato per BTC) ──
+    components = {}
+    scores = []
+
+    # ── A. CoinGecko — sentiment votes + community ──
+    cg_score = 50  # default
     try:
-        url = "https://lunarcrush.com/api4/public/coins/list/v2?sort=galaxy_score&limit=10"
+        # v3 public API: no key needed, 30 calls/min
+        url = ("https://api.coingecko.com/api/v3/coins/bitcoin"
+               "?localization=false&tickers=false&market_data=false"
+               "&community_data=true&developer_data=false&sparkline=false")
+        headers = {"accept": "application/json"}
+        # Se hai una key CoinGecko (opzionale), usala
+        cg_key = os.getenv("COINGECKO_API_KEY", "")
+        if cg_key:
+            # Pro API usa un diverso base URL
+            url = ("https://pro-api.coingecko.com/api/v3/coins/bitcoin"
+                   "?localization=false&tickers=false&market_data=false"
+                   "&community_data=true&developer_data=false&sparkline=false")
+            headers["x-cg-pro-api-key"] = cg_key
+
         r = requests.get(url, headers=headers, timeout=10)
+
         if r.status_code == 200:
-            items = r.json().get("data", [])
-            for item in items:
-                sym = (item.get("symbol", "") or item.get("s", "")).upper()
-                if sym == "BTC":
-                    result = _parse_lunarcrush_item(item, "coins/list/v2")
-                    if result:
-                        return _lunarcrush_cache
-            # BTC non trovato nei top 10 per galaxy — prova senza sort
-            url2 = "https://lunarcrush.com/api4/public/coins/list/v2?limit=1&search=btc"
-            r2 = requests.get(url2, headers=headers, timeout=10)
-            if r2.status_code == 200:
-                items2 = r2.json().get("data", [])
-                if items2:
-                    result = _parse_lunarcrush_item(items2[0], "coins/list/v2(search)")
-                    if result:
-                        return _lunarcrush_cache
+            data = r.json()
+
+            # Sentiment votes (CoinGecko user voting)
+            sent_up = float(data.get("sentiment_votes_up_percentage", 50) or 50)
+            sent_down = float(data.get("sentiment_votes_down_percentage", 50) or 50)
+            components["cg_sent_up"] = round(sent_up, 1)
+            components["cg_sent_down"] = round(sent_down, 1)
+
+            # Community data
+            community = data.get("community_data", {})
+            reddit_subs = int(community.get("reddit_subscribers", 0) or 0)
+            reddit_posts = float(community.get("reddit_average_posts_48h", 0) or 0)
+            reddit_comments = float(community.get("reddit_average_comments_48h", 0) or 0)
+            reddit_active = int(community.get("reddit_accounts_active_48h", 0) or 0)
+
+            components["cg_reddit_subs"] = reddit_subs
+            components["cg_reddit_posts_48h"] = round(reddit_posts, 1)
+            components["cg_reddit_comments_48h"] = round(reddit_comments, 1)
+            components["cg_reddit_active_48h"] = reddit_active
+
+            # Score: sentiment_up% è già un buon indicatore (50 = neutral)
+            cg_score = sent_up  # 0-100, 50 = neutral
+            scores.append(("coingecko", cg_score))
+            log(f"[SENT] CoinGecko OK: SentUp:{sent_up:.0f}% Posts48h:{reddit_posts:.0f} "
+                f"Comments48h:{reddit_comments:.0f} Active:{reddit_active}")
         elif r.status_code == 429:
-            log("[SENT] LunarCrush rate limited on coins/list")
+            log("[SENT] CoinGecko rate limited — using cache")
         else:
-            log(f"[SENT] LunarCrush coins/list HTTP {r.status_code}")
-    except Exception as e:
-        log(f"[SENT] LunarCrush coins/list error: {e}")
+            log(f"[SENT] CoinGecko HTTP {r.status_code}")
 
-    # ── Tentativo 2: time-series (ultimo datapoint, cached ~1h) ──
+    except Exception as e:
+        log(f"[SENT] CoinGecko error: {e}")
+
+    # ── B. Reddit r/bitcoin — keyword sentiment su hot posts ──
+    reddit_score = 50  # default
     try:
-        url = "https://lunarcrush.com/api4/public/coins/btc/time-series/v2"
-        r = requests.get(url, headers=headers, timeout=10)
+        url = "https://www.reddit.com/r/bitcoin/hot.json?limit=25"
+        headers_r = {"User-Agent": "BTC-Scalper-V7/1.0 (sentiment analysis)"}
+        r = requests.get(url, headers=headers_r, timeout=10)
+
         if r.status_code == 200:
-            data_list = r.json().get("data", [])
-            if data_list:
-                # Ultimo datapoint (più recente)
-                item = data_list[-1]
-                result = _parse_lunarcrush_item(item, "time-series/v2")
-                if result:
-                    return _lunarcrush_cache
-        elif r.status_code != 429:
-            log(f"[SENT] LunarCrush time-series HTTP {r.status_code}")
+            posts = r.json().get("data", {}).get("children", [])
+            if posts:
+                title_scores = []
+                total_score_sum = 0
+                total_comments = 0
+                bullish_count = 0
+                bearish_count = 0
+
+                for post in posts:
+                    pd_data = post.get("data", {})
+                    title = pd_data.get("title", "")
+                    score = int(pd_data.get("score", 0) or 0)
+                    n_comments = int(pd_data.get("num_comments", 0) or 0)
+                    upvote_ratio = float(pd_data.get("upvote_ratio", 0.5) or 0.5)
+
+                    ts = _score_title(title)
+                    # Pesa per engagement (score + comments)
+                    weight = max(1, score + n_comments)
+                    title_scores.append((ts, weight))
+                    total_score_sum += score
+                    total_comments += n_comments
+                    if ts > 0.1:
+                        bullish_count += 1
+                    elif ts < -0.1:
+                        bearish_count += 1
+
+                # Weighted average sentiment
+                total_weight = sum(w for _, w in title_scores)
+                if total_weight > 0:
+                    weighted_sent = sum(s * w for s, w in title_scores) / total_weight
+                else:
+                    weighted_sent = 0
+
+                # Map [-1, +1] → [10, 90]
+                reddit_score = max(10, min(90, 50 + weighted_sent * 40))
+
+                components["reddit_n_posts"] = len(posts)
+                components["reddit_bullish"] = bullish_count
+                components["reddit_bearish"] = bearish_count
+                components["reddit_neutral"] = len(posts) - bullish_count - bearish_count
+                components["reddit_avg_score"] = round(total_score_sum / max(len(posts), 1), 0)
+                components["reddit_total_comments"] = total_comments
+                components["reddit_weighted_sent"] = round(weighted_sent, 3)
+
+                scores.append(("reddit", reddit_score))
+                log(f"[SENT] Reddit OK: Score:{reddit_score:.0f} Bull:{bullish_count} "
+                    f"Bear:{bearish_count} AvgUpvotes:{components['reddit_avg_score']:.0f}")
+        elif r.status_code == 429:
+            log("[SENT] Reddit rate limited — using cache")
+        else:
+            log(f"[SENT] Reddit HTTP {r.status_code}")
+
     except Exception as e:
-        log(f"[SENT] LunarCrush time-series error: {e}")
+        log(f"[SENT] Reddit error: {e}")
 
-    # ── Tentativo 3: topic/bitcoin (aggregato social) ──
-    try:
-        url = "https://lunarcrush.com/api4/public/topic/bitcoin/v1"
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            if data:
-                result = _parse_lunarcrush_item(data, "topic/bitcoin")
-                if result:
-                    return _lunarcrush_cache
-        elif r.status_code != 429:
-            log(f"[SENT] LunarCrush topic HTTP {r.status_code}")
-    except Exception as e:
-        log(f"[SENT] LunarCrush topic error: {e}")
+    # ── Composite social score ──
+    if scores:
+        # CoinGecko peso 55% (structured data), Reddit 45% (real-time sentiment)
+        weights_map = {"coingecko": 0.55, "reddit": 0.45}
+        total_w = sum(weights_map.get(name, 0.5) for name, _ in scores)
+        social_composite = sum(s * weights_map.get(name, 0.5) for name, s in scores) / total_w
+    else:
+        social_composite = 50
 
-    log("[SENT] LunarCrush: tutti gli endpoint falliti")
-    return _lunarcrush_cache
+    social_composite = max(5, min(95, round(social_composite, 1)))
+    components["social_composite"] = social_composite
+    components["sources"] = [name for name, _ in scores]
 
-
-def _parse_lunarcrush_item(item, source=""):
-    """
-    Parsing unificato per qualsiasi endpoint LunarCrush.
-    I campi possono avere nomi leggermente diversi tra endpoint.
-    Returns True se il parsing ha avuto successo.
-    """
-    global _lunarcrush_cache
-
-    # Galaxy Score: cercato con diversi nomi possibili
-    galaxy = None
-    for key in ["galaxy_score", "gs", "galaxy"]:
-        val = item.get(key)
-        if val is not None:
-            galaxy = float(val)
-            break
-
-    # Sentiment: % positivo
-    sentiment = None
-    for key in ["sentiment", "average_sentiment", "sent"]:
-        val = item.get(key)
-        if val is not None:
-            sentiment = float(val)
-            break
-
-    # Almeno uno dei due deve esistere
-    if galaxy is None and sentiment is None:
-        log(f"[SENT] LunarCrush parse failed ({source}): no galaxy or sentiment in keys={list(item.keys())[:10]}")
-        return False
-
-    galaxy = galaxy if galaxy is not None else 50
-    sentiment = sentiment if sentiment is not None else 50
-
-    # Social volume
-    social_vol = 0
-    for key in ["social_volume", "social_mentions", "posts_created", "posts_active"]:
-        val = item.get(key)
-        if val is not None and float(val) > 0:
-            social_vol = int(float(val))
-            break
-
-    # Alt rank
-    alt_rank = int(float(item.get("alt_rank", 500) or 500))
-
-    # Social dominance
-    social_dom = float(item.get("social_dominance", 0) or 0)
-
-    # Interactions
-    interactions = int(float(item.get("interactions", item.get("interactions_24h", 0)) or 0))
-
-    _lunarcrush_cache = {
-        "ts": time.time(),
-        "galaxy": galaxy,
-        "sentiment": sentiment,
-        "social_volume": social_vol,
-        "alt_rank": alt_rank,
-        "social_dominance": social_dom,
-        "interactions": interactions,
-        "source": source,
-    }
-    log(f"[SENT] LunarCrush OK ({source}): Galaxy:{galaxy:.0f} Sent:{sentiment:.0f}% "
-        f"SocVol:{social_vol} AltRank:{alt_rank} Interact:{interactions}")
-    return True
+    _social_cache = {"ts": time.time(), "score": social_composite, "components": components}
+    log(f"[SENT] Social composite: {social_composite:.0f} ({len(scores)} sources: {components['sources']})")
+    return _social_cache
 
 
 def _fetch_cryptocompare():
@@ -502,7 +532,7 @@ def get_sentiment_score():
 
     Pesi:
       A. Fear & Greed Index          30%  (macro contrarian)
-      B. LunarCrush Galaxy+Sentiment 30%  (social real-time)
+      B. CoinGecko + Reddit Social  30%  (social real-time, free)
       C. Funding z-score             25%  (derivatives positioning)
       D. CryptoCompare IntoTheBlock  15%  (on-chain signals)
 
@@ -531,26 +561,22 @@ def get_sentiment_score():
     components.setdefault("fgi", fgi_score)
     sources["fgi"] = (fgi_score, 0.30)
 
-    # ── B. LunarCrush — Galaxy Score + Sentiment (social real-time) ──
-    lc = _fetch_lunarcrush()
-    lc_available = lc["ts"] > 0
+    # ── B. CoinGecko + Reddit Social Sentiment (free, replaces LunarCrush) ──
+    social = _fetch_social_sentiment()
+    social_available = social["ts"] > 0
 
-    if lc_available:
-        # Combina Galaxy Score (health globale) e Sentiment % (positività post)
-        # Galaxy è 0-100 ma centrato su ~50-60, quindi stretchiamo un po'
-        galaxy_norm = max(0, min(100, (lc["galaxy"] - 20) * 1.25))
-        # Sentiment è già 0-100
-        lc_score = galaxy_norm * 0.55 + lc["sentiment"] * 0.45
-        lc_score = max(5, min(95, lc_score))
-
-        components["lc_galaxy"] = round(lc["galaxy"], 1)
-        components["lc_sentiment"] = round(lc["sentiment"], 1)
-        components["lc_social_vol"] = lc.get("social_volume", 0)
-        components["lc_alt_rank"] = lc.get("alt_rank", 0)
-        components["lc_score"] = round(lc_score, 1)
-        sources["lunarcrush"] = (lc_score, 0.30)
+    if social_available:
+        social_score = social["score"]
+        components["social_score"] = round(social_score, 1)
+        components["social_sources"] = social.get("components", {}).get("sources", [])
+        # Passa i sub-componenti per il log dettagliato
+        sc = social.get("components", {})
+        components["cg_sent_up"] = sc.get("cg_sent_up", "off")
+        components["reddit_bullish"] = sc.get("reddit_bullish", "off")
+        components["reddit_bearish"] = sc.get("reddit_bearish", "off")
+        sources["social"] = (social_score, 0.30)
     else:
-        components["lc_score"] = None  # non disponibile
+        components["social_score"] = None
 
     # ── C. Funding z-score interno (derivati) ──
     fz = get_funding_z()
@@ -586,8 +612,8 @@ def get_sentiment_score():
     # Dettaglio fonti attive
     active = [k for k in sources]
     missing = []
-    if not lc_available:
-        missing.append("LC")
+    if not social_available:
+        missing.append("Social")
     if not cc_available:
         missing.append("CC")
     components["active_sources"] = active
@@ -596,9 +622,9 @@ def get_sentiment_score():
     _sentiment_cache = {"score": composite, "components": components, "ts": time.time()}
 
     # Log dettagliato
-    lc_str = f"LC:{lc_score:.0f}" if lc_available else "LC:off"
+    soc_str = f"Social:{social_score:.0f}" if social_available else "Social:off"
     cc_str = f"CC:{cc_score:.0f}" if cc_available else "CC:off"
-    log(f"[SENT] Score:{composite} | FGI:{fgi_score} {lc_str} "
+    log(f"[SENT] Score:{composite} | FGI:{fgi_score} {soc_str} "
         f"Fund:{funding_sent:.0f} {cc_str} | {len(sources)} sources")
     return composite
 
@@ -617,27 +643,29 @@ def get_sentiment_bias():
     - score > 65: GREED → slight SHORT bias
     - else: NEUTRAL
 
-    In V7.2 tiene conto anche di LunarCrush Galaxy Score per conferma:
-    se Galaxy < 30, la fear è confermata socialmente → bias più forte.
+    V7.2: conferma anche con Reddit sentiment per extreme levels.
     """
     s = get_sentiment_score()
-    lc = _lunarcrush_cache
+    social = _social_cache
 
-    # Galaxy Score basso rinforza il segnale contrarian
-    galaxy_extreme = lc.get("galaxy", 50) < 30 or lc.get("galaxy", 50) > 75
+    # Reddit bearish > 60% dei post rinforza fear
+    reddit_extreme = False
+    sc = social.get("components", {})
+    r_bull = sc.get("reddit_bullish", 0)
+    r_bear = sc.get("reddit_bearish", 0)
+    if r_bull + r_bear > 5:  # almeno 5 post classificati
+        if r_bear / (r_bull + r_bear) > 0.6:
+            reddit_extreme = True  # extreme bearish on Reddit
 
     if s < 20:
         return "EXTREME_FEAR", s
     if s < 35:
-        # Se Galaxy conferma fear, promuovi a extreme
-        if galaxy_extreme and lc.get("galaxy", 50) < 30:
+        if reddit_extreme:
             return "EXTREME_FEAR", s
         return "FEAR", s
     if s > 80:
         return "EXTREME_GREED", s
     if s > 65:
-        if galaxy_extreme and lc.get("galaxy", 50) > 75:
-            return "EXTREME_GREED", s
         return "GREED", s
     return "NEUTRAL", s
 
@@ -645,20 +673,17 @@ def get_sentiment_bias():
 def get_sentiment_adjustment():
     """
     Returns (size_mult_adj, sl_adj, confidence_adj) based on sentiment.
-    V7.2: modulato anche da LunarCrush social volume spike.
+    V7.2: modulato anche da Reddit activity spike.
     """
     s = get_sentiment_score()
-    lc = _lunarcrush_cache
+    sc = _social_cache.get("components", {})
 
-    # Social volume spike detection: se il volume social è molto alto,
-    # il mercato è "rumoroso" → riduci size per cautela
-    social_vol = lc.get("social_volume", 0)
+    # Reddit activity spike: se i commenti 48h sono molto alti → mercato rumoroso
+    reddit_comments = sc.get("cg_reddit_comments_48h", 0)
     vol_penalty = 1.0
-    # Se abbiamo storico, un volume >2x media recente = spike
-    # Per ora usiamo una soglia assoluta conservativa
-    if social_vol > 50000:  # BTC tipicamente 10k-30k
+    if reddit_comments > 5000:  # spike di attività
         vol_penalty = 0.85
-        log(f"[SENT] Social volume spike: {social_vol} → size ×0.85")
+        log(f"[SENT] Reddit activity spike: {reddit_comments} comments/48h → size ×0.85")
 
     if s < 15:
         return 0.7 * vol_penalty, 1.3, 2
@@ -2870,7 +2895,7 @@ def maybe_send_daily_report():
     ml_n = _ml_model.n_samples
     sent = get_sentiment_score()
     sd = get_sentiment_detail()
-    lc_info = f"Galaxy:{sd.get('lc_galaxy','off')} Sent:{sd.get('lc_sentiment','off')}%"
+    lc_info = f"CG_Up:{sd.get('cg_sent_up','off')}% Reddit:+{sd.get('reddit_bullish','?')}/-{sd.get('reddit_bearish','?')}"
     cc_info = f"Bull:{sd.get('cc_bull_pct','off')}%"
     report = (
         f"📊 <b>BTC Scalper V7.2 Daily Report</b>\n"
@@ -2887,7 +2912,7 @@ def maybe_send_daily_report():
         f"🤖 <b>V7.2 Analytics</b>\n"
         f"  ML: {ml_n} samples, acc:{ml_acc:.0%}\n"
         f"  Sentiment: {sent}/100\n"
-        f"  🌙 LunarCrush: {lc_info}\n"
+        f"  🌐 Social: {lc_info}\n"
         f"  📊 CryptoCompare: {cc_info}\n"
         f"  FGI: {sd.get('fgi','?')} | Funding: {sd.get('funding_sent','?')}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -3159,13 +3184,16 @@ def scanner_thread():
             # V7: Extended analytics dashboard
             log(f"[SCAN]  ── V7.2 Analytics ──")
             sent_detail = get_sentiment_detail()
-            lc_g = sent_detail.get("lc_galaxy", "off")
-            lc_s = sent_detail.get("lc_sentiment", "off")
+            cg_up = sent_detail.get("cg_sent_up", "off")
+            r_bull = sent_detail.get("reddit_bullish", "off")
+            r_bear = sent_detail.get("reddit_bearish", "off")
             cc_b = sent_detail.get("cc_bull_pct", "off")
+            social_s = sent_detail.get("social_score", "off")
             missing = sent_detail.get("missing_sources", [])
             miss_str = f" ⚠️missing:{','.join(missing)}" if missing else ""
             log(f"[SCAN]  Sentiment:{sent_score} | FGI:{sent_detail.get('fgi','?')} "
-                f"LC_Galaxy:{lc_g} LC_Sent:{lc_s} CC_Bull:{cc_b} Fund:{sent_detail.get('funding_sent','?')}{miss_str}")
+                f"Social:{social_s} (CG:{cg_up}% Reddit:+{r_bull}/-{r_bear}) "
+                f"CC:{cc_b} Fund:{sent_detail.get('funding_sent','?')}{miss_str}")
             log(f"[SCAN]  Flow:{flow_sig['bias']}({flow_sig['confidence']}) | {flow_sig['details']}")
             log(f"[SCAN]  ML: {_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%}")
             if _ml_model.n_samples >= 20:
