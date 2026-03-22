@@ -293,66 +293,77 @@ def update_fleet_daily_pnl(btc_pnl):
 
 def compute_hourly_bias():
     """
-    Versione V7 - Ottimizzata per catturare trend discendenti rapidi e lenti.
+    Versione V7.1 - Multi-timeframe Momentum + Order Flow + Sentiment.
+    Cattura i dump veloci (5m) e i trend lenti (1h).
     """
+    global _last_oi, _regime
     fz = get_funding_z()
-    mid = get_mid()
-    # _regime viene preso dalla variabile globale aggiornata dallo scanner_thread
+    sentiment = get_sentiment_score() # Modulo Sentiment
+    current_oi = get_btc_open_interest() # Modulo Order Flow
+    
+    # Calcolo variazione OI (Order Flow)
+    oi_change = (current_oi - _last_oi) / _last_oi if _last_oi > 0 else 0
+    _last_oi = current_oi
 
-    # 1. Recupero momentum con protezione
-    short_momentum = 0
+    # 1. Recupero Momentum su due timeframe
+    short_momentum_5m = 0
+    short_momentum_1h = 0
     try:
+        # Recupero 15m (per simulare il 5m se non hai candele da 5m) o fetch diretto 5m
+        df_5m = fetch_df("15m", 2) # Se hai candele 5m usa "5m"
         df_1h = fetch_df("1h", 2)
+        
+        if df_5m is not None and len(df_5m) >= 2:
+            short_momentum_5m = (float(df_5m['close'].iloc[-1]) / float(df_5m['close'].iloc[-2])) - 1
+            
         if df_1h is not None and len(df_1h) >= 2:
-            px_now = float(df_1h.iloc[-1]['close'])
-            px_1h_ago = float(df_1h.iloc[-2]['close'])
-            short_momentum = (px_now - px_1h_ago) / px_1h_ago
+            short_momentum_1h = (float(df_1h['close'].iloc[-1]) / float(df_1h['close'].iloc[-2])) - 1
     except Exception as e:
-        log(f"[BIAS_ERR] Errore calcolo momentum: {e}")
+        log(f"[BIAS_ERR] Errore momentum: {e}")
 
     # ================================================================
-    # NUOVA LOGICA DI DECISIONE
+    # GERARCHIA DI DECISIONE (TUA LOGICA POTENZIATA)
     # ================================================================
     
-    # A. MOMENTUM AGGRESSIVO (Flash protection)
-    # Abbassato a 0.20% per essere più reattivo
-    if short_momentum < -0.0020:
+    # A. FAST DUMP (Priorità Massima)
+    # Se scende dello 0.2% in 5 min, attiviamo SHORT_ONLY immediato.
+    # Se l'OI sale (oi_change > 0), il segnale è confermato da "mani forti".
+    if short_momentum_5m < -0.002:
         bias = "SHORT_ONLY"
-        reason = f"FLASH DROP: BTC {short_momentum:+.2%}"
-    elif short_momentum > 0.0020:
+        reason = f"FAST DUMP 5m ({short_momentum_5m:+.2%}) | OI:{oi_change:+.2%}"
+
+    # B. TREND 1h (Cattura cali costanti come 70k -> 68.5k)
+    elif short_momentum_1h < -0.004:
+        bias = "SHORT_ONLY" # O "SHORT_BIAS" se preferisci essere meno rigido
+        reason = f"1h DOWNTREND ({short_momentum_1h:+.2%})"
+
+    elif short_momentum_1h > 0.004:
         bias = "LONG_ONLY"
-        reason = f"FLASH PUMP: BTC {short_momentum:+.2%}"
+        reason = f"1h UPTREND ({short_momentum_1h:+.2%})"
 
-    # B. REGIME BEAR (Trend primario negativo)
+    # C. FILTRO SENTIMENT (Contrarian)
+    elif sentiment < 25:
+        bias = "LONG_ONLY"
+        reason = f"EXTREME FEAR ({sentiment}) - Looking for bounce"
+    
+    # D. LOGICA DI REGIME (Default in assenza di momentum forte)
     elif _regime == "BEAR":
-        # Se siamo in Bear, permettiamo Short a meno che non ci sia un forte ipervenduto (FZ molto basso)
-        if fz > -0.5:
-            bias = "SHORT_ONLY"
-            reason = f"BEAR REGIME + FZ:{fz:+.1f}"
-        else:
-            bias = "NEUTRAL"
-            reason = f"BEAR but FZ extreme low ({fz:+.1f})"
+        bias = "SHORT_ONLY" if fz > -0.5 else "NEUTRAL"
+        reason = f"BEAR REGIME + FZ:{fz:+.1f}"
 
-    # C. REGIME BULL (Trend primario positivo)
     elif _regime == "BULL":
-        # SE IL MOMENTUM È NEGATIVO (anche poco), NON FORZARE LONG
-        if short_momentum < -0.0005: # -0.05%
-            bias = "NEUTRAL" # Sblocca la possibilità di segnali SELL tecnici
-            reason = f"BULL under pressure (Mom:{short_momentum:+.2%})"
-        else:
-            bias = "LONG_ONLY"
-            reason = f"BULL + FZ:{fz:+.1f}"
+        # Se il momentum orario accenna a scendere, meglio stare Neutrali
+        bias = "LONG_ONLY" if short_momentum_1h >= -0.0005 else "NEUTRAL"
+        reason = f"BULL REGIME + Mom:{short_momentum_1h:+.2%}"
 
-    # D. DEFAULT / RANGE
     else:
         bias = "NEUTRAL"
-        reason = f"RANGE/UNKNOWN (Mom:{short_momentum:+.2%})"
+        reason = f"STABLE/RANGE (F&G:{sentiment})"
 
     # Log e pubblicazione
     publish_bias(bias, reason)
-    log(f"[FLEET] Bias: {bias} | {reason}")
-    return bias
-def execute_kill_switch():
+    log(f"[FLEET V7] Bias: {bias} | {reason}")
+    return biasdef execute_kill_switch():
     """
     KILL SWITCH: chiude TUTTE le posizioni aperte su entrambi i bot.
     Chiamato quando il daily loss supera il 3%.
