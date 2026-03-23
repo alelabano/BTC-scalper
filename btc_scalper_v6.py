@@ -818,7 +818,7 @@ def get_btc_open_interest():
                 return float(c.get("openInterest", 0) or 0)
     except Exception as e:
         log_btc(f"[FLOW] OI fetch error: {e}")
-    return _oi_cache
+    return _btc_oi_cache
 
 
 def compute_orderbook_delta():
@@ -3249,6 +3249,10 @@ _all_mids_cache = {}
 _active_positions_cache = {}
 _scanner_candidates = []
 _alt_funding_data = {}  # {coin: {"rate": float, "history": [...], "oi": float, "oi_prev": float}}
+_funding_history = {}   # {coin: [rate1, rate2, ...]}
+_funding_cache = {}     # {coin: current_rate}
+_oi_cache = {}      # {coin: current_oi}
+_oi_prev_cache = {}     # {coin: previous_oi}
 _alt_trade_history = []
 _alt_daily_pnl = 0.0
 _alt_consec_losses = 0
@@ -3438,14 +3442,14 @@ def fetch_funding_and_oi(ctxs=None, meta_assets=None):
     except Exception as e:
         log_err(f"fetch_funding_and_oi: {e}")
 
-def get_oi_change(coin):
+def alt_get_oi_change(coin):
     curr = _oi_cache.get(coin, 0.0)
     prev = _oi_prev_cache.get(coin, 0.0)
     if prev == 0.0:
         return 0.0
     return (curr - prev) / (prev + 1e-10)
 
-def get_funding_z(coin):
+def alt_get_funding_z(coin):
     history = _funding_history.get(coin, [])
     if len(history) < 3:
         return 0.0
@@ -3455,10 +3459,10 @@ def get_funding_z(coin):
         return 0.0
     return float((history[-1] - arr.mean()) / std)
 
-def inject_funding(df, coin):
+def alt_inject_funding(df, coin):
     df = df.copy()
-    df['funding_z'] = get_funding_z(coin)
-    df['oi_change'] = get_oi_change(coin)
+    df['funding_z'] = alt_get_funding_z(coin)
+    df['oi_change'] = alt_get_oi_change(coin)
     return df
 
 
@@ -4589,7 +4593,7 @@ def run_processor():
             df_5m  = build_features(df_5m)
             if df_1h.empty or df_15m.empty or df_5m.empty:
                 continue
-            df_5m = inject_funding(df_5m, coin)
+            df_5m = alt_inject_funding(df_5m, coin)
 
             # ── ALIAS TF ──────────────────────────────────────────────
             # TREND  (1h):  direzione primaria, regime, EMA200, slope, MACD
@@ -6645,12 +6649,12 @@ def executor_thread_alt():
             if cb_active:
                 if cycle % 40 == 1:
                     log_exec(f"🛑 CIRCUIT BREAKER: {cb_reason}")
-                if not hasattr(executor_thread, '_cb_notified'):
-                    executor_thread._cb_notified = True
+                if not hasattr(executor_thread_alt, '_cb_notified'):
+                    executor_thread_alt._cb_notified = True
                     tg(f"🛑 <b>CIRCUIT BREAKER</b>: {cb_reason}")
             else:
-                if hasattr(executor_thread, '_cb_notified'):
-                    del executor_thread._cb_notified
+                if hasattr(executor_thread_alt, '_cb_notified'):
+                    del executor_thread_alt._cb_notified
                 slots_free = MAX_CONCURRENT_TRADES - n_active - len(pending_orders)
                 for _, coin, sig in candidates:
                     if slots_free <= 0:
