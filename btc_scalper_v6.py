@@ -3237,6 +3237,8 @@ def processor_thread(sz_dec, px_dec):
 # ================================================================
 
 # ALT global stores
+_state_lock = threading.Lock()
+_scanner_lock = threading.Lock()
 _signals_store = {}
 _candidates_store = {}
 _cooldown_store = {}
