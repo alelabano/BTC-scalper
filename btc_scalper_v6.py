@@ -1875,6 +1875,32 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     return None
 
 
+def momentum_trigger(df_15m, allow_long=True, allow_short=True):
+    """
+    Momentum puro — cattura move veloci che flow e tech non vedono.
+    Prezzo sale/scende >0.3% in ultime 2 candele 15m + volume sopra media.
+    Cattura short squeeze, liquidazioni, news spike.
+    """
+    if df_15m is None or len(df_15m) < 5:
+        return None
+
+    c_now = float(df_15m.iloc[-1]['close'])
+    c_2ago = float(df_15m.iloc[-3]['close'])
+    vol = float(df_15m.iloc[-1]['vol_rel'])
+
+    move_pct = (c_now - c_2ago) / c_2ago
+
+    if allow_long and move_pct > 0.003 and vol >= 0.8:
+        return {"direction": "LONG", "type": "MOMENTUM",
+                "details": f"move:+{move_pct:.2%}/30m vol:{vol:.1f}x"}
+
+    if allow_short and move_pct < -0.003 and vol >= 0.8:
+        return {"direction": "SHORT", "type": "MOMENTUM",
+                "details": f"move:{move_pct:.2%}/30m vol:{vol:.1f}x"}
+
+    return None
+
+
 def technical_trigger(r, r_prev, allow_long=True, allow_short=True):
     """
     Technical trigger — pullback con volume confirmation.
@@ -1973,46 +1999,58 @@ def check_signal():
     allow_short = True
 
     # ══════════════════════════════════════════════════════════
-    # DUAL TRIGGER: Flow (master) + Technical (fallback)
-    # Se flow triggera → usa flow (priorità)
-    # Se flow è neutro ma tech triggera → usa tech con size ridotta
-    # Se nessuno triggera → no trade
+    # TRIPLE TRIGGER: Flow (master) → Tech (fallback) → Momentum (catch-all)
     # ══════════════════════════════════════════════════════════
 
     flow_sig = flow_trigger(_flow_cache.get("data", {}), regime, allow_long, allow_short)
     tech_sig = technical_trigger(r, r2, allow_long, allow_short)
+    mom_sig = momentum_trigger(df_15m, allow_long, allow_short)
 
     if flow_sig:
         direction = flow_sig["direction"]
-        sig_type = flow_sig["sig_type"]  # FLOW_STRONG or FLOW_WEAK
+        sig_type = flow_sig["sig_type"]
         details = flow_sig["details"]
         if tech_sig and tech_sig["direction"] == direction:
             sig_type += "+TECH"
             details += f" +{tech_sig['type']}"
+        if mom_sig and mom_sig["direction"] == direction:
+            sig_type += "+MOM"
+            details += f" +{mom_sig['details']}"
     elif tech_sig:
         direction = tech_sig["direction"]
         sig_type = tech_sig["type"]
         details = tech_sig["details"]
+        if mom_sig and mom_sig["direction"] == direction:
+            sig_type += "+MOM"
+            details += f" +{mom_sig['details']}"
+    elif mom_sig:
+        direction = mom_sig["direction"]
+        sig_type = mom_sig["type"]
+        details = mom_sig["details"]
     else:
         return None
 
     # ══════════════════════════════════════════════════════════
     # SIZE SCALING per signal quality
-    # FLOW_STRONG+TECH = 1.0x (massima conviction)
-    # FLOW_STRONG      = 1.0x
-    # FLOW_WEAK+TECH   = 0.8x
-    # FLOW_WEAK        = 0.7x
-    # PULLBACK (tech)  = 0.5x (no flow)
+    # FLOW_STRONG+TECH+MOM = 1.0x (massima conviction)
+    # FLOW_STRONG          = 1.0x
+    # FLOW_WEAK+TECH       = 0.8x
+    # FLOW_WEAK            = 0.7x
+    # PULLBACK (tech)      = 0.5x
+    # MOMENTUM (solo)      = 0.5x (no flow)
     # ══════════════════════════════════════════════════════════
 
     size_mult = 1.0
 
     if "FLOW_STRONG" in sig_type:
         size_mult = 1.0
-    elif "FLOW_WEAK" in sig_type and "TECH" in sig_type:
+    elif "FLOW_WEAK" in sig_type and ("TECH" in sig_type or "MOM" in sig_type):
         size_mult = 0.8
     elif "FLOW_WEAK" in sig_type:
         size_mult = 0.7
+    elif "MOMENTUM" in sig_type:
+        size_mult = 0.5
+        details += " (momentum×0.5)"
     else:
         size_mult = 0.5  # tech-only
         details += " (tech-only×0.5)"
