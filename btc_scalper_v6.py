@@ -2113,8 +2113,45 @@ def check_signal():
 
     log_btc(f"[SIGNAL] {direction} {sig_type} | {details}")
 
+    # ══════════════════════════════════════════════════════════
+    # EXPECTATION: il regime crea l'aspettativa, la strategia SL/TP si adatta
+    #
+    # Prezzo scende da giorni (TREND down) → aspetto inversione LONG
+    #   → SHORT nel frattempo: TP stretto, SL veloce (prendi profitto rapido)
+    #   → LONG quando arriva: TP largo, trailing attivo (lascia correre)
+    #
+    # Prezzo sale da giorni (TREND up) → aspetto continuazione o inversione SHORT
+    #   → LONG nel frattempo: TP stretto (potrebbe invertire)
+    #   → SHORT se inverte: TP largo (il move ribassista è potente)
+    # ══════════════════════════════════════════════════════════
+
+    trend_dir = "UP" if ema9_1h > ema21_1h else "DOWN"
+    trade_aligns_with_trend = (
+        (trend_dir == "UP" and direction == "LONG") or
+        (trend_dir == "DOWN" and direction == "SHORT")
+    )
+
+    # Aspettativa = inversione del trend attuale
+    # Se il trade è CONTRO il trend → è il trade che segue il trend in corso
+    #   = TP stretto (il trend sta per finire)
+    # Se il trade è CON il trend atteso dell'inversione → TP largo
+    #   = ovvero: controtendenza = il trade che aspettavamo
+
+    if trade_aligns_with_trend:
+        # Segui il trend in corso — TP stretto, SL stretto, prendi profitto rapido
+        strategy = "FOLLOW"
+        tp_mult = 0.7    # TP 30% più stretto
+        sl_mult = 0.8    # SL 20% più stretto (esci veloce se gira)
+        details += f" [FOLLOW trend:{trend_dir}]"
+    else:
+        # Controtendenza = possibile inversione — TP largo, trailing, lascia correre
+        strategy = "REVERSAL"
+        tp_mult = 1.5    # TP 50% più largo
+        sl_mult = 1.0    # SL normale (dai spazio all'inversione)
+        scalp_mode = "TREND"  # forza trailing attivo
+        details += f" [REVERSAL vs trend:{trend_dir}]"
+
     # ── SL / TP — MODE ADAPTIVE ──
-    ai_confidence = 7  # default, no AI call overhead
     ai_sl_adj = 1.0
     update_funding_oi()
     oi_chg = get_oi_change()
@@ -2154,7 +2191,14 @@ def check_signal():
         tp_dist = sl_dist * TREND_TP_RR * tp_adj_redis / lev_scale
 
     # TP floor (non scalano con leva)
-    tp_dist = max(tp_dist, px * TP_PRICE_PCT * 0.8)  # floor 80% del TP target
+    tp_dist = max(tp_dist, px * TP_PRICE_PCT * 0.8)
+
+    # ── APPLY EXPECTATION STRATEGY ──
+    # FOLLOW: TP stretto, SL stretto (prendi profitto rapido)
+    # REVERSAL: TP largo, SL normale (lascia correre l'inversione)
+    sl_dist *= sl_mult
+    tp_dist *= tp_mult
+    log_btc(f"[{strategy}] SL×{sl_mult} TP×{tp_mult} → SL:{sl_dist/px*100:.2f}% TP:{tp_dist/px*100:.2f}%")
 
     # Swing SL override (se migliore dell'ATR)
     if direction == "LONG":
