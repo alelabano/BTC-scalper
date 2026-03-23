@@ -1967,6 +1967,61 @@ def check_signal():
                     direction = "SHORT"; sig_type = "REVERSAL"
                     details = f"RSI1h:{rsi1h:.0f} RSI5:{rsi5:.0f} MACD turning"
 
+    # ══════════════════════════════════════════════════════════
+    # ORDER FLOW TRIGGER — segnale indipendente dai tecnici
+    # ══════════════════════════════════════════════════════════
+    # Se nessun segnale tecnico ma l'order flow è forte e direzionale,
+    # genera un trade "FLOW" con condizioni minime di conferma.
+    #
+    # Condizioni:
+    #   - CVD trend forte (BUY/SELL) con slope significativo
+    #   - OB imbalance nella stessa direzione (>62% o <38%)
+    #   - Conferma OI (CONVICTION o BUILDING, non UNWIND)
+    #   - RSI non in zona estrema opposta (non comprare a RSI>75)
+    #   - Volume almeno 0.5x media (mercato non morto)
+    #
+    # Il flow trigger ha SL più stretto (ATR×0.7) e size ridotta (×0.7)
+    # perché non ha conferma tecnica classica.
+    # ══════════════════════════════════════════════════════════
+
+    if direction is None:
+        flow_sig = get_flow_signal()
+        flow_bias = flow_sig.get("bias", "NEUTRAL")
+        flow_conf = flow_sig.get("confidence", 0)
+
+        if flow_conf >= 4 and flow_bias != "NEUTRAL":
+            flow_data = _flow_cache.get("data", {})
+            cvd = flow_data.get("cvd_trend", {})
+            ob = flow_data.get("ob_delta", {})
+            oi_m = flow_data.get("oi_momentum", {})
+
+            cvd_signal = cvd.get("signal", "NEUTRAL")
+            ob_side = ob.get("aggressive_side", "NEUTRAL")
+            oi_signal = oi_m.get("signal", "NEUTRAL")
+            ob_imb = ob.get("imbalance_ratio", 0.5)
+
+            # FLOW LONG: CVD buy + OB buy pressure + OI non in unwind + RSI non overbought
+            if (flow_bias == "BUY" and allow_long and
+                cvd_signal == "BUY" and ob_imb > 0.58 and
+                oi_signal != "UNWIND" and
+                rsi5 < 70 and vol5 >= 0.5):
+                direction = "LONG"
+                sig_type = "FLOW"
+                details = (f"CVD:{cvd.get('cvd',0):.1f} OB_imb:{ob_imb:.0%} "
+                          f"OI:{oi_signal} RSI:{rsi5:.0f} conf:{flow_conf}")
+                log_btc(f"⚡ FLOW TRIGGER LONG — {details}")
+
+            # FLOW SHORT: CVD sell + OB sell pressure + OI non in unwind + RSI non oversold
+            elif (flow_bias == "SELL" and allow_short and
+                  cvd_signal == "SELL" and ob_imb < 0.42 and
+                  oi_signal != "UNWIND" and
+                  rsi5 > 30 and vol5 >= 0.5):
+                direction = "SHORT"
+                sig_type = "FLOW"
+                details = (f"CVD:{cvd.get('cvd',0):.1f} OB_imb:{ob_imb:.0%} "
+                          f"OI:{oi_signal} RSI:{rsi5:.0f} conf:{flow_conf}")
+                log_btc(f"⚡ FLOW TRIGGER SHORT — {details}")
+
     if direction is None:
         return None
 
@@ -2095,6 +2150,19 @@ def check_signal():
     # Confidence sizing: AI confidence 1-10 → size multiplier 0.5-1.0
     size_mult = 0.5 + (ai_confidence - 1) * 0.055  # 1→0.5, 5→0.72, 10→1.0
     size_mult = max(0.5, min(1.0, size_mult))
+
+    # ── FLOW TRIGGER ADJUSTMENTS ──
+    # Flow signals have no technical confirmation → tighter risk management
+    if sig_type == "FLOW":
+        sl_dist *= 0.7           # SL 30% più stretto
+        tp_dist = sl_dist * 1.5  # R:R minimo 1:1.5
+        size_mult *= 0.7         # size ridotta (no conferma tecnica)
+        # Ricalcola SL/TP
+        if direction == "LONG":
+            sl = px - sl_dist; tp = px + tp_dist
+        else:
+            sl = px + sl_dist; tp = px - tp_dist
+        log_btc(f"[FLOW] SL stretto ×0.7, size ×0.7, R:R 1:1.5")
 
     # ── LIQUIDITY CHECK + SETUP SCORE ──
     liq = fetch_liquidity()
