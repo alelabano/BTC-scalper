@@ -3177,6 +3177,7 @@ def processor_thread(sz_dec, px_dec):
                 continue
 
             # ── DETECT ──
+            sig_ts = time.time()
             sig = check_signal()
             if sig is None:
                 log_btc(f"no signal | {_btc_regime} | BTC ${mid:,.0f}")
@@ -3184,6 +3185,11 @@ def processor_thread(sz_dec, px_dec):
                 continue
 
             direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode, ml_features = sig
+
+            # Blocca entry vecchie — se check_signal ha impiegato >5s il prezzo è stale
+            if time.time() - sig_ts > 5:
+                log_btc(f"⚠️ Signal stale ({time.time()-sig_ts:.1f}s) — skip")
+                continue
 
             if not is_funding_ok(direction):
                 time.sleep(BTC_SCAN_INTERVAL)
