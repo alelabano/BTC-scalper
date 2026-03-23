@@ -2946,14 +2946,11 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     global _btc_last_trade_ts
     is_buy = direction == "LONG"
 
-    # Size basato su risk: BTC_RISK_USD / sl_dist_pct / lev_effective
-    # Se SL = 0.3% e risk = $5, size = $5 / 0.003 = $1666 notional
-    # Con leva 20x, margine = $83
+    # ── SIZE ──
     sl_pct = sl_dist / entry_px
     notional = (BTC_RISK_USD * size_mult) / sl_pct
-    # Cap al balance × leverage
     bal = get_balance()
-    max_notional = bal * BTC_LEVERAGE * 0.9  # 90% del max
+    max_notional = bal * BTC_LEVERAGE * 0.9
     notional = min(notional, max_notional)
     size = rpx(notional / entry_px, sz_dec)
 
@@ -2961,145 +2958,75 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         log_btc(f"Size zero: notional=${notional:.0f} px={entry_px}")
         return False
 
-    # ── MARGIN CHECK: verifica prima di inviare ──
     if not check_margin(size, entry_px):
         return False
 
-    # Set leverage
-    # Set leverage (clamped to max allowed)
+    # ── LEVERAGE ──
     effective_lev = min(BTC_LEVERAGE, get_max_leverage())
     try: call(_exchange.update_leverage, effective_lev, BTC_COIN, timeout=10)
     except: pass
-    time.sleep(0.3)
 
-    # Verify leverage
-    pos_check = get_position()
-    if pos_check is None:
-        # No existing position, leverage should be set
-        pass
+    # ── PRICE: market price + piccolo slippage ──
+    order_px = get_mid()
+    if order_px <= 0:
+        return False
 
-    # Calcola decimali effettivi — garantisce SL ≠ entry ≠ TP dopo round
-    eff_dec = effective_price_dec(entry, sl, tp, px_dec)
-
-    sl_px = rpx(sl, eff_dec)
-    tp_px = rpx(tp, eff_dec)
-    entry_rounded = rpx(entry, eff_dec)
-
-    # Verifica finale: SL e TP devono essere distinti da entry
-    if (is_buy and (sl_px >= entry_rounded or tp_px <= entry_rounded)) or \
-       (not is_buy and (sl_px <= entry_rounded or tp_px >= entry_rounded)):
-        eff_dec = min(eff_dec + 2, 8)
-        sl_px = rpx(sl, eff_dec)
-        tp_px = rpx(tp, eff_dec)
-        log_btc(f"⚠️ px_dec alzato a {eff_dec} per distinguere SL/TP")
-
-    tp_rr_display = tp_dist / sl_dist if sl_dist > 0 else 0
-    log_btc(f"{'🟢' if is_buy else '🔴'} ORDER {BTC_COIN} {direction} [{scalp_mode}] @ {entry} size:{size} "
-        f"SL:{sl_px}({sl_dist/entry*100:.2f}%) TP:{tp_px}({tp_dist/entry*100:.2f}%) R:R=1:{tp_rr_display:.1f} "
-        f"risk:${BTC_RISK_USD*size_mult:.1f} notional:${notional:.0f}")
-
-    # ══════════════════════════════════════════════════════════════
-    # EXECUTION — mode-adaptive
-    # FLASH: IoC diretto (velocità, no GTC)
-    # RANGE/TREND: GTC Maker → IoC fallback
-    # ══════════════════════════════════════════════════════════════
-
-    filled = False
-
-    # ── STEP 1: GTC MAKER (skip in FLASH mode) ──
-    if scalp_mode == "FLASH":
-        log_btc(f"⚡ FLASH mode — skip GTC, direct IoC")
+    if is_buy:
+        order_px *= 1.0003  # paga 0.03% sopra mid per fill immediato
     else:
-        try:
-            fresh_mid = get_mid()
-            if fresh_mid <= 0: return False
+        order_px *= 0.9997  # vendi 0.03% sotto mid
 
-            drift = (fresh_mid - entry_px) / entry_px
-            if (is_buy and drift > DRIFT_MAX_FAVORABLE) or (not is_buy and drift < -DRIFT_MAX_FAVORABLE):
-                log_btc(f"Drift {drift:+.3%} — too late"); return False
-            if (is_buy and drift < -DRIFT_MAX_ADVERSE) or (not is_buy and drift > DRIFT_MAX_ADVERSE):
-                log_btc(f"Drift {drift:+.3%} — invalidated"); return False
+    order_px = rpx(order_px, px_dec)
 
-            if abs(drift) > 0.001:
-                if is_buy:
-                    sl_px = rpx(fresh_mid - sl_dist, eff_dec)
-                    tp_px = rpx(fresh_mid + tp_dist, eff_dec)
-                else:
-                    sl_px = rpx(fresh_mid + sl_dist, eff_dec)
-                    tp_px = rpx(fresh_mid - tp_dist, eff_dec)
+    # SL/TP basati su actual market price (non entry_px stale)
+    mid_now = get_mid()
+    if mid_now <= 0:
+        mid_now = order_px
+    if is_buy:
+        sl_px = rpx(mid_now - sl_dist, px_dec)
+        tp_px = rpx(mid_now + abs(tp - entry_px), px_dec)
+    else:
+        sl_px = rpx(mid_now + sl_dist, px_dec)
+        tp_px = rpx(mid_now - abs(tp - entry_px), px_dec)
 
-            gtc_px = rpx(fresh_mid * (1 + SLIPPAGE) if is_buy else fresh_mid * (1 - SLIPPAGE), eff_dec)
-            res = call(_exchange.order, BTC_COIN, is_buy, size, gtc_px,
-                       {"limit": {"tif": "Gtc"}}, False, timeout=15)
-            log_btc(f"GTC Maker @ {gtc_px}: {res}")
+    tp_dist = abs(tp - entry_px)
+    log_btc(f"{'🟢' if is_buy else '🔴'} ORDER {direction} [{scalp_mode}] @ {order_px} "
+            f"size:{size} SL:{sl_px} TP:{tp_px} risk:${BTC_RISK_USD*size_mult:.1f}")
 
-            oid_gtc = None
-            if res and res.get("status") == "ok":
-                for s in res.get("response",{}).get("data",{}).get("statuses",[]):
-                    if "filled" in s:
-                        filled = True
-                        log_btc(f"✅ GTC instant fill (maker)")
-                        break
-                    if "resting" in s:
-                        oid_gtc = s["resting"]["oid"]
+    # ══════════════════════════════════════════════════════════
+    # EXECUTION: aggressive limit IoC — no polling, no GTC
+    # ══════════════════════════════════════════════════════════
+    filled = False
+    try:
+        res = call(_exchange.order, BTC_COIN, is_buy, size, order_px,
+                   {"limit": {"tif": "Ioc"}}, False, timeout=15)
 
-                if not filled and oid_gtc:
-                    for tick in range(GTC_TIMEOUT * 2):
-                        time.sleep(0.5)
-                        p = get_position()
-                        if p and p.get("szi", 0) != 0:
-                            filled = True
-                            log_btc(f"✅ GTC filled in {(tick+1)*0.5:.1f}s (maker)")
-                            break
-                    if not filled:
-                        try: call(_exchange.cancel, BTC_COIN, oid_gtc, timeout=10)
-                        except: pass
-                        log_btc(f"GTC not filled in {GTC_TIMEOUT}s")
-        except Exception as e:
-            log_btc(f"GTC error: {e}")
-
-    # ── STEP 2: IoC TAKER (fallback) ──
-    if not filled:
-        try:
-            fresh_mid = get_mid()
-            if fresh_mid <= 0: return False
-
-            drift2 = (fresh_mid - entry_px) / entry_px
-            if abs(drift2) > DRIFT_MAX_FAVORABLE * 1.5:
-                log_btc(f"Post-GTC drift {drift2:+.3%} — abort"); return False
-
-            # Slippage dinamico: base SLIPPAGE × 2, scalato con volatilità
-            atr_pct = sl_dist / fresh_mid
-            dyn_slip = max(SLIPPAGE * 2, min(atr_pct * 0.5, 0.005))
-
-            ioc_px = rpx(fresh_mid * (1 + dyn_slip) if is_buy else fresh_mid * (1 - dyn_slip), px_dec)
-            res = call(_exchange.order, BTC_COIN, is_buy, size, ioc_px,
-                       {"limit": {"tif": "Ioc"}}, False, timeout=15)
-            log_btc(f"IoC Taker @ {ioc_px} (slip:{dyn_slip:.2%}): {res}")
-
-            if res and res.get("status") == "ok":
-                for s in res.get("response",{}).get("data",{}).get("statuses",[]):
-                    if "filled" in s:
-                        filled = True
-                        avg = float(s["filled"].get("avgPx", 0))
-                        real_slip = abs(avg - fresh_mid) / fresh_mid if avg > 0 else 0
-                        log_btc(f"✅ IoC filled @ {avg} (slip:{real_slip:.3%})")
-                        break
-        except Exception as e:
-            log_btc(f"IoC error: {e}")
+        if res and res.get("status") == "ok":
+            for s in res.get("response", {}).get("data", {}).get("statuses", []):
+                if "filled" in s:
+                    filled = True
+                    avg = float(s["filled"].get("avgPx", 0))
+                    real_slip = abs(avg - mid_now) / mid_now if avg > 0 else 0
+                    log_btc(f"✅ FILLED @ {avg} (slip:{real_slip:.3%})")
+                    break
+    except Exception as e:
+        log_btc(f"Order error: {e}")
 
     if not filled:
-        log_btc(f"GTC + IoC failed — no fill"); return False
+        log_btc(f"❌ IoC not filled — no trade")
+        return False
 
     # ── Conferma posizione ──
+    time.sleep(0.3)
     pos = get_position()
     if not pos:
-        for _ in range(6):
-            time.sleep(1)
+        for _ in range(4):
+            time.sleep(0.5)
             pos = get_position()
             if pos: break
     if not pos:
-        log_btc(f"Filled but position not found"); return False
+        log_btc(f"Filled but position not found")
+        return False
 
     actual_size = rpx(abs(pos["szi"]), sz_dec)
     actual_entry = pos["entry"]
@@ -3119,12 +3046,12 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
             tp_px = rpx(actual_entry - new_sl_dist * TP_RR, px_dec)
         log_btc(f"⚠️ Lev {actual_lev}x → SL/TP ricalcolati")
 
-    # Place SL + TP
+    # ── Place SL + TP ──
     try:
         call(_exchange.order, BTC_COIN, not is_buy, actual_size, sl_px,
              {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
              True, timeout=15)
-        time.sleep(0.3)
+        time.sleep(0.2)
         call(_exchange.order, BTC_COIN, not is_buy, actual_size, tp_px,
              {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
              True, timeout=15)
@@ -3134,13 +3061,12 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         return False
 
     _btc_last_trade_ts = time.time()
-    filled_px = actual_entry or entry
-    sl_pct_real = abs(filled_px - sl_px) / filled_px * 100
-    tp_pct_real = abs(tp_px - filled_px) / filled_px * 100
+    sl_pct_real = abs(actual_entry - sl_px) / actual_entry * 100
+    tp_pct_real = abs(tp_px - actual_entry) / actual_entry * 100
 
-    log_btc(f"✅ FILLED @ {filled_px} size:{actual_size} lev:{actual_lev}x "
-        f"SL:{sl_px}({sl_pct_real:.2f}%) TP:{tp_px}({tp_pct_real:.2f}%)")
-    tg(f"{'🟢' if is_buy else '🔴'} <b>BTC</b> {direction} @ {filled_px}\n"
+    log_btc(f"✅ FILLED @ {actual_entry} size:{actual_size} lev:{actual_lev}x "
+            f"SL:{sl_px}({sl_pct_real:.2f}%) TP:{tp_px}({tp_pct_real:.2f}%)")
+    tg(f"{'🟢' if is_buy else '🔴'} <b>BTC</b> {direction} @ {actual_entry}\n"
        f"SL:{sl_px} ({sl_pct_real:.1f}%) | TP:{tp_px} ({tp_pct_real:.1f}%)\n"
        f"Size:{actual_size} | Lev:{actual_lev}x | Risk:${BTC_RISK_USD*size_mult:.1f}")
     return True
