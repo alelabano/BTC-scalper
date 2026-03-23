@@ -1566,7 +1566,7 @@ _btc_regime_ts = 0
 
 def update_regime():
     global _btc_regime, _btc_regime_ts
-    if time.time() - _btc_regime_ts < REGIME_INTERVAL:
+    if time.time() - _btc_regime_ts < BTC_REGIME_INTERVAL:
         return _btc_regime
 
     df = fetch_df("4h", 90)
@@ -3239,6 +3239,9 @@ def processor_thread(sz_dec, px_dec):
 # ALT global stores
 _state_lock = threading.Lock()
 _scanner_lock = threading.Lock()
+_alt_scanner_ready = threading.Event()
+COIN_BLACKLIST = set()  # coins to never trade
+pending_orders = {}  # {coin: {oid, placed_at, signal, ...}}
 _signals_store = {}
 _candidates_store = {}
 _cooldown_store = {}
@@ -6319,7 +6322,7 @@ def run_scanner():
         meme_tag = f" 🐸-{c['meme_pen']:.0f}" if c['meme_pen'] > 0 else ""
         log("SCAN", f"  {c['coin']:<8} score:{c['composite']:>5.1f} | struct:{c['structure']:.2f} {c['direction']:>4} | FZ:{c['funding_z']:+.2f} | BTC:{c['btc_align']:.2f}{meme_tag}")
     log("SCAN", f"=== FINE | {len(candidates)} candidati → top {len(top)} per Processor | {elapsed:.1f}s ===")
-    _scanner_ready.set()
+    _alt_scanner_ready.set()
 
 
 def scanner_thread_combined():
@@ -6338,7 +6341,7 @@ def scanner_thread_combined():
 def processor_thread_combined():
     log_alt("Thread avviato — attendo primo ciclo Scanner...")
     # Aspetta che lo Scanner abbia completato almeno un ciclo
-    _scanner_ready.wait()
+    _alt_scanner_ready.wait()
     log_alt("Scanner pronto — avvio cicli Processor")
 
     while True:
