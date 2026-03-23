@@ -1881,40 +1881,24 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     return None
 
 
-def technical_trigger(r, r_prev, h, allow_long, allow_short, regime, scalp_mode):
+def technical_trigger(r, r_prev, allow_long=True, allow_short=True):
     """
-    Technical trigger — genera segnali da pattern classici.
-    Returns: {"direction": "LONG"|"SHORT", "type": str, "details": str} o None
+    Technical trigger — pullback puro.
+    RSI in zona estrema + MACD che gira = entry.
     """
     rsi = float(r['rsi'])
     macd = float(r['macd_hist'])
     macd_prev = float(r_prev['macd_hist'])
-    slope = float(r['ema_slope'])
-    vol = float(r['vol_rel'])
-    bb = float(r['bb_pos'])
-    hh = float(r.get('hh', 0))
-    ll = float(r.get('ll', 0))
 
-    ema9 = float(h['ema9'])
-    ema21 = float(h['ema21'])
+    # Pullback BUY: RSI oversold + MACD turning up
+    if allow_long and rsi < 40 and macd > macd_prev:
+        return {"direction": "LONG", "type": "PULLBACK",
+                "details": f"RSI:{rsi:.0f} MACD↑"}
 
-    # PULLBACK LONG: RSI pullback + MACD accelera + slope up
-    if allow_long and (ema9 > ema21 or scalp_mode == "RANGE"):
-        if 35 <= rsi <= 62 and macd > macd_prev and slope > 0 and vol >= 0.3:
-            return {"direction": "LONG", "type": "PULLBACK",
-                    "details": f"RSI:{rsi:.0f} MACD↑ slope:{slope:.4f}"}
-        if rsi > 50 and rsi < 80 and macd > 0 and hh > 0 and vol >= 0.8:
-            return {"direction": "LONG", "type": "BREAKOUT",
-                    "details": f"RSI:{rsi:.0f} HH vol:{vol:.1f}x"}
-
-    # PULLBACK SHORT: RSI rally + MACD decelera + slope down
-    if allow_short and (ema9 < ema21 or scalp_mode == "RANGE"):
-        if 38 <= rsi <= 65 and macd < macd_prev and slope < 0 and vol >= 0.3:
-            return {"direction": "SHORT", "type": "PULLBACK",
-                    "details": f"RSI:{rsi:.0f} MACD↓ slope:{slope:.4f}"}
-        if rsi < 50 and rsi > 20 and macd < 0 and ll > 0 and vol >= 0.8:
-            return {"direction": "SHORT", "type": "BREAKDOWN",
-                    "details": f"RSI:{rsi:.0f} LL vol:{vol:.1f}x"}
+    # Pullback SELL: RSI overbought + MACD turning down
+    if allow_short and rsi > 60 and macd < macd_prev:
+        return {"direction": "SHORT", "type": "PULLBACK",
+                "details": f"RSI:{rsi:.0f} MACD↓"}
 
     return None
 
@@ -2005,7 +1989,7 @@ def check_signal():
     # ══════════════════════════════════════════════════════════
 
     flow_sig = flow_trigger(_flow_cache.get("data", {}), regime, allow_long, allow_short)
-    tech_sig = technical_trigger(r, r2, h, allow_long, allow_short, regime, scalp_mode)
+    tech_sig = technical_trigger(r, r2, allow_long, allow_short)
 
     if flow_sig:
         direction = flow_sig["direction"]
