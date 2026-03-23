@@ -91,9 +91,9 @@ LOOKBACK_DAYS_TREND = 60; LOOKBACK_DAYS_SETUP = 14; LOOKBACK_DAYS_ENTRY = 5
 MIN_CANDLES_TREND = 200; MIN_CANDLES_SETUP = 200; MIN_CANDLES_ENTRY = 200
 MIN_VOLUME_24H_USD = 1_000_000; MIN_VOLUME_TREND_MULT = 1.8
 FORWARD_WINDOW = 36
-MIN_PRECISION = 0.45; MIN_PRECISION_FLOOR = 0.38
-MIN_PROFIT_FACTOR = 1.2; MIN_PROFIT_FACTOR_FLOOR = 0.9
-MIN_BACKTEST_TRADES = 50; VOLATILITY_MIN = 0.0015
+MIN_PRECISION = 0.35; MIN_PRECISION_FLOOR = 0.28
+MIN_PROFIT_FACTOR = 0.9; MIN_PROFIT_FACTOR_FLOOR = 0.6
+MIN_BACKTEST_TRADES = 20; VOLATILITY_MIN = 0.0015
 DEFAULT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL_USD", "1000"))
 API_TIMEOUT_SEC = 30; PROCESSOR_INTERVAL = 5 * 60
 ALT_FUNDING_HISTORY_LEN = 42
@@ -107,7 +107,7 @@ ALT_SIGNAL_MAX_AGE = 2 * 60
 META_REFRESH_CYCLES = 20
 ENTRY_POLL_ATTEMPTS = 8; ENTRY_POLL_INTERVAL = 2
 COIN_COOLDOWN_MR = 3600; COIN_COOLDOWN_TREND = 14400; COIN_COOLDOWN = 3600
-SETUP_SCORE_MIN = 75
+SETUP_SCORE_MIN = 50
 TRAILING_STOP_INTERVAL = 5 * 60
 SCANNER_INTERVAL = 20 * 60; SCANNER_MAX_UNIVERSE = 229
 PROCESSOR_MAX_COINS = 30
@@ -5002,7 +5002,7 @@ def run_processor():
                 # L'edge storico è buono, ma il regime attuale lo supporta?
                 # Se gli ultimi 50 trade hanno PF < 0.8 → mercato cambiato, skip
                 pf_recent = bt["profit_factor_recent"]
-                if bt["n_trades_recent"] >= 10 and pf_recent < 0.8:
+                if bt["n_trades_recent"] >= 10 and pf_recent < 0.5:
                     log_alt(f"[{coin}] ❌ Regime sfavorevole: PF recente {pf_recent:.2f} < 0.8 (edge storico ok: {pf_full:.2f})")
                     clear_candidate(coin)
                     continue
