@@ -2156,7 +2156,7 @@ def check_signal():
     _last_ml_features = ml_features
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
-            size_mult, regime, setup, scalp_mode, ml_features)
+            size_mult, regime, 50, scalp_mode, ml_features)
 
 # ================================================================
 # EXECUTION
