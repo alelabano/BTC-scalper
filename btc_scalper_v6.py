@@ -3339,24 +3339,50 @@ def scanner_thread():
 # BTC THREAD B — PROCESSOR (check signal ogni 10s)
 # ================================================================
 def processor_thread(sz_dec, px_dec):
+    """
+    BTC Processor V7.3 — DETECT + EXECUTE in un unico ciclo.
+    
+    Quando trova un segnale, lo esegue IMMEDIATAMENTE (no publish → wait → read).
+    Latenza: check_signal (~8s) → execute (~3s) = ~11s totale (era ~40s).
+    
+    Il position management (trailing, partial, AI) resta nel btc_executor_loop.
+    """
+    global _btc_current_signal, _btc_last_trade_ts, _btc_is_trading
+
     log_btc("Processor avviato — attendo Scanner...")
     _btc_scanner_ready.wait()
-    log_btc("Scanner pronto — avvio")
+    log_btc("Scanner pronto — avvio (detect+execute mode)")
 
     while True:
         try:
             pos = get_position()
             mid = get_mid()
 
+            # Se in posizione → il btc_executor_loop gestisce trailing/partial
             if pos is not None:
-                entry = pos["entry"]
-                szi = pos["szi"]
-                d = "LONG" if szi > 0 else "SHORT"
-                pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
-                log_btc(f"In {d} @ {entry:.0f} PnL:{pnl_pct:+.2f}% | BTC ${mid:,.0f}")
                 time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
+            # Kill switch / circuit breaker check
+            ks, ks_reason = fleet_check_kill_switch()
+            if ks:
+                time.sleep(BTC_SCAN_INTERVAL)
+                continue
+
+            cb, cb_reason = check_circuit_breaker()
+            if cb:
+                time.sleep(BTC_SCAN_INTERVAL)
+                continue
+
+            if time.time() - _btc_last_trade_ts < BTC_COOLDOWN_SEC:
+                time.sleep(BTC_SCAN_INTERVAL)
+                continue
+
+            if _btc_is_trading:
+                time.sleep(BTC_SCAN_INTERVAL)
+                continue
+
+            # ── DETECT ──
             sig = check_signal()
             if sig is None:
                 log_btc(f"no signal | {_btc_regime} | BTC ${mid:,.0f}")
@@ -3364,26 +3390,39 @@ def processor_thread(sz_dec, px_dec):
                 continue
 
             direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode, ml_features = sig
-            sl_pct = sl_dist / entry_px * 100
-            tp_dist = abs(tp - entry_px)
-            tp_pct = tp_dist / entry_px * 100
-            rr = tp_dist / sl_dist if sl_dist > 0 else 0
-            log_btc(f"📡 {direction} {sig_type} [{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f}")
 
             if not is_funding_ok(direction):
                 time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
-            global _btc_current_signal
-            _btc_current_signal = {
-                "direction": direction, "sig_type": sig_type,
-                "sl": sl, "tp": tp, "entry_px": entry_px,
-                "sl_dist": sl_dist, "size_mult": size_mult,
-                "regime": sig_regime, "setup": setup,
-                "scalp_mode": scalp_mode, "ts": time.time(),
-                "ml_features": ml_features
-            }
-            log_btc(f"→ [{direction}] [{sig_type}] [{scalp_mode}] published")
+            # ── EXECUTE IMMEDIATELY — zero delay ──
+            log_btc(f"⚡ DETECT+EXEC {direction} {sig_type} [{scalp_mode}] @ {entry_px:,.0f}")
+
+            success = btc_open_trade(direction, sl, tp, entry_px,
+                                     sl_dist, sz_dec, px_dec, size_mult, scalp_mode)
+            if success:
+                p = get_position()
+                if p:
+                    # Pubblica pos_state per il btc_executor_loop (position manager)
+                    pos_state = p.copy()
+                    pos_state.update({
+                        "type": sig_type, "sl_dist": sl_dist,
+                        "sl_original": sl, "tp_original": tp,
+                        "regime": sig_regime, "scalp_mode": scalp_mode,
+                        "setup_score": setup, "ai_confidence": 7,
+                        "last_mgmt": 0, "partial_done": False,
+                        "trailing_active": False, "trailing_moves": 0,
+                        "current_ts": 0, "atr": 0, "open_ts": time.time(),
+                        "close_reason": "", "ml_features": ml_features
+                    })
+                    save_pos_state(pos_state)
+                    # Signal per l'executor loop (position management)
+                    _btc_current_signal = {"filled": True, "pos_state": pos_state}
+                    sl_pct = sl_dist / entry_px * 100
+                    log_btc(f"✅ FILLED SL:{sl:,.0f}({sl_pct:.2f}%) TP:{tp:,.0f}")
+            else:
+                _btc_last_trade_ts = time.time()
+                log_btc(f"❌ Trade fallito — cooldown {BTC_COOLDOWN_SEC}s")
 
         except Exception as e:
             log_btc(f"Processor error: {e}")
@@ -7133,51 +7172,13 @@ def btc_executor_loop(sz_dec, px_dec):
             # Fleet: nessuna posizione BTC
             fleet_set_btc_position(None)
 
-            # Kill switch
-            ks, ks_reason = fleet_check_kill_switch()
-            if ks:
-                if cycle % 6 == 1: log_btc(f"🚨 KILL SWITCH: {ks_reason}")
-                time.sleep(BTC_SCAN_INTERVAL); continue
-
-            # Circuit breaker
-            cb, cb_reason = check_circuit_breaker()
-            if cb:
-                if cycle % 6 == 1: log_btc(f"🛑 {cb_reason}")
-                time.sleep(BTC_SCAN_INTERVAL); continue
-
-            if time.time() - _btc_last_trade_ts < BTC_COOLDOWN_SEC:
-                time.sleep(BTC_SCAN_INTERVAL); continue
-
-            if _btc_is_trading:
-                time.sleep(BTC_SCAN_INTERVAL); continue
-
-            # Check for new signal
+            # Check if processor just filled a trade
             sig = _btc_current_signal
-            if sig and time.time() - sig.get("ts", 0) < 120:
+            if sig and sig.get("filled"):
                 _btc_current_signal = None
-
-                direction = sig["direction"]; sm = sig['scalp_mode']
-                log_btc(f"🎯 {direction} {sig['sig_type']} [{sm}] @ {sig['entry_px']:,.0f}")
-
-                success = btc_open_trade(direction, sig["sl"], sig["tp"], sig["entry_px"],
-                                     sig["sl_dist"], sz_dec, px_dec, sig["size_mult"], sig["scalp_mode"])
-                if success:
-                    p = get_position()
-                    if p:
-                        last_pos_state = p
-                        last_pos_state.update({
-                            "type": sig["sig_type"], "sl_dist": sig["sl_dist"],
-                            "sl_original": sig["sl"], "tp_original": sig["tp"],
-                            "regime": sig["regime"], "scalp_mode": sig["scalp_mode"],
-                            "setup_score": sig["setup"], "ai_confidence": 7,
-                            "last_mgmt": 0, "partial_done": False,
-                            "trailing_active": False, "trailing_moves": 0,
-                            "current_ts": 0, "atr": 0, "open_ts": time.time(),
-                            "close_reason": "", "ml_features": sig.get("ml_features", [])
-                        })
-                        save_pos_state(last_pos_state)
-                else:
-                    _btc_last_trade_ts = time.time()
+                last_pos_state = sig.get("pos_state")
+                if last_pos_state:
+                    log_btc(f"📥 Trade received from processor — managing position")
 
             # Status
             daily_pnl = sum(t["pnl"] for t in _btc_trades_today if time.time()-t.get("ts_close",t.get("ts",0))<86400)
