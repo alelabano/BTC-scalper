@@ -1811,6 +1811,43 @@ def is_signal_allowed(sig_type, direction):
     if pf >= 0.6 or pf_recent >= 0.6:
         return True
     return True  # nel dubbio, permetti — il mercato cambia
+def flow_trigger(flow_data, allow_long=True, allow_short=True):
+    """
+    Unico trigger di trade. Entry SOLO su accelerazione reale.
+    Returns: {"direction": "LONG"|"SHORT", "details": str} o None
+    """
+    cvd_data = flow_data.get("cvd_trend", {})
+    ob_data = flow_data.get("ob_delta", {})
+    oi_data = flow_data.get("oi_momentum", {})
+
+    cvd = cvd_data.get("cvd", 0)
+    cvd_slope = cvd_data.get("cvd_slope", 0)
+    ob = ob_data.get("imbalance_ratio", 0.5)
+    oi = oi_data.get("oi_change_pct", 0)
+
+    cvd_prev = cvd - cvd_slope if cvd_slope != 0 else cvd * 0.8
+
+    # BUY: CVD positivo + accelera >20% + OI cresce + OB bid-heavy
+    if (allow_long and
+        cvd > 0 and oi > 0 and ob > 0.55 and
+        abs(cvd_prev) > 0.1 and cvd > cvd_prev * 1.2):
+        accel = cvd / max(abs(cvd_prev), 0.01) * 100 - 100
+        details = f"CVD:{cvd:.1f}(+{accel:.0f}%) OI:+{oi:.1f}% OB:{ob:.0%}"
+        log_btc(f"⚡ FLOW BUY — {details}")
+        return {"direction": "LONG", "details": details}
+
+    # SELL: CVD negativo + accelera >20% + OI cresce + OB ask-heavy
+    if (allow_short and
+        cvd < 0 and oi > 0 and ob < 0.45 and
+        abs(cvd_prev) > 0.1 and abs(cvd) > abs(cvd_prev) * 1.2):
+        accel = abs(cvd) / max(abs(cvd_prev), 0.01) * 100 - 100
+        details = f"CVD:{cvd:.1f}(+{accel:.0f}%) OI:+{oi:.1f}% OB:{ob:.0%}"
+        log_btc(f"⚡ FLOW SELL — {details}")
+        return {"direction": "SHORT", "details": details}
+
+    return None
+
+
 def check_signal():
     """
     Returns: (direction, signal_type, sl, tp, entry_px, atr, details) or None
@@ -1876,115 +1913,17 @@ def check_signal():
     sig_type = None
     details = ""
 
-    # In RANGE mode (ADX < 20): entrambe le direzioni permesse
-    # In TREND/FLASH mode: rispetta il regime (BULL→LONG, BEAR→SHORT)
     allow_long = (regime in ("BULL", "RANGE") or scalp_mode == "RANGE")
     allow_short = (regime in ("BEAR", "RANGE") or scalp_mode == "RANGE")
 
-    # ── LONG SIGNALS ──
-    if allow_long:
-        long_setup = (scalp_mode == "RANGE") or (ema9_1h > ema21_1h)
-        if long_setup:
-            pullback = (35 <= rsi5 <= 62 and
-                       macd5 > macd5_prev and
-                       slope5 > 0 and
-                       vol5 >= 0.3)
+    # ── FLOW TRIGGER: unico gate ──
+    flow_sig = flow_trigger(_flow_cache.get("data", {}), allow_long, allow_short)
+    if not flow_sig:
+        return None  # NO FLOW = NO TRADE
 
-            breakout = (rsi5 > 50 and rsi5 < 80 and
-                       macd5 > 0 and
-                       float(r['hh']) > 0 and
-                       vol5 >= 0.8)
-
-            if pullback and is_signal_allowed("PULLBACK", "LONG"):
-                direction = "LONG"; sig_type = "PULLBACK"
-                details = f"RSI15:{rsi5:.0f} MACD↑ slope:{slope5:.4f}"
-            elif breakout and is_signal_allowed("BREAKOUT", "LONG"):
-                direction = "LONG"; sig_type = "BREAKOUT"
-                details = f"RSI15:{rsi5:.0f} HH vol:{vol5:.1f}x"
-
-    # ── SHORT SIGNALS ──
-    if direction is None and allow_short:
-        short_setup = (scalp_mode == "RANGE") or (ema9_1h < ema21_1h)
-        if short_setup:
-            pullback = (38 <= rsi5 <= 65 and
-                       macd5 < macd5_prev and
-                       slope5 < 0 and
-                       vol5 >= 0.3)
-
-            breakdown = (rsi5 < 50 and rsi5 > 20 and
-                        macd5 < 0 and
-                        float(r['ll']) > 0 and
-                        vol5 >= 0.8)
-
-            if pullback and is_signal_allowed("PULLBACK", "SHORT"):
-                direction = "SHORT"; sig_type = "PULLBACK"
-                details = f"RSI15:{rsi5:.0f} MACD↓ slope:{slope5:.4f}"
-            elif breakdown and is_signal_allowed("BREAKDOWN", "SHORT"):
-                direction = "SHORT"; sig_type = "BREAKDOWN"
-                details = f"RSI15:{rsi5:.0f} LL vol:{vol5:.1f}x"
-
-    # ── REVERSAL (solo in RANGE regime/mode) ──
-    if direction is None and (regime == "RANGE" or scalp_mode == "RANGE"):
-        if rsi1h < 38:
-            if (rsi5 < 35 and macd5 > macd5_prev and slope5 > -0.001):
-                if is_signal_allowed("REVERSAL", "LONG"):
-                    direction = "LONG"; sig_type = "REVERSAL"
-                    details = f"RSI1h:{rsi1h:.0f} RSI5:{rsi5:.0f} MACD turning"
-
-        if rsi1h > 62 and direction is None:
-            if (rsi5 > 65 and macd5 < macd5_prev and slope5 < 0.001):
-                if is_signal_allowed("REVERSAL", "SHORT"):
-                    direction = "SHORT"; sig_type = "REVERSAL"
-                    details = f"RSI1h:{rsi1h:.0f} RSI5:{rsi5:.0f} MACD turning"
-
-    # ══════════════════════════════════════════════════════════
-    # ══════════════════════════════════════════════════════════
-    # ORDER FLOW TRIGGER — entry solo su accelerazione reale
-    # ══════════════════════════════════════════════════════════
-    # Non basta che CVD sia positivo — deve ACCELERARE (>1.2x precedente).
-    # OI deve crescere (nuove posizioni, non chiusure).
-    # OB imbalance conferma la direzione.
-    # Questo filtra il 90% del rumore e cattura solo i move reali.
-    # ══════════════════════════════════════════════════════════
-
-    if direction is None:
-        flow_data = _flow_cache.get("data", {})
-        cvd_data = flow_data.get("cvd_trend", {})
-        ob_data = flow_data.get("ob_delta", {})
-        oi_data = flow_data.get("oi_momentum", {})
-
-        cvd_now = cvd_data.get("cvd", 0)
-        cvd_slope = cvd_data.get("cvd_slope", 0)
-        ob_imb = ob_data.get("imbalance_ratio", 0.5)
-        oi_change = oi_data.get("oi_change_pct", 0)
-
-        # CVD precedente: approssimato dal CVD - slope (1 step back)
-        cvd_prev = cvd_now - cvd_slope if cvd_slope != 0 else cvd_now * 0.8
-
-        # FLOW BUY: CVD positivo + accelera + OI cresce + OB bid-heavy
-        if (allow_long and
-            cvd_now > 0 and oi_change > 0 and ob_imb > 0.55 and
-            abs(cvd_prev) > 0.1 and cvd_now > cvd_prev * 1.2 and
-            rsi5 < 72 and vol5 >= 0.5):
-            direction = "LONG"
-            sig_type = "FLOW"
-            details = (f"CVD:{cvd_now:.1f}(prev:{cvd_prev:.1f} +{cvd_now/max(abs(cvd_prev),0.01)*100-100:.0f}%) "
-                      f"OI:+{oi_change:.1f}% OB:{ob_imb:.0%} RSI:{rsi5:.0f}")
-            log_btc(f"⚡ FLOW BUY — CVD accelerating {details}")
-
-        # FLOW SELL: CVD negativo + accelera + OI cresce + OB ask-heavy
-        elif (allow_short and
-              cvd_now < 0 and oi_change > 0 and ob_imb < 0.45 and
-              abs(cvd_prev) > 0.1 and abs(cvd_now) > abs(cvd_prev) * 1.2 and
-              rsi5 > 28 and vol5 >= 0.5):
-            direction = "SHORT"
-            sig_type = "FLOW"
-            details = (f"CVD:{cvd_now:.1f}(prev:{cvd_prev:.1f} +{abs(cvd_now)/max(abs(cvd_prev),0.01)*100-100:.0f}%) "
-                      f"OI:+{oi_change:.1f}% OB:{ob_imb:.0%} RSI:{rsi5:.0f}")
-            log_btc(f"⚡ FLOW SELL — CVD accelerating {details}")
-
-    if direction is None:
-        return None
+    direction = flow_sig["direction"]
+    sig_type = "FLOW"
+    details = flow_sig["details"]
 
     # ── AI CONTEXT ANALYSIS (async — non blocca il calcolo SL/TP) ──
     ai_future = None
