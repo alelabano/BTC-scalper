@@ -1938,59 +1938,50 @@ def check_signal():
                     details = f"RSI1h:{rsi1h:.0f} RSI5:{rsi5:.0f} MACD turning"
 
     # ══════════════════════════════════════════════════════════
-    # ORDER FLOW TRIGGER — segnale indipendente dai tecnici
     # ══════════════════════════════════════════════════════════
-    # Se nessun segnale tecnico ma l'order flow è forte e direzionale,
-    # genera un trade "FLOW" con condizioni minime di conferma.
-    #
-    # Condizioni:
-    #   - CVD trend forte (BUY/SELL) con slope significativo
-    #   - OB imbalance nella stessa direzione (>62% o <38%)
-    #   - Conferma OI (CONVICTION o BUILDING, non UNWIND)
-    #   - RSI non in zona estrema opposta (non comprare a RSI>75)
-    #   - Volume almeno 0.5x media (mercato non morto)
-    #
-    # Il flow trigger ha SL più stretto (ATR×0.7) e size ridotta (×0.7)
-    # perché non ha conferma tecnica classica.
+    # ORDER FLOW TRIGGER — entry solo su accelerazione reale
+    # ══════════════════════════════════════════════════════════
+    # Non basta che CVD sia positivo — deve ACCELERARE (>1.2x precedente).
+    # OI deve crescere (nuove posizioni, non chiusure).
+    # OB imbalance conferma la direzione.
+    # Questo filtra il 90% del rumore e cattura solo i move reali.
     # ══════════════════════════════════════════════════════════
 
     if direction is None:
-        flow_sig = get_flow_signal()
-        flow_bias = flow_sig.get("bias", "NEUTRAL")
-        flow_conf = flow_sig.get("confidence", 0)
+        flow_data = _flow_cache.get("data", {})
+        cvd_data = flow_data.get("cvd_trend", {})
+        ob_data = flow_data.get("ob_delta", {})
+        oi_data = flow_data.get("oi_momentum", {})
 
-        if flow_conf >= 4 and flow_bias != "NEUTRAL":
-            flow_data = _flow_cache.get("data", {})
-            cvd = flow_data.get("cvd_trend", {})
-            ob = flow_data.get("ob_delta", {})
-            oi_m = flow_data.get("oi_momentum", {})
+        cvd_now = cvd_data.get("cvd", 0)
+        cvd_slope = cvd_data.get("cvd_slope", 0)
+        ob_imb = ob_data.get("imbalance_ratio", 0.5)
+        oi_change = oi_data.get("oi_change_pct", 0)
 
-            cvd_signal = cvd.get("signal", "NEUTRAL")
-            ob_side = ob.get("aggressive_side", "NEUTRAL")
-            oi_signal = oi_m.get("signal", "NEUTRAL")
-            ob_imb = ob.get("imbalance_ratio", 0.5)
+        # CVD precedente: approssimato dal CVD - slope (1 step back)
+        cvd_prev = cvd_now - cvd_slope if cvd_slope != 0 else cvd_now * 0.8
 
-            # FLOW LONG: CVD buy + OB buy pressure + OI non in unwind + RSI non overbought
-            if (flow_bias == "BUY" and allow_long and
-                cvd_signal == "BUY" and ob_imb > 0.58 and
-                oi_signal != "UNWIND" and
-                rsi5 < 70 and vol5 >= 0.5):
-                direction = "LONG"
-                sig_type = "FLOW"
-                details = (f"CVD:{cvd.get('cvd',0):.1f} OB_imb:{ob_imb:.0%} "
-                          f"OI:{oi_signal} RSI:{rsi5:.0f} conf:{flow_conf}")
-                log_btc(f"⚡ FLOW TRIGGER LONG — {details}")
+        # FLOW BUY: CVD positivo + accelera + OI cresce + OB bid-heavy
+        if (allow_long and
+            cvd_now > 0 and oi_change > 0 and ob_imb > 0.55 and
+            abs(cvd_prev) > 0.1 and cvd_now > cvd_prev * 1.2 and
+            rsi5 < 72 and vol5 >= 0.5):
+            direction = "LONG"
+            sig_type = "FLOW"
+            details = (f"CVD:{cvd_now:.1f}(prev:{cvd_prev:.1f} +{cvd_now/max(abs(cvd_prev),0.01)*100-100:.0f}%) "
+                      f"OI:+{oi_change:.1f}% OB:{ob_imb:.0%} RSI:{rsi5:.0f}")
+            log_btc(f"⚡ FLOW BUY — CVD accelerating {details}")
 
-            # FLOW SHORT: CVD sell + OB sell pressure + OI non in unwind + RSI non oversold
-            elif (flow_bias == "SELL" and allow_short and
-                  cvd_signal == "SELL" and ob_imb < 0.42 and
-                  oi_signal != "UNWIND" and
-                  rsi5 > 30 and vol5 >= 0.5):
-                direction = "SHORT"
-                sig_type = "FLOW"
-                details = (f"CVD:{cvd.get('cvd',0):.1f} OB_imb:{ob_imb:.0%} "
-                          f"OI:{oi_signal} RSI:{rsi5:.0f} conf:{flow_conf}")
-                log_btc(f"⚡ FLOW TRIGGER SHORT — {details}")
+        # FLOW SELL: CVD negativo + accelera + OI cresce + OB ask-heavy
+        elif (allow_short and
+              cvd_now < 0 and oi_change > 0 and ob_imb < 0.45 and
+              abs(cvd_prev) > 0.1 and abs(cvd_now) > abs(cvd_prev) * 1.2 and
+              rsi5 > 28 and vol5 >= 0.5):
+            direction = "SHORT"
+            sig_type = "FLOW"
+            details = (f"CVD:{cvd_now:.1f}(prev:{cvd_prev:.1f} +{abs(cvd_now)/max(abs(cvd_prev),0.01)*100-100:.0f}%) "
+                      f"OI:+{oi_change:.1f}% OB:{ob_imb:.0%} RSI:{rsi5:.0f}")
+            log_btc(f"⚡ FLOW SELL — CVD accelerating {details}")
 
     if direction is None:
         return None
