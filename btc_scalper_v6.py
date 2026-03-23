@@ -298,7 +298,7 @@ def fleet_set_kill_switch(active, reason=""):
         _fleet["kill_reason"] = reason
     if active:
         _rset("fleet:kill_switch", {"active": True, "reason": reason, "ts": time.time()})
-        log("FLEET", f"🚨 KILL SWITCH: {reason}")
+        log_btc("FLEET", f"🚨 KILL SWITCH: {reason}")
         tg(f"🚨 <b>KILL SWITCH</b>: {reason}")
 
 # ================================================================
@@ -419,15 +419,15 @@ def _fetch_social_sentiment():
             # Score: sentiment_up% è già un buon indicatore (50 = neutral)
             cg_score = sent_up  # 0-100, 50 = neutral
             scores.append(("coingecko", cg_score))
-            log(f"[SENT] CoinGecko OK: SentUp:{sent_up:.0f}% Posts48h:{reddit_posts:.0f} "
+            log_btc(f"[SENT] CoinGecko OK: SentUp:{sent_up:.0f}% Posts48h:{reddit_posts:.0f} "
                 f"Comments48h:{reddit_comments:.0f} Active:{reddit_active}")
         elif r.status_code == 429:
-            log("[SENT] CoinGecko rate limited — using cache")
+            log_btc("[SENT] CoinGecko rate limited — using cache")
         else:
-            log(f"[SENT] CoinGecko HTTP {r.status_code}")
+            log_btc(f"[SENT] CoinGecko HTTP {r.status_code}")
 
     except Exception as e:
-        log(f"[SENT] CoinGecko error: {e}")
+        log_btc(f"[SENT] CoinGecko error: {e}")
 
     # ── B. Reddit r/bitcoin — keyword sentiment su hot posts ──
     reddit_score = 50  # default
@@ -450,7 +450,7 @@ def _fetch_social_sentiment():
                 r = requests.get(reddit_url, headers=headers_r, timeout=10)
                 if r.status_code == 200:
                     break
-                log(f"[SENT] Reddit {reddit_url.split('/')[2]} HTTP {r.status_code}")
+                log_btc(f"[SENT] Reddit {reddit_url.split('/')[2]} HTTP {r.status_code}")
             except:
                 continue
 
@@ -500,17 +500,17 @@ def _fetch_social_sentiment():
                 components["reddit_weighted_sent"] = round(weighted_sent, 3)
 
                 scores.append(("reddit", reddit_score))
-                log(f"[SENT] Reddit OK: Score:{reddit_score:.0f} Bull:{bullish_count} "
+                log_btc(f"[SENT] Reddit OK: Score:{reddit_score:.0f} Bull:{bullish_count} "
                     f"Bear:{bearish_count} AvgUpvotes:{components['reddit_avg_score']:.0f}")
         elif r and r.status_code == 429:
-            log("[SENT] Reddit rate limited — using cache")
+            log_btc("[SENT] Reddit rate limited — using cache")
         elif r:
-            log(f"[SENT] Reddit all endpoints failed (last: HTTP {r.status_code})")
+            log_btc(f"[SENT] Reddit all endpoints failed (last: HTTP {r.status_code})")
         else:
-            log("[SENT] Reddit: no response from any endpoint")
+            log_btc("[SENT] Reddit: no response from any endpoint")
 
     except Exception as e:
-        log(f"[SENT] Reddit error: {e}")
+        log_btc(f"[SENT] Reddit error: {e}")
 
     # ── Composite social score ──
     if scores:
@@ -526,7 +526,7 @@ def _fetch_social_sentiment():
     components["sources"] = [name for name, _ in scores]
 
     _social_cache = {"ts": time.time(), "score": social_composite, "components": components}
-    log(f"[SENT] Social composite: {social_composite:.0f} ({len(scores)} sources: {components['sources']})")
+    log_btc(f"[SENT] Social composite: {social_composite:.0f} ({len(scores)} sources: {components['sources']})")
     return _social_cache
 
 
@@ -560,13 +560,13 @@ def _fetch_cryptocompare():
             resp = r.json()
             # Check per errori API nella risposta JSON
             if resp.get("Response") == "Error":
-                log(f"[SENT] CryptoCompare API error: {resp.get('Message', 'unknown')}")
+                log_btc(f"[SENT] CryptoCompare API error: {resp.get('Message', 'unknown')}")
                 return _cryptocompare_cache
 
             data = resp.get("Data", {})
 
             if not data:
-                log(f"[SENT] CryptoCompare: Data vuoto. Keys risposta: {list(resp.keys())}")
+                log_btc(f"[SENT] CryptoCompare: Data vuoto. Keys risposta: {list(resp.keys())}")
                 return _cryptocompare_cache
 
             # Estrai i segnali principali
@@ -600,7 +600,7 @@ def _fetch_cryptocompare():
 
             if not signals:
                 # Log delle keys effettive per debug
-                log(f"[SENT] CryptoCompare: nessun signal trovato. Data keys: {list(data.keys())[:15]}")
+                log_btc(f"[SENT] CryptoCompare: nessun signal trovato. Data keys: {list(data.keys())[:15]}")
 
             # Media delle bull percentages
             if bull_scores:
@@ -614,14 +614,14 @@ def _fetch_cryptocompare():
                 "signals": signals,
                 "n_signals": len(bull_scores),
             }
-            log(f"[SENT] CryptoCompare OK: Bull:{avg_bull:.0f}% ({len(bull_scores)} signals)")
+            log_btc(f"[SENT] CryptoCompare OK: Bull:{avg_bull:.0f}% ({len(bull_scores)} signals)")
         elif r.status_code == 429:
-            log(f"[SENT] CryptoCompare rate limited — using cache")
+            log_btc(f"[SENT] CryptoCompare rate limited — using cache")
         else:
-            log(f"[SENT] CryptoCompare HTTP {r.status_code}: {r.text[:200]}")
+            log_btc(f"[SENT] CryptoCompare HTTP {r.status_code}: {r.text[:200]}")
 
     except Exception as e:
-        log(f"[SENT] CryptoCompare error: {e}")
+        log_btc(f"[SENT] CryptoCompare error: {e}")
 
     return _cryptocompare_cache
 
@@ -657,7 +657,7 @@ def get_sentiment_score():
                 components["fgi"] = fgi_score
                 components["fgi_label"] = data[0].get("value_classification", "Neutral")
     except Exception as e:
-        log(f"[SENT] FGI fetch error: {e}")
+        log_btc(f"[SENT] FGI fetch error: {e}")
     components.setdefault("fgi", fgi_score)
     sources["fgi"] = (fgi_score, 0.30)
 
@@ -724,7 +724,7 @@ def get_sentiment_score():
     # Log dettagliato
     soc_str = f"Social:{social_score:.0f}" if social_available else "Social:off"
     cc_str = f"CC:{cc_score:.0f}" if cc_available else "CC:off"
-    log(f"[SENT] Score:{composite} | FGI:{fgi_score} {soc_str} "
+    log_btc(f"[SENT] Score:{composite} | FGI:{fgi_score} {soc_str} "
         f"Fund:{funding_sent:.0f} {cc_str} | {len(sources)} sources")
     return composite
 
@@ -783,7 +783,7 @@ def get_sentiment_adjustment():
     vol_penalty = 1.0
     if reddit_comments > 5000:  # spike di attività
         vol_penalty = 0.85
-        log(f"[SENT] Reddit activity spike: {reddit_comments} comments/48h → size ×0.85")
+        log_btc(f"[SENT] Reddit activity spike: {reddit_comments} comments/48h → size ×0.85")
 
     if s < 15:
         return 0.7 * vol_penalty, 1.3, 2
@@ -817,7 +817,7 @@ def get_btc_open_interest():
             if a["name"] == COIN:
                 return float(c.get("openInterest", 0) or 0)
     except Exception as e:
-        log(f"[FLOW] OI fetch error: {e}")
+        log_btc(f"[FLOW] OI fetch error: {e}")
     return _oi_cache
 
 
@@ -877,7 +877,7 @@ def compute_orderbook_delta():
             result["wall_dist_pct"] = (nearest[0] - mid) / mid * 100
 
     except Exception as e:
-        log(f"[FLOW] OB delta error: {e}")
+        log_btc(f"[FLOW] OB delta error: {e}")
     return result
 
 
@@ -1165,7 +1165,7 @@ class OnlineGBClassifier:
         # Log periodico
         if self.n_samples % 10 == 0:
             acc = np.mean(self.accuracy_window) if self.accuracy_window else 0
-            log(f"[ML] Update #{self.n_samples} | Acc:{acc:.0%} | pred:{pred:.2f} actual:{outcome}")
+            log_btc(f"[ML] Update #{self.n_samples} | Acc:{acc:.0%} | pred:{pred:.2f} actual:{outcome}")
 
     def get_accuracy(self):
         if not self.accuracy_window:
@@ -1204,7 +1204,7 @@ class OnlineGBClassifier:
             self.feature_vars = np.array(d["feature_vars"])
             self.lr = d.get("lr", 0.05)
         except Exception as e:
-            log(f"[ML] Load error: {e}")
+            log_btc(f"[ML] Load error: {e}")
 
 
 # Singleton ML model
@@ -1277,7 +1277,7 @@ def ml_record_outcome(features, won):
     # Salva modello su Redis periodicamente
     if _ml_model.n_samples % 5 == 0:
         _rset("btc7:ml_model", _ml_model.to_dict())
-        log(f"[ML] Model saved ({_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%})")
+        log_btc(f"[ML] Model saved ({_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%})")
 
 
 def ml_load_model():
@@ -1285,9 +1285,9 @@ def ml_load_model():
     d = _rget("btc7:ml_model")
     if d:
         _ml_model.from_dict(d)
-        log(f"[ML] Model loaded: {_ml_model.n_samples} samples, weights:{np.abs(_ml_model.weights).sum():.2f}")
+        log_btc(f"[ML] Model loaded: {_ml_model.n_samples} samples, weights:{np.abs(_ml_model.weights).sum():.2f}")
     else:
-        log("[ML] No saved model — starting fresh")
+        log_btc("[ML] No saved model — starting fresh")
 
 
 # ================================================================
@@ -1327,7 +1327,7 @@ def update_funding_oi():
                 _btc_oi_cache = float(c.get("openInterest", 0) or 0)
                 break
     except Exception as e:
-        log(f"update_funding_oi: {e}")
+        log_btc(f"update_funding_oi: {e}")
 
 def get_funding_z():
     """Z-score del funding BTC: quanto è estremo rispetto alla storia recente."""
@@ -1361,12 +1361,12 @@ def load_state():
     if _btc_pending_order:
         age = now - _btc_pending_order.get("placed_at", 0)
         if age > PENDING_ORDER_TTL:
-            log(f"🧹 Pending order scaduto in Redis ({age:.0f}s) — clearing")
+            log_btc(f"🧹 Pending order scaduto in Redis ({age:.0f}s) — clearing")
             _btc_pending_order = {}
             _rset("btc6:pending", None)
         else:
-            log(f"⏳ Pending order restored from Redis (age:{age:.0f}s)")
-    log(f"State: {len(_btc_trades_today)} trades, {_btc_consec_losses} losses")
+            log_btc(f"⏳ Pending order restored from Redis (age:{age:.0f}s)")
+    log_btc(f"State: {len(_btc_trades_today)} trades, {_btc_consec_losses} losses")
 
 def save_trade(pnl, direction, entry, exit_px, sig_type="", sl_dist=0, regime="",
                extra=None):
@@ -1475,7 +1475,7 @@ def _update_adaptive_params():
         "ts": time.time()
     }
     _rset("btc6:params", _btc_params)
-    log(f"📊 Stats: WR:{wr:.0%} PF:{pf:.2f} PnL:${total_pnl:.2f} SLadj:{sl_adj} TPadj:{tp_adj}")
+    log_btc(f"📊 Stats: WR:{wr:.0%} PF:{pf:.2f} PnL:${total_pnl:.2f} SLadj:{sl_adj} TPadj:{tp_adj}")
 
 def get_sl_tp_adjustments():
     """Returns (sl_mult, tp_mult) from adaptive params."""
@@ -1604,11 +1604,11 @@ def run_backtest():
     if time.time() - _btc_bt_ts < 3600 and _btc_bt_results:
         return _btc_bt_results  # cache 1 ora
 
-    log("📊 Running backtest...")
+    log_btc("📊 Running backtest...")
     df_1h = fetch_df("1h", 60)
     df_5m = fetch_df("15m", 30)   # 30 giorni di 15m = ~2880 candele
     if df_1h is None or df_5m is None or len(df_5m) < 500 or len(df_1h) < 200:
-        log("📊 Backtest: insufficient data")
+        log_btc("📊 Backtest: insufficient data")
         return _btc_bt_results
 
     # Allinea 1h con 5m per timestamp
@@ -1624,7 +1624,7 @@ def run_backtest():
     ).sort_index()
 
     if len(merged) < 500:
-        log("📊 Backtest: merge failed")
+        log_btc("📊 Backtest: merge failed")
         return _btc_bt_results
 
     c = merged['close'].values.astype(np.float64)
@@ -1756,15 +1756,15 @@ def run_backtest():
 
             results[sig_name] = {"pf": pf, "pf_recent": rpf, "wr": wr, "n": nt, "avg_ret": avg}
             emoji = "✅" if pf >= 1.0 else "❌"
-            log(f"  {emoji} {sig_name:<20} PF:{pf:.2f} WR:{wr:.0%} N:{nt} Recent:{rpf:.2f}")
+            log_btc(f"  {emoji} {sig_name:<20} PF:{pf:.2f} WR:{wr:.0%} N:{nt} Recent:{rpf:.2f}")
         else:
             results[sig_name] = {"pf": 0, "pf_recent": 0, "wr": 0, "n": nt, "avg_ret": 0}
-            log(f"  ⚠️ {sig_name:<20} only {nt} trades — insufficient")
+            log_btc(f"  ⚠️ {sig_name:<20} only {nt} trades — insufficient")
 
     _btc_bt_results = results
     _btc_bt_ts = time.time()
     _rset("btc6:backtest", results)
-    log(f"📊 Backtest done: {len(results)} signal types tested")
+    log_btc(f"📊 Backtest done: {len(results)} signal types tested")
     return results
 
 def is_signal_allowed(sig_type, direction):
@@ -1984,7 +1984,7 @@ def check_signal():
     actual_lev = get_effective_lev()
     lev_scale = BTC_LEVERAGE / max(actual_lev, 1)
     if lev_scale != 1.0:
-        log(f"⚠️ Lev {actual_lev}x vs {BTC_LEVERAGE}x → SL ×{lev_scale:.2f}")
+        log_btc(f"⚠️ Lev {actual_lev}x vs {BTC_LEVERAGE}x → SL ×{lev_scale:.2f}")
 
     sl_adj_redis, tp_adj_redis = get_sl_tp_adjustments()
     buffer = px * 0.002 * lev_scale
@@ -2039,7 +2039,7 @@ def check_signal():
     sl_pct = sl_dist / px * 100
     tp_pct = tp_dist / px * 100
     rr = tp_dist / sl_dist if sl_dist > 0 else 0
-    log(f"[{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} ADX:{adx1h:.0f} lev:{actual_lev}x")
+    log_btc(f"[{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} ADX:{adx1h:.0f} lev:{actual_lev}x")
 
     # Confidence sizing: AI confidence 1-10 → size multiplier 0.5-1.0
     size_mult = 0.5 + (ai_confidence - 1) * 0.055  # 1→0.5, 5→0.72, 10→1.0
@@ -2048,7 +2048,7 @@ def check_signal():
     # ── LIQUIDITY CHECK + SETUP SCORE ──
     liq = fetch_liquidity()
     if liq.get("spread") is not None and liq["spread"] > 0.001:
-        log(f"⚠️ Spread troppo alto: {liq['spread']:.4%} — skip")
+        log_btc(f"⚠️ Spread troppo alto: {liq['spread']:.4%} — skip")
         return None
 
     ema50_1h = float(h.get('ema50', px))
@@ -2056,7 +2056,7 @@ def check_signal():
     setup = compute_setup_score(direction, px, ema50_1h, ema200_1h,
                                 rsi5, ai_confidence, fz, liq)
     if setup < 40:
-        log(f"⚠️ Setup score {setup}/100 — troppo basso")
+        log_btc(f"⚠️ Setup score {setup}/100 — troppo basso")
         return None
 
     details += f" score:{setup}"
@@ -2116,7 +2116,7 @@ def check_signal():
          (flow_bias == "BUY" and direction == "SHORT"):
         setup -= 5 + flow_conf
         if flow_conf >= 6:
-            log(f"⚠️ Flow {flow_bias} vs {direction} (conf:{flow_conf}) — signal weakened")
+            log_btc(f"⚠️ Flow {flow_bias} vs {direction} (conf:{flow_conf}) — signal weakened")
             size_mult *= 0.7
         details += f" ⚠️flow:{flow_bias}({flow_conf})vs{direction}"
     else:
@@ -2129,15 +2129,15 @@ def check_signal():
         if (div["type"] == "BEARISH" and direction == "LONG"):
             setup -= 20
             details += " ⚠️DIV:BEAR"
-            log(f"⚠️ Bearish divergence detected — LONG penalized")
+            log_btc(f"⚠️ Bearish divergence detected — LONG penalized")
         elif (div["type"] == "BULLISH" and direction == "SHORT"):
             setup -= 20
             details += " ⚠️DIV:BULL"
-            log(f"⚠️ Bullish divergence detected — SHORT penalized")
+            log_btc(f"⚠️ Bullish divergence detected — SHORT penalized")
 
     # Re-check setup after adjustments
     if setup < 35:
-        log(f"⚠️ Setup score {setup}/100 dopo analytics layer — troppo basso")
+        log_btc(f"⚠️ Setup score {setup}/100 dopo analytics layer — troppo basso")
         return None
 
     # ── MACHINE LEARNING PREDICTION ──
@@ -2160,14 +2160,14 @@ def check_signal():
     if ml_adj.get("ml_active"):
         action = ml_adj.get("action", "NORMAL")
         if action == "BLOCK":
-            log(f"🤖 [ML] BLOCKED — P(win)={ml_prob:.0%} | {ml_adj.get('reason','')}")
+            log_btc(f"🤖 [ML] BLOCKED — P(win)={ml_prob:.0%} | {ml_adj.get('reason','')}")
             return None
         elif action == "REDUCE":
             size_mult *= ml_adj.get("size_mult", 0.6)
-            log(f"🤖 [ML] REDUCE — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
+            log_btc(f"🤖 [ML] REDUCE — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
         elif action == "BOOST":
             size_mult = min(size_mult * ml_adj.get("size_mult", 1.2), 1.3)
-            log(f"🤖 [ML] BOOST — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
+            log_btc(f"🤖 [ML] BOOST — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
         details += f" ML:{ml_prob:.0%}({action})"
     else:
         details += f" ML:warmup"
@@ -2177,7 +2177,7 @@ def check_signal():
 
     size_mult = max(0.3, min(1.3, size_mult))
 
-    log(f"[V7] Final: setup:{setup} size:{size_mult:.2f} sent:{sent_score} "
+    log_btc(f"[V7] Final: setup:{setup} size:{size_mult:.2f} sent:{sent_score} "
         f"flow:{flow_bias} ML:{ml_prob:.0%} | {details[-80:]}")
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
@@ -2222,16 +2222,16 @@ def get_meta():
                         "px_dec":  px_dec,
                         "max_lev": max_lev,
                     }
-                    log(f"✅ Meta {BTC_COIN}: szDec={sz_dec} pxDec={px_dec} maxLev={max_lev}x")
+                    log_btc(f"✅ Meta {BTC_COIN}: szDec={sz_dec} pxDec={px_dec} maxLev={max_lev}x")
 
                     if BTC_LEVERAGE > max_lev:
-                        log(f"⚠️ BTC_LEVERAGE {BTC_LEVERAGE}x > max {max_lev}x")
+                        log_btc(f"⚠️ BTC_LEVERAGE {BTC_LEVERAGE}x > max {max_lev}x")
                         tg(f"⚠️ Leva {BTC_LEVERAGE}x > max {max_lev}x per {BTC_COIN}")
 
                     return sz_dec, px_dec
         except Exception as e:
             if attempt < 2: time.sleep(3 * (attempt + 1))
-            else: log(f"get_meta failed: {e}")
+            else: log_btc(f"get_meta failed: {e}")
     return 5, 1  # BTC defaults
 
 def get_max_leverage():
@@ -2318,18 +2318,18 @@ def check_margin(size, entry_px):
         margin_with_buffer = margin_required * 1.2
 
         if available < margin_with_buffer:
-            log(f"⚠️ Margine insufficiente: need ${margin_with_buffer:.2f} "
+            log_btc(f"⚠️ Margine insufficiente: need ${margin_with_buffer:.2f} "
                 f"have ${available:.2f} (used:${total_margin:.2f} total:${account_value:.2f})")
             return False
 
         # Check anche che l'account value sia sopra una soglia minima
         if account_value < BTC_RISK_USD * 2:
-            log(f"⚠️ Account value troppo basso: ${account_value:.2f}")
+            log_btc(f"⚠️ Account value troppo basso: ${account_value:.2f}")
             return False
 
         return True
     except Exception as e:
-        log(f"check_margin error: {e}")
+        log_btc(f"check_margin error: {e}")
         return True
 
 # ================================================================
@@ -2377,7 +2377,7 @@ def fetch_liquidity():
                 result["cluster_dist"] = d
                 result["cluster_side"] = "below"
     except Exception as e:
-        log(f"fetch_liquidity: {e}")
+        log_btc(f"fetch_liquidity: {e}")
     return result
 
 # ================================================================
@@ -2478,7 +2478,7 @@ def compute_real_exit(direction, entry_px, ts_open):
                            else (entry_px - exit_px) / entry_px)
                 return exit_px, pnl_pct
     except Exception as e:
-        log(f"compute_real_exit: {e}")
+        log_btc(f"compute_real_exit: {e}")
     return 0, 0
 
 # ================================================================
@@ -2510,12 +2510,12 @@ def cleanup_orphan_orders():
 
     triggers = get_trigger_orders()
     if triggers:
-        log(f"🧹 {len(triggers)} ordini orfani trovati — cancello")
+        log_btc(f"🧹 {len(triggers)} ordini orfani trovati — cancello")
         for o in triggers:
             oid = o.get("oid")
             if oid:
                 cancel_trigger_order(oid)
-                log(f"  Cancelled {o.get('orderType')} #{oid}")
+                log_btc(f"  Cancelled {o.get('orderType')} #{oid}")
         tg(f"🧹 Cancellati {len(triggers)} ordini BTC orfani", silent=True)
 
 # ================================================================
@@ -2532,7 +2532,7 @@ def set_pending(oid, sl, tp, direction, sl_dist, sig_type="", regime=""):
         "sl_dist": sl_dist, "type": sig_type, "regime": regime
     }
     _rset("btc6:pending", _btc_pending_order)
-    log(f"⏳ Ordine pendente registrato (oid={oid})")
+    log_btc(f"⏳ Ordine pendente registrato (oid={oid})")
 
 def clear_pending():
     global _btc_pending_order
@@ -2562,7 +2562,7 @@ def check_pending(sz_dec, px_dec):
         tp_px = rpx(_btc_pending_order["tp"], px_dec)
         actual_size = rpx(abs(pos["szi"]), sz_dec)
 
-        log(f"✅ Pendente fillato → piazzo SL/TP")
+        log_btc(f"✅ Pendente fillato → piazzo SL/TP")
         try:
             call(_exchange.order, BTC_COIN, not is_buy, actual_size, sl_px,
                  {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
@@ -2575,10 +2575,10 @@ def check_pending(sz_dec, px_dec):
             entry = pos["entry"]
             sl_pct = abs(entry - sl_px) / entry * 100
             tp_pct = abs(tp_px - entry) / entry * 100
-            log(f"🔒 Pendente protetto: SL:{sl_px}({sl_pct:.1f}%) TP:{tp_px}({tp_pct:.1f}%)")
+            log_btc(f"🔒 Pendente protetto: SL:{sl_px}({sl_pct:.1f}%) TP:{tp_px}({tp_pct:.1f}%)")
             tg(f"🔒 <b>BTC</b> pendente fillato | SL:{sl_px} TP:{tp_px}", silent=True)
         except Exception as e:
-            log(f"🚨 SL/TP pendente error: {e}")
+            log_btc(f"🚨 SL/TP pendente error: {e}")
             tg(f"🚨 BTC pendente SL/TP ERROR!")
 
         result = _btc_pending_order.copy()
@@ -2589,13 +2589,13 @@ def check_pending(sz_dec, px_dec):
 
     # Check se è scaduto
     if now - placed_at > PENDING_ORDER_TTL:
-        log(f"⏱ Pendente scaduto dopo {PENDING_ORDER_TTL}s — cancello")
+        log_btc(f"⏱ Pendente scaduto dopo {PENDING_ORDER_TTL}s — cancello")
         try:
             if oid:
                 call(_exchange.cancel, BTC_COIN, oid, timeout=10)
-                log(f"  Cancelled GTC #{oid}")
+                log_btc(f"  Cancelled GTC #{oid}")
         except Exception as e:
-            log(f"  Cancel error: {e}")
+            log_btc(f"  Cancel error: {e}")
         tg(f"⏱ BTC ordine scaduto — cancellato", silent=True)
         clear_pending()
         return None
@@ -2603,7 +2603,7 @@ def check_pending(sz_dec, px_dec):
     # Ancora in attesa
     elapsed = int(now - placed_at)
     if elapsed % 30 == 0:  # log ogni 30s
-        log(f"⏳ Pendente in attesa... {elapsed}s/{PENDING_ORDER_TTL}s")
+        log_btc(f"⏳ Pendente in attesa... {elapsed}s/{PENDING_ORDER_TTL}s")
     return None
 
 # ================================================================
@@ -2616,7 +2616,7 @@ def recover_position(sz_dec, px_dec):
     """
     pos = get_position()
     if pos is None:
-        log("🔍 No open position — clean start")
+        log_btc("🔍 No open position — clean start")
         return None
 
     entry = pos["entry"]
@@ -2625,7 +2625,7 @@ def recover_position(sz_dec, px_dec):
     mid = get_mid()
     pnl_pct = ((mid-entry)/entry if d == "LONG" else (entry-mid)/entry) * 100
 
-    log(f"🔍 Found open position: {d} @ {entry} size:{abs(szi)} PnL:{pnl_pct:+.1f}%")
+    log_btc(f"🔍 Found open position: {d} @ {entry} size:{abs(szi)} PnL:{pnl_pct:+.1f}%")
 
     # Check if SL exists
     orders = get_open_orders()
@@ -2646,14 +2646,14 @@ def recover_position(sz_dec, px_dec):
             call(_exchange.order, BTC_COIN, not is_buy, size_abs, sl_px,
                  {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
                  True, timeout=15)
-            log(f"🚨 EMERGENCY SL placed @ {sl_px}")
+            log_btc(f"🚨 EMERGENCY SL placed @ {sl_px}")
             tg(f"🚨 <b>BTC</b> restart — emergency SL @ {sl_px}")
         except Exception as e:
-            log(f"🚨 EMERGENCY SL FAILED: {e}")
+            log_btc(f"🚨 EMERGENCY SL FAILED: {e}")
             tg(f"🚨🚨 BTC NO SL — MANUAL CHECK!")
 
     if not has_tp:
-        log(f"⚠️ No TP order — trade will be managed by AI only")
+        log_btc(f"⚠️ No TP order — trade will be managed by AI only")
 
     pos_state = pos.copy()
     pos_state["type"] = "RECOVERED"
@@ -2698,7 +2698,7 @@ def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
         pos_state["trailing_active"] = True
         pos_state["trailing_activated_at"] = mid
         pos_state["trailing_moves"] = 0
-        log(f"📈 Trailing ACTIVATED at {mid:.1f} (profit:{profit_dist/entry*100:.2f}%)")
+        log_btc(f"📈 Trailing ACTIVATED at {mid:.1f} (profit:{profit_dist/entry*100:.2f}%)")
         save_pos_state(pos_state)
 
     # Calcola nuovo trailing SL
@@ -2737,10 +2737,10 @@ def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
         pos_state["current_ts"] = new_ts
         pos_state["trailing_moves"] = pos_state.get("trailing_moves", 0) + 1
         trail_pct = abs(new_ts - entry) / entry * 100
-        log(f"📈 Trailing SL → {new_ts} ({'+' if (d=='LONG' and new_ts>entry) or (d=='SHORT' and new_ts<entry) else ''}{trail_pct:.2f}% from entry) [move #{pos_state['trailing_moves']}]")
+        log_btc(f"📈 Trailing SL → {new_ts} ({'+' if (d=='LONG' and new_ts>entry) or (d=='SHORT' and new_ts<entry) else ''}{trail_pct:.2f}% from entry) [move #{pos_state['trailing_moves']}]")
         save_pos_state(pos_state)
     except Exception as e:
-        log(f"Trailing update error: {e}")
+        log_btc(f"Trailing update error: {e}")
 
 # ================================================================
 # PARTIAL CLOSE
@@ -2782,7 +2782,7 @@ def check_partial_close(pos_state, mid, sz_dec, px_dec):
         pos_state["partial_close_px"] = mid
         pos_state["partial_pnl_pct"] = profit_dist / entry * 100
         partial_pnl = profit_dist / entry * 100
-        log(f"💰 PARTIAL CLOSE 50% @ {mid:.1f} PnL:{partial_pnl:+.2f}%")
+        log_btc(f"💰 PARTIAL CLOSE 50% @ {mid:.1f} PnL:{partial_pnl:+.2f}%")
         tg(f"💰 BTC partial close 50% PnL:{partial_pnl:+.1f}%", silent=True)
         save_pos_state(pos_state)
 
@@ -2795,9 +2795,9 @@ def check_partial_close(pos_state, mid, sz_dec, px_dec):
                 if o.get("coin") == BTC_COIN and o.get("orderType") == "Take Profit Market":
                     call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
             # Non ripiazzare TP — lascia correre con trailing
-            log(f"📈 Remaining {remaining} runs with trailing stop")
+            log_btc(f"📈 Remaining {remaining} runs with trailing stop")
     except Exception as e:
-        log(f"Partial close error: {e}")
+        log_btc(f"Partial close error: {e}")
 
 # ================================================================
 # FUNDING CHECK
@@ -2813,18 +2813,18 @@ def is_funding_ok(direction):
 
     # Raw funding check
     if direction == "LONG" and funding > FUNDING_BLOCK_THRESH:
-        log(f"⚠️ Funding {funding*100:.3f}% contro LONG — skip")
+        log_btc(f"⚠️ Funding {funding*100:.3f}% contro LONG — skip")
         return False
     if direction == "SHORT" and funding < -FUNDING_BLOCK_THRESH:
-        log(f"⚠️ Funding {funding*100:.3f}% contro SHORT — skip")
+        log_btc(f"⚠️ Funding {funding*100:.3f}% contro SHORT — skip")
         return False
 
     # Z-score check: funding estremo = crowded = rischio squeeze
     if direction == "LONG" and fz > 2.5:
-        log(f"⚠️ Funding z-score {fz:+.1f} — crowded long, skip")
+        log_btc(f"⚠️ Funding z-score {fz:+.1f} — crowded long, skip")
         return False
     if direction == "SHORT" and fz < -2.5:
-        log(f"⚠️ Funding z-score {fz:+.1f} — crowded short, skip")
+        log_btc(f"⚠️ Funding z-score {fz:+.1f} — crowded short, skip")
         return False
 
     return True
@@ -2898,14 +2898,14 @@ def maybe_send_daily_report():
         f"💼 Balance: ${bal:.2f}"
     )
     tg(report)
-    log(f"📊 Daily report sent: {len(trades)} trades ${total:+.2f}")
+    log_btc(f"📊 Daily report sent: {len(trades)} trades ${total:+.2f}")
 
 def open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0, scalp_mode="TREND"):
     global _btc_last_trade_ts, _btc_is_trading
 
     # Lock: previeni race condition (ordini doppi)
     if _btc_is_trading:
-        log("⚠️ Trade already in progress — skipping")
+        log_btc("⚠️ Trade already in progress — skipping")
         return False
     _btc_is_trading = True
 
@@ -2930,7 +2930,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     size = rpx(notional / entry_px, sz_dec)
 
     if size <= 0:
-        log(f"Size zero: notional=${notional:.0f} px={entry_px}")
+        log_btc(f"Size zero: notional=${notional:.0f} px={entry_px}")
         return False
 
     # ── MARGIN CHECK: verifica prima di inviare ──
@@ -2963,10 +2963,10 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         eff_dec = min(eff_dec + 2, 8)
         sl_px = rpx(sl, eff_dec)
         tp_px = rpx(tp, eff_dec)
-        log(f"⚠️ px_dec alzato a {eff_dec} per distinguere SL/TP")
+        log_btc(f"⚠️ px_dec alzato a {eff_dec} per distinguere SL/TP")
 
     tp_rr_display = tp_dist / sl_dist if sl_dist > 0 else 0
-    log(f"{'🟢' if is_buy else '🔴'} ORDER {BTC_COIN} {direction} [{scalp_mode}] @ {entry} size:{size} "
+    log_btc(f"{'🟢' if is_buy else '🔴'} ORDER {BTC_COIN} {direction} [{scalp_mode}] @ {entry} size:{size} "
         f"SL:{sl_px}({sl_dist/entry*100:.2f}%) TP:{tp_px}({tp_dist/entry*100:.2f}%) R:R=1:{tp_rr_display:.1f} "
         f"risk:${BTC_RISK_USD*size_mult:.1f} notional:${notional:.0f}")
 
@@ -2980,7 +2980,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 
     # ── STEP 1: GTC MAKER (skip in FLASH mode) ──
     if scalp_mode == "FLASH":
-        log(f"⚡ FLASH mode — skip GTC, direct IoC")
+        log_btc(f"⚡ FLASH mode — skip GTC, direct IoC")
     else:
         try:
             fresh_mid = get_mid()
@@ -2988,9 +2988,9 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 
             drift = (fresh_mid - entry_px) / entry_px
             if (is_buy and drift > DRIFT_MAX_FAVORABLE) or (not is_buy and drift < -DRIFT_MAX_FAVORABLE):
-                log(f"Drift {drift:+.3%} — too late"); return False
+                log_btc(f"Drift {drift:+.3%} — too late"); return False
             if (is_buy and drift < -DRIFT_MAX_ADVERSE) or (not is_buy and drift > DRIFT_MAX_ADVERSE):
-                log(f"Drift {drift:+.3%} — invalidated"); return False
+                log_btc(f"Drift {drift:+.3%} — invalidated"); return False
 
             if abs(drift) > 0.001:
                 if is_buy:
@@ -3003,14 +3003,14 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
             gtc_px = rpx(fresh_mid * (1 + SLIPPAGE) if is_buy else fresh_mid * (1 - SLIPPAGE), eff_dec)
             res = call(_exchange.order, BTC_COIN, is_buy, size, gtc_px,
                        {"limit": {"tif": "Gtc"}}, False, timeout=15)
-            log(f"GTC Maker @ {gtc_px}: {res}")
+            log_btc(f"GTC Maker @ {gtc_px}: {res}")
 
             oid_gtc = None
             if res and res.get("status") == "ok":
                 for s in res.get("response",{}).get("data",{}).get("statuses",[]):
                     if "filled" in s:
                         filled = True
-                        log(f"✅ GTC instant fill (maker)")
+                        log_btc(f"✅ GTC instant fill (maker)")
                         break
                     if "resting" in s:
                         oid_gtc = s["resting"]["oid"]
@@ -3021,14 +3021,14 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
                         p = get_position()
                         if p and p.get("szi", 0) != 0:
                             filled = True
-                            log(f"✅ GTC filled in {(tick+1)*0.5:.1f}s (maker)")
+                            log_btc(f"✅ GTC filled in {(tick+1)*0.5:.1f}s (maker)")
                             break
                     if not filled:
                         try: call(_exchange.cancel, BTC_COIN, oid_gtc, timeout=10)
                         except: pass
-                        log(f"GTC not filled in {GTC_TIMEOUT}s")
+                        log_btc(f"GTC not filled in {GTC_TIMEOUT}s")
         except Exception as e:
-            log(f"GTC error: {e}")
+            log_btc(f"GTC error: {e}")
 
     # ── STEP 2: IoC TAKER (fallback) ──
     if not filled:
@@ -3038,7 +3038,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 
             drift2 = (fresh_mid - entry_px) / entry_px
             if abs(drift2) > DRIFT_MAX_FAVORABLE * 1.5:
-                log(f"Post-GTC drift {drift2:+.3%} — abort"); return False
+                log_btc(f"Post-GTC drift {drift2:+.3%} — abort"); return False
 
             # Slippage dinamico: base SLIPPAGE × 2, scalato con volatilità
             atr_pct = sl_dist / fresh_mid
@@ -3047,7 +3047,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
             ioc_px = rpx(fresh_mid * (1 + dyn_slip) if is_buy else fresh_mid * (1 - dyn_slip), px_dec)
             res = call(_exchange.order, BTC_COIN, is_buy, size, ioc_px,
                        {"limit": {"tif": "Ioc"}}, False, timeout=15)
-            log(f"IoC Taker @ {ioc_px} (slip:{dyn_slip:.2%}): {res}")
+            log_btc(f"IoC Taker @ {ioc_px} (slip:{dyn_slip:.2%}): {res}")
 
             if res and res.get("status") == "ok":
                 for s in res.get("response",{}).get("data",{}).get("statuses",[]):
@@ -3055,13 +3055,13 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
                         filled = True
                         avg = float(s["filled"].get("avgPx", 0))
                         real_slip = abs(avg - fresh_mid) / fresh_mid if avg > 0 else 0
-                        log(f"✅ IoC filled @ {avg} (slip:{real_slip:.3%})")
+                        log_btc(f"✅ IoC filled @ {avg} (slip:{real_slip:.3%})")
                         break
         except Exception as e:
-            log(f"IoC error: {e}")
+            log_btc(f"IoC error: {e}")
 
     if not filled:
-        log(f"GTC + IoC failed — no fill"); return False
+        log_btc(f"GTC + IoC failed — no fill"); return False
 
     # ── Conferma posizione ──
     pos = get_position()
@@ -3071,7 +3071,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
             pos = get_position()
             if pos: break
     if not pos:
-        log(f"Filled but position not found"); return False
+        log_btc(f"Filled but position not found"); return False
 
     actual_size = rpx(abs(pos["szi"]), sz_dec)
     actual_entry = pos["entry"]
@@ -3089,7 +3089,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         else:
             sl_px = rpx(actual_entry + new_sl_dist, px_dec)
             tp_px = rpx(actual_entry - new_sl_dist * TP_RR, px_dec)
-        log(f"⚠️ Lev {actual_lev}x → SL/TP ricalcolati")
+        log_btc(f"⚠️ Lev {actual_lev}x → SL/TP ricalcolati")
 
     # Place SL + TP
     try:
@@ -3101,7 +3101,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
              {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
              True, timeout=15)
     except Exception as e:
-        log(f"🚨 SL/TP ERROR: {e}")
+        log_btc(f"🚨 SL/TP ERROR: {e}")
         tg(f"🚨 BTC SL/TP ERROR — check!")
         return False
 
@@ -3110,7 +3110,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     sl_pct_real = abs(filled_px - sl_px) / filled_px * 100
     tp_pct_real = abs(tp_px - filled_px) / filled_px * 100
 
-    log(f"✅ FILLED @ {filled_px} size:{actual_size} lev:{actual_lev}x "
+    log_btc(f"✅ FILLED @ {filled_px} size:{actual_size} lev:{actual_lev}x "
         f"SL:{sl_px}({sl_pct_real:.2f}%) TP:{tp_px}({tp_pct_real:.2f}%)")
     tg(f"{'🟢' if is_buy else '🔴'} <b>BTC</b> {direction} @ {filled_px}\n"
        f"SL:{sl_px} ({sl_pct_real:.1f}%) | TP:{tp_px} ({tp_pct_real:.1f}%)\n"
@@ -3124,7 +3124,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 _btc_scanner_ready = threading.Event()
 
 def scanner_thread():
-    log("[SCAN] BTC Scanner avviato")
+    log_btc("[SCAN] BTC Scanner avviato")
     ml_load_model()
     while True:
         try:
