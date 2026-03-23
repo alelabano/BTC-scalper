@@ -1968,14 +1968,9 @@ def check_signal():
     if regime == "RANGE_LOW_VOL":
         return None
 
-    # Direzioni permesse in base al regime
-    if regime == "TREND_STRONG":
-        trend_up = ema9_1h > ema21_1h
-        allow_long = trend_up
-        allow_short = not trend_up
-    else:
-        allow_long = True
-        allow_short = True
+    # Flow decide la direzione — regime scala la size, non blocca mai
+    allow_long = True
+    allow_short = True
 
     # ══════════════════════════════════════════════════════════
     # DUAL TRIGGER: Flow (master) + Technical (fallback)
