@@ -1834,10 +1834,10 @@ def is_signal_allowed(sig_type, direction):
 def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     """
     Flow trigger adattivo al regime.
-    TREND_STRONG → aggressivo (CVD + OI bastano)
-    TREND        → medio (CVD + OB conferma)
-    RANGE        → leggero (solo CVD — qui nasce il profitto)
-    RANGE_LOW_VOL → None (non tradare)
+    TREND_STRONG → CVD + OI (aggressivo, il trend protegge)
+    TREND        → CVD + OB > 0.52 (conferma book)
+    RANGE        → CVD + OB > 0.52 (serve conferma, CVD da solo è rumore)
+    RANGE_LOW_VOL → None
     """
     cvd_data = flow_data.get("cvd_trend", {})
     ob_data = flow_data.get("ob_delta", {})
@@ -1849,29 +1849,17 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
 
     direction = None
 
-    # TREND_STRONG → aggressivo: CVD + OI bastano
     if regime == "TREND_STRONG":
         if cvd > 0 and oi > 0 and allow_long:
             direction = "LONG"
         elif cvd < 0 and oi > 0 and allow_short:
             direction = "SHORT"
 
-    # TREND → medio: CVD + OB conferma
-    elif regime == "TREND":
+    elif regime in ("TREND", "RANGE"):
         if cvd > 0 and ob > 0.52 and allow_long:
             direction = "LONG"
         elif cvd < 0 and ob < 0.48 and allow_short:
             direction = "SHORT"
-
-    # RANGE → leggero: solo CVD direzionale
-    elif regime == "RANGE":
-        if cvd > 0 and allow_long:
-            direction = "LONG"
-        elif cvd < 0 and allow_short:
-            direction = "SHORT"
-
-    # RANGE_LOW_VOL → non tradare
-    # (già gestito nel check_signal, ma safety net)
 
     if direction:
         details = f"CVD:{cvd:.1f} OI:{oi:+.1f}% OB:{ob:.0%} [{regime}]"
@@ -1883,22 +1871,24 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
 
 def technical_trigger(r, r_prev, allow_long=True, allow_short=True):
     """
-    Technical trigger — pullback puro.
-    RSI in zona estrema + MACD che gira = entry.
+    Technical trigger — pullback con volume confirmation.
+    RSI estremo + MACD turning + volume sopra media = entry reale.
+    Senza volume, il MACD turn è rumore su candela singola.
     """
     rsi = float(r['rsi'])
     macd = float(r['macd_hist'])
     macd_prev = float(r_prev['macd_hist'])
+    vol = float(r['vol_rel'])
 
-    # Pullback BUY: RSI oversold + MACD turning up
-    if allow_long and rsi < 40 and macd > macd_prev:
+    # Pullback BUY: RSI oversold + MACD turning up + volume conferma
+    if allow_long and rsi < 40 and macd > macd_prev and vol >= 0.5:
         return {"direction": "LONG", "type": "PULLBACK",
-                "details": f"RSI:{rsi:.0f} MACD↑"}
+                "details": f"RSI:{rsi:.0f} MACD↑ vol:{vol:.1f}x"}
 
-    # Pullback SELL: RSI overbought + MACD turning down
-    if allow_short and rsi > 60 and macd < macd_prev:
+    # Pullback SELL: RSI overbought + MACD turning down + volume conferma
+    if allow_short and rsi > 60 and macd < macd_prev and vol >= 0.5:
         return {"direction": "SHORT", "type": "PULLBACK",
-                "details": f"RSI:{rsi:.0f} MACD↓"}
+                "details": f"RSI:{rsi:.0f} MACD↓ vol:{vol:.1f}x"}
 
     return None
 
