@@ -814,7 +814,7 @@ def get_btc_open_interest():
     try:
         ctx = call(_info.meta_and_asset_ctxs, timeout=15)
         for a, c in zip(ctx[0]["universe"], ctx[1]):
-            if a["name"] == COIN:
+            if a["name"] == BTC_COIN:
                 return float(c.get("openInterest", 0) or 0)
     except Exception as e:
         log_btc(f"[FLOW] OI fetch error: {e}")
@@ -829,7 +829,7 @@ def compute_orderbook_delta():
     result = {"delta": 0, "imbalance_ratio": 0.5, "aggressive_side": "NEUTRAL",
               "depth_bid": 0, "depth_ask": 0, "wall_level": 0, "wall_side": ""}
     try:
-        ob = call(_info.l2_snapshot, COIN, timeout=10)
+        ob = call(_info.l2_snapshot, BTC_COIN, timeout=10)
         if not ob:
             return result
 
@@ -1288,6 +1288,50 @@ def ml_load_model():
         log_btc(f"[ML] Model loaded: {_ml_model.n_samples} samples, weights:{np.abs(_ml_model.weights).sum():.2f}")
     else:
         log_btc("[ML] No saved model — starting fresh")
+
+
+def compute_hourly_bias():
+    """Multi-timeframe Momentum + Order Flow + Sentiment → Fleet bias."""
+    global _last_oi, _btc_regime
+    fz = get_funding_z()
+    sentiment = get_sentiment_score()
+    current_oi = get_btc_open_interest()
+
+    oi_change = (current_oi - _last_oi) / _last_oi if _last_oi > 0 else 0
+    _last_oi = current_oi
+
+    short_momentum_5m = 0
+    short_momentum_1h = 0
+    try:
+        df_5m = fetch_df("15m", 2)
+        df_1h = fetch_df("1h", 2)
+        if df_5m is not None and len(df_5m) >= 2:
+            short_momentum_5m = (float(df_5m['close'].iloc[-1]) / float(df_5m['close'].iloc[-2])) - 1
+        if df_1h is not None and len(df_1h) >= 2:
+            short_momentum_1h = (float(df_1h['close'].iloc[-1]) / float(df_1h['close'].iloc[-2])) - 1
+    except Exception as e:
+        log_btc(f"Bias momentum error: {e}")
+
+    if short_momentum_5m < -0.002:
+        bias = "SHORT_ONLY"; reason = f"FAST DUMP 5m ({short_momentum_5m:+.2%}) OI:{oi_change:+.2%}"
+    elif short_momentum_1h < -0.004:
+        bias = "SHORT_ONLY"; reason = f"1h DOWNTREND ({short_momentum_1h:+.2%})"
+    elif short_momentum_1h > 0.004:
+        bias = "LONG_ONLY"; reason = f"1h UPTREND ({short_momentum_1h:+.2%})"
+    elif sentiment < 25:
+        bias = "LONG_ONLY"; reason = f"EXTREME FEAR ({sentiment})"
+    elif _btc_regime == "BEAR":
+        bias = "SHORT_ONLY" if fz > -0.5 else "NEUTRAL"
+        reason = f"BEAR REGIME + FZ:{fz:+.1f}"
+    elif _btc_regime == "BULL":
+        bias = "LONG_ONLY" if short_momentum_1h >= -0.0005 else "NEUTRAL"
+        reason = f"BULL REGIME + Mom:{short_momentum_1h:+.2%}"
+    else:
+        bias = "NEUTRAL"; reason = f"RANGE (F&G:{sentiment})"
+
+    fleet_set_bias(bias, reason)
+    log_btc(f"Fleet bias: {bias} | {reason}")
+    return bias
 
 
 # ================================================================
@@ -2053,7 +2097,7 @@ def check_signal():
 
     ema50_1h = float(h.get('ema50', px))
     ema200_1h = float(h.get('ema200', px))
-    setup = compute_setup_score(direction, px, ema50_1h, ema200_1h,
+    setup = btc_compute_setup_score(direction, px, ema50_1h, ema200_1h,
                                 rsi5, ai_confidence, fz, liq)
     if setup < 40:
         log_btc(f"⚠️ Setup score {setup}/100 — troppo basso")
@@ -2383,7 +2427,7 @@ def fetch_liquidity():
 # ================================================================
 # SETUP SCORE (from V4 — adapted for BTC-only)
 # ================================================================
-def compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
+def btc_compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
                         funding_z, liq=None):
     """
     Score composito 0-100. Combina trend, RSI, AI, funding z-score, liquidità.
@@ -2447,7 +2491,7 @@ def compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
 # ================================================================
 # REAL EXIT PRICE (from V4 — precise PnL from fills)
 # ================================================================
-def get_recent_fills(since_ts):
+def btc_get_recent_fills(since_ts):
     """Recupera fill recenti BTC da API."""
     try:
         fills = call(_info.user_fills_by_time, _account.address,
@@ -2455,13 +2499,13 @@ def get_recent_fills(since_ts):
         return [f for f in (fills or []) if f.get("coin") == BTC_COIN]
     except: return []
 
-def compute_real_exit(direction, entry_px, ts_open):
+def btc_compute_real_exit(direction, entry_px, ts_open):
     """
     Calcola exit price reale dalla media ponderata dei fill di chiusura.
     Fallback a 0 se fill non disponibili.
     """
     try:
-        fills = get_recent_fills(ts_open)
+        fills = btc_get_recent_fills(ts_open)
         close_side = "B" if direction == "SHORT" else "A"
         close_fills = [f for f in fills
                        if f.get("side", "")[0:1].upper() == close_side
@@ -2745,7 +2789,7 @@ def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
 # ================================================================
 # PARTIAL CLOSE
 # ================================================================
-def check_partial_close(pos_state, mid, sz_dec, px_dec):
+def btc_check_partial_close(pos_state, mid, sz_dec, px_dec):
     """
     Chiudi 50% della posizione quando il prezzo raggiunge PARTIAL_CLOSE_PCT del TP.
     Prende profitto parziale e lascia correre il resto con trailing.
@@ -2900,7 +2944,7 @@ def maybe_send_daily_report():
     tg(report)
     log_btc(f"📊 Daily report sent: {len(trades)} trades ${total:+.2f}")
 
-def open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0, scalp_mode="TREND"):
+def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0, scalp_mode="TREND"):
     global _btc_last_trade_ts, _btc_is_trading
 
     # Lock: previeni race condition (ordini doppi)
@@ -6892,7 +6936,7 @@ def btc_executor_loop(sz_dec, px_dec):
                 size_abs = abs(szi)
 
                 open_ts = last_pos_state.get("open_ts", time.time() - 3600)
-                real_exit, real_pnl = compute_real_exit(d, entry, open_ts)
+                real_exit, real_pnl = btc_compute_real_exit(d, entry, open_ts)
 
                 if real_exit > 0 and real_pnl != 0:
                     exit_px = real_exit; pnl_pct = real_pnl * 100
@@ -6956,7 +7000,7 @@ def btc_executor_loop(sz_dec, px_dec):
                 if atr_now > 0 and trade_mode == "TREND":
                     update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
                 if trade_mode == "TREND":
-                    check_partial_close(last_pos_state, mid, sz_dec, px_dec)
+                    btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
 
                 # Fleet: pubblica posizione BTC per ALT engine
                 fleet_set_btc_position({"direction": d, "size": abs(szi), "entry": entry})
@@ -6994,7 +7038,7 @@ def btc_executor_loop(sz_dec, px_dec):
                 direction = sig["direction"]; sm = sig['scalp_mode']
                 log_btc(f"🎯 {direction} {sig['sig_type']} [{sm}] @ {sig['entry_px']:,.0f}")
 
-                success = open_trade(direction, sig["sl"], sig["tp"], sig["entry_px"],
+                success = btc_open_trade(direction, sig["sl"], sig["tp"], sig["entry_px"],
                                      sig["sl_dist"], sz_dec, px_dec, sig["size_mult"], sig["scalp_mode"])
                 if success:
                     p = get_position()
