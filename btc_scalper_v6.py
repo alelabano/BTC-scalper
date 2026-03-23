@@ -3421,8 +3421,9 @@ def save_trade_outcome(trade: dict):
 def is_circuit_breaker_active() -> tuple[bool, str]:
     """
     Circuit breaker: blocca nuovi trade se:
-    1. Le perdite giornaliere superano MAX_DAILY_LOSS_PCT del capitale
-    2. Ci sono MAX_CONSECUTIVE_LOSSES stop loss consecutivi
+    1. Le perdite nelle ultime 24h superano MAX_DAILY_LOSS_PCT del capitale
+    2. Ci sono MAX_CONSECUTIVE_LOSSES stop loss consecutivi nelle ultime 6h
+       (trade più vecchi di 6h non contano — evita blocco da storia stale)
 
     Ritorna (active: bool, reason: str)
     """
@@ -3432,20 +3433,24 @@ def is_circuit_breaker_active() -> tuple[bool, str]:
             return False, ""
 
         now = time.time()
-        today_start = now - 86400  # ultime 24h
 
-        # 1. Perdite giornaliere
-        today_trades = [t for t in history if t.get("ts_close", 0) > today_start]
+        # 1. Perdite giornaliere (ultime 24h)
+        today_trades = [t for t in history if t.get("ts_close", 0) > now - 86400]
         if today_trades:
             daily_pnl = sum(t.get("pnl_pct", 0) for t in today_trades)
             if daily_pnl <= -MAX_DAILY_LOSS_PCT:
                 return True, f"daily loss {daily_pnl:.1f}% > max {MAX_DAILY_LOSS_PCT}%"
 
-        # 2. Stop loss consecutivi (ultimi N trade)
-        recent = history[-MAX_CONSECUTIVE_LOSSES:]
-        if len(recent) >= MAX_CONSECUTIVE_LOSSES:
-            if all(t.get("outcome") == "loss" for t in recent):
-                return True, f"{MAX_CONSECUTIVE_LOSSES} stop loss consecutivi"
+        # 2. Stop loss consecutivi — SOLO trade delle ultime 6h
+        recent_6h = [t for t in history if t.get("ts_close", 0) > now - 21600]
+        if len(recent_6h) >= MAX_CONSECUTIVE_LOSSES:
+            last_n = recent_6h[-MAX_CONSECUTIVE_LOSSES:]
+            if all(t.get("outcome") == "loss" for t in last_n):
+                # Pausa 30 minuti dall'ultimo loss
+                last_loss_ts = max(t.get("ts_close", 0) for t in last_n)
+                if now - last_loss_ts < 1800:
+                    mins_left = int((1800 - (now - last_loss_ts)) / 60)
+                    return True, f"{MAX_CONSECUTIVE_LOSSES} stop loss consecutivi, pausa {mins_left}min"
 
         return False, ""
     except Exception as e:
