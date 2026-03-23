@@ -7098,6 +7098,84 @@ def btc_executor_loop(sz_dec, px_dec):
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
+                # ══════════════════════════════════════════════════
+                # POST-ENTRY VALIDATION (runs once, 90-120s after entry)
+                # ══════════════════════════════════════════════════
+                # Entri subito → dopo 1-2 candele validi se il setup è
+                # ancora valido. Se no → chiudi con loss minima.
+                # Meglio tagliare -0.03% che aspettare lo SL a -0.10%.
+                # ══════════════════════════════════════════════════
+                open_ts = last_pos_state.get("open_ts", 0)
+                validated = last_pos_state.get("post_validated", False)
+                time_in_trade = time.time() - open_ts if open_ts > 0 else 0
+
+                if not validated and time_in_trade >= 90 and time_in_trade < 300:
+                    # Run validation ONCE after 90s
+                    last_pos_state["post_validated"] = True
+                    save_pos_state(last_pos_state)
+
+                    cut_reason = ""
+                    try:
+                        # 1. Order flow: il flusso è ancora nella nostra direzione?
+                        flow_sig = get_flow_signal()
+                        flow_bias = flow_sig.get("bias", "NEUTRAL")
+                        flow_conf = flow_sig.get("confidence", 0)
+
+                        flow_against = (
+                            (d == "LONG" and flow_bias == "SELL" and flow_conf >= 4) or
+                            (d == "SHORT" and flow_bias == "BUY" and flow_conf >= 4)
+                        )
+
+                        # 2. Prezzo: si sta muovendo contro di noi?
+                        price_against = pnl_pct < -0.03  # -0.03% = il move non è partito
+
+                        # 3. Momentum: la candela corrente conferma?
+                        df_check = fetch_df("15m", 1)
+                        momentum_dead = False
+                        if df_check is not None and len(df_check) >= 3:
+                            rc = df_check.iloc[-1]
+                            rsi_now = float(rc['rsi'])
+                            macd_now = float(rc['macd_hist'])
+                            macd_prev = float(df_check.iloc[-2]['macd_hist'])
+
+                            if d == "LONG":
+                                # LONG: RSI dovrebbe salire, MACD accelerare
+                                momentum_dead = (macd_now < macd_prev and rsi_now < 45)
+                            else:
+                                # SHORT: RSI dovrebbe scendere, MACD decelerare
+                                momentum_dead = (macd_now > macd_prev and rsi_now > 55)
+
+                        # DECISIONE: cut se 2 su 3 condizioni sono negative
+                        negatives = sum([flow_against, price_against, momentum_dead])
+
+                        if negatives >= 2:
+                            cut_reason = (f"POST-VALIDATION FAIL ({negatives}/3): "
+                                         f"flow:{flow_bias}({flow_conf}) "
+                                         f"pnl:{pnl_pct:+.2f}% "
+                                         f"momentum:{'dead' if momentum_dead else 'ok'}")
+                        else:
+                            log_btc(f"✅ POST-VALIDATION OK ({negatives}/3 neg) — "
+                                   f"flow:{flow_bias} pnl:{pnl_pct:+.2f}% "
+                                   f"momentum:{'dead' if momentum_dead else 'alive'}")
+
+                    except Exception as e:
+                        log_btc(f"Post-validation error: {e}")
+
+                    # EARLY CUT: chiudi con IoC se validazione fallita
+                    if cut_reason:
+                        log_btc(f"✂️ EARLY CUT — {cut_reason}")
+                        try:
+                            size_abs = rpx(abs(szi), sz_dec)
+                            close_px = rpx(mid * (0.997 if d == "LONG" else 1.003), px_dec)
+                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
+                                 {"limit": {"tif": "Ioc"}}, False, timeout=15)
+                            last_pos_state["close_reason"] = f"✂️ {cut_reason}"
+                            save_pos_state(last_pos_state)
+                            tg(f"✂️ <b>BTC EARLY CUT</b>\n{cut_reason}\nPnL: {pnl_pct:+.2f}%")
+                        except Exception as e:
+                            log_btc(f"Early cut execution error: {e}")
+
+                # Normal management: trailing + partial
                 if atr_now > 0 and trade_mode == "TREND":
                     update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
                 if trade_mode == "TREND":
