@@ -1237,47 +1237,53 @@ def build_ml_features(rsi_15m, rsi_1h, macd_hist, adx_1h, vol_rel,
 
 def ml_predict_signal(features):
     """
-    Predict win probability per il segnale corrente.
-    Returns: (prob, adjustment_dict)
+    ML come filtro finale passivo — solo osservazione + scaling leggero.
+    
+    NON blocca mai. NON boosta mai.
+    Solo leggera riduzione size (-10% a -20%) se il modello è
+    abbastanza maturo E la probabilità è bassa.
+    
+    Il vero decision making è: backtest PF + setup score + tecnici.
+    ML è un tracker statistico che impara col tempo.
     """
     prob = _ml_model.predict_proba(features)
     acc = _ml_model.get_accuracy()
+    n = _ml_model.n_samples
 
-    # Solo applica ML se ha abbastanza dati E buona accuracy
-    if _ml_model.n_samples < 20 or acc < 0.52:
-        return prob, {"ml_active": False, "prob": prob, "reason": f"warmup ({_ml_model.n_samples} samples)"}
+    info = {
+        "ml_active": False,
+        "prob": round(prob, 3),
+        "acc": round(acc, 3),
+        "n_samples": n,
+        "action": "OBSERVE",
+        "size_mult": 1.0,
+    }
 
-    adjustments = {"ml_active": True, "prob": round(prob, 3), "acc": round(acc, 3)}
+    # Serve almeno 50 samples E accuracy > 55% per influenzare la size
+    if n >= 50 and acc >= 0.55:
+        info["ml_active"] = True
+        if prob < 0.35:
+            # Bassa probabilità → riduci size del 20% (mai blocca)
+            info["size_mult"] = 0.80
+            info["action"] = "SOFT_REDUCE"
+        elif prob < 0.45:
+            # Sotto media → riduci size del 10%
+            info["size_mult"] = 0.90
+            info["action"] = "SLIGHT_REDUCE"
+        else:
+            # Probabilità OK o alta → nessuna modifica (mai boosta)
+            info["action"] = "NEUTRAL"
+            info["size_mult"] = 1.0
 
-    # Signal filtering: blocca segnali con prob < 30%
-    if prob < 0.30:
-        adjustments["action"] = "BLOCK"
-        adjustments["reason"] = f"ML prob {prob:.0%} < 30%"
-    # Size reduction: prob 30-45% → size × 0.6
-    elif prob < 0.45:
-        adjustments["action"] = "REDUCE"
-        adjustments["size_mult"] = 0.6
-        adjustments["reason"] = f"ML prob {prob:.0%} → reduce size"
-    # Normal: prob 45-65%
-    elif prob < 0.65:
-        adjustments["action"] = "NORMAL"
-        adjustments["size_mult"] = 1.0
-    # Boost: prob > 65% → size × 1.2
-    else:
-        adjustments["action"] = "BOOST"
-        adjustments["size_mult"] = 1.2
-        adjustments["reason"] = f"ML prob {prob:.0%} → boost"
-
-    return prob, adjustments
+    return prob, info
 
 
 def ml_record_outcome(features, won):
     """Record trade outcome per aggiornare il modello online."""
     _ml_model.update(features, 1 if won else 0)
-    # Salva modello su Redis periodicamente
     if _ml_model.n_samples % 5 == 0:
         _rset("btc7:ml_model", _ml_model.to_dict())
-        log_btc(f"[ML] Model saved ({_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%})")
+        log_btc(f"[ML] Saved ({_ml_model.n_samples} samples, acc:{_ml_model.get_accuracy():.0%})")
 
 
 def ml_load_model():
@@ -2202,27 +2208,21 @@ def check_signal():
 
     ml_prob, ml_adj = ml_predict_signal(ml_features)
 
+    # ML come filtro finale passivo — solo size scaling leggero
     if ml_adj.get("ml_active"):
-        action = ml_adj.get("action", "NORMAL")
-        if action == "BLOCK":
-            # V7.3: ML non blocca mai — riduce size al minimo invece
-            size_mult *= 0.4
-            log_btc(f"🤖 [ML] LOW prob P(win)={ml_prob:.0%} → size×0.4 (was BLOCK)")
-            action = "REDUCE_HARD"
-        elif action == "REDUCE":
-            size_mult *= ml_adj.get("size_mult", 0.6)
-            log_btc(f"🤖 [ML] REDUCE — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
-        elif action == "BOOST":
-            size_mult = min(size_mult * ml_adj.get("size_mult", 1.2), 1.3)
-            log_btc(f"🤖 [ML] BOOST — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
+        ml_size = ml_adj.get("size_mult", 1.0)
+        size_mult *= ml_size
+        action = ml_adj.get("action", "OBSERVE")
+        if ml_size < 1.0:
+            log_btc(f"🤖 [ML] {action} P(win)={ml_prob:.0%} → size×{ml_size}")
         details += f" ML:{ml_prob:.0%}({action})"
     else:
-        details += f" ML:warmup"
+        details += f" ML:learning({ml_adj.get('n_samples',0)})"
 
-    # Store ML features in signal for later outcome recording
-    _last_ml_features = ml_features  # will be saved in pos_state
+    # Store ML features for later outcome recording
+    _last_ml_features = ml_features
 
-    size_mult = max(0.3, min(1.3, size_mult))
+    size_mult = max(0.3, min(1.2, size_mult))
 
     log_btc(f"[V7] Final: setup:{setup} size:{size_mult:.2f} sent:{sent_score} "
         f"flow:{flow_bias} ML:{ml_prob:.0%} | {details[-80:]}")
