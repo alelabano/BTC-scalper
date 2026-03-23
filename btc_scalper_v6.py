@@ -1833,10 +1833,9 @@ def is_signal_allowed(sig_type, direction):
     return True  # nel dubbio, permetti — il mercato cambia
 def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     """
-    Flow trigger adattivo al regime.
-    TREND_STRONG → CVD + OI (aggressivo, il trend protegge)
-    TREND        → CVD + OB > 0.52 (conferma book)
-    RANGE        → CVD + OB > 0.52 (serve conferma, CVD da solo è rumore)
+    Flow trigger a 2 livelli:
+    FLOW_STRONG → tutte le condizioni (CVD + OB > 0.58 + OI non unwind + RSI + vol)
+    FLOW_WEAK   → fallback controllato (CVD + OB > 0.52 + OI non in unwind)
     RANGE_LOW_VOL → None
     """
     cvd_data = flow_data.get("cvd_trend", {})
@@ -1844,27 +1843,34 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     oi_data = flow_data.get("oi_momentum", {})
 
     cvd = cvd_data.get("cvd", 0)
+    cvd_signal = cvd_data.get("signal", "NEUTRAL")
     ob = ob_data.get("imbalance_ratio", 0.5)
     oi = oi_data.get("oi_change_pct", 0)
+    oi_signal = oi_data.get("signal", "NEUTRAL")
 
     direction = None
+    sig_type = None
 
-    if regime == "TREND_STRONG":
-        if cvd > 0 and oi > 0 and allow_long:
-            direction = "LONG"
-        elif cvd < 0 and oi > 0 and allow_short:
-            direction = "SHORT"
+    # ── FLOW_STRONG: tutte le condizioni ──
+    if (allow_long and cvd > 0 and cvd_signal == "BUY" and
+        ob > 0.58 and oi_signal != "UNWIND" and oi > 0):
+        direction = "LONG"; sig_type = "FLOW_STRONG"
+    elif (allow_short and cvd < 0 and cvd_signal == "SELL" and
+          ob < 0.42 and oi_signal != "UNWIND" and oi > 0):
+        direction = "SHORT"; sig_type = "FLOW_STRONG"
 
-    elif regime in ("TREND", "RANGE"):
-        if cvd > 0 and ob > 0.52 and allow_long:
-            direction = "LONG"
-        elif cvd < 0 and ob < 0.48 and allow_short:
-            direction = "SHORT"
+    # ── FLOW_WEAK: fallback controllato ──
+    elif (allow_long and cvd > 0 and cvd_signal == "BUY" and
+          ob > 0.52 and oi_signal in ("BUILDING", "NEUTRAL", "CONVICTION")):
+        direction = "LONG"; sig_type = "FLOW_WEAK"
+    elif (allow_short and cvd < 0 and cvd_signal == "SELL" and
+          ob < 0.48 and oi_signal in ("BUILDING", "NEUTRAL", "CONVICTION")):
+        direction = "SHORT"; sig_type = "FLOW_WEAK"
 
     if direction:
-        details = f"CVD:{cvd:.1f} OI:{oi:+.1f}% OB:{ob:.0%} [{regime}]"
-        log_btc(f"⚡ FLOW {'BUY' if direction=='LONG' else 'SELL'} [{regime}] — {details}")
-        return {"direction": direction, "details": details}
+        details = f"CVD:{cvd:.1f}({cvd_signal}) OI:{oi:+.1f}%({oi_signal}) OB:{ob:.0%} [{regime}]"
+        log_btc(f"⚡ {sig_type} {'BUY' if direction=='LONG' else 'SELL'} — {details}")
+        return {"direction": direction, "sig_type": sig_type, "details": details}
 
     return None
 
@@ -1983,33 +1989,38 @@ def check_signal():
 
     if flow_sig:
         direction = flow_sig["direction"]
-        sig_type = "FLOW"
+        sig_type = flow_sig["sig_type"]  # FLOW_STRONG or FLOW_WEAK
         details = flow_sig["details"]
-        # Se tech conferma flow → FLOW+TECH (size piena)
         if tech_sig and tech_sig["direction"] == direction:
-            sig_type = "FLOW+TECH"
+            sig_type += "+TECH"
             details += f" +{tech_sig['type']}"
     elif tech_sig:
         direction = tech_sig["direction"]
         sig_type = tech_sig["type"]
         details = tech_sig["details"]
     else:
-        return None  # nessun trigger
+        return None
 
     # ══════════════════════════════════════════════════════════
-    # GERARCHIA DECISIONALE
-    # 1. TRIGGER (flow o tech) — già passato sopra
-    # 2. TREND (SOFT FILTER) — scala size, non blocca mai
-    # 3. ML (FILTRO FINALE) — blocca solo se ha dati E prob < 0.45
-    # 4. SENTIMENT (PESO) — scala size
+    # SIZE SCALING per signal quality
+    # FLOW_STRONG+TECH = 1.0x (massima conviction)
+    # FLOW_STRONG      = 1.0x
+    # FLOW_WEAK+TECH   = 0.8x
+    # FLOW_WEAK        = 0.7x
+    # PULLBACK (tech)  = 0.5x (no flow)
     # ══════════════════════════════════════════════════════════
 
     size_mult = 1.0
 
-    # Tech-only signals get reduced size (no flow confirmation)
-    if sig_type not in ("FLOW", "FLOW+TECH"):
-        size_mult *= 0.6
-        details += " (tech-only×0.6)"
+    if "FLOW_STRONG" in sig_type:
+        size_mult = 1.0
+    elif "FLOW_WEAK" in sig_type and "TECH" in sig_type:
+        size_mult = 0.8
+    elif "FLOW_WEAK" in sig_type:
+        size_mult = 0.7
+    else:
+        size_mult = 0.5  # tech-only
+        details += " (tech-only×0.5)"
 
     # ── 2. TREND: soft filter — mai blocca, scala size ──
     trend_dir = "UP" if ema9_1h > ema21_1h else "DOWN" if ema9_1h < ema21_1h else "FLAT"
