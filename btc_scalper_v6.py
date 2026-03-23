@@ -1813,9 +1813,10 @@ def run_backtest():
 
 def is_signal_allowed(sig_type, direction):
     """
-    Check if signal has edge. Usa pf_recent (ultimi 30 trade) come filtro primario
-    — reagisce al mercato attuale, non a 30gg fa.
-    Blocca solo se ENTRAMBI pf E pf_recent sono sotto soglia.
+    Check if signal has edge from backtest.
+    V7.3: soglie rilassate — il backtest è informativo, non bloccante.
+    Il setup score + size scaling gestiscono la qualità.
+    Blocca SOLO segnali chiaramente perdenti (PF < 0.5 su entrambi).
     """
     key = f"{sig_type}_{direction}"
     bt = _btc_bt_results.get(key, {})
@@ -1824,16 +1825,16 @@ def is_signal_allowed(sig_type, direction):
     n = bt.get("n", 0)
     if n < 10:
         return True  # not enough data — allow
-    # Passa se il recent mostra edge, anche se lo storico è debole
-    if pf_recent >= 0.9:
+    # Passa se il recent mostra qualsiasi edge
+    if pf_recent >= 0.7:
         return True
-    # Blocca solo se entrambi sono sotto soglia
-    if pf < 0.7 and pf_recent < 0.7:
+    # Blocca solo se ENTRAMBI sono chiaramente perdenti
+    if pf < 0.5 and pf_recent < 0.5:
         return False
-    # Edge debole ma non assente
-    if pf >= 0.8 or pf_recent >= 0.8:
+    # Edge debole — permetti ma il setup score + ML scaleranno la size
+    if pf >= 0.6 or pf_recent >= 0.6:
         return True
-    return False
+    return True  # nel dubbio, permetti — il mercato cambia
 def check_signal():
     """
     Returns: (direction, signal_type, sl, tp, entry_px, atr, details) or None
@@ -2099,7 +2100,7 @@ def check_signal():
     ema200_1h = float(h.get('ema200', px))
     setup = btc_compute_setup_score(direction, px, ema50_1h, ema200_1h,
                                 rsi5, ai_confidence, fz, liq)
-    if setup < 40:
+    if setup < 30:
         log_btc(f"⚠️ Setup score {setup}/100 — troppo basso")
         return None
 
@@ -2166,21 +2167,21 @@ def check_signal():
     else:
         details += f" flow:NEUTRAL"
 
-    # Delta divergence: high-priority reversal signal
+    # Delta divergence: soft warning — reduce size, don't kill signal
     flow_data = _flow_cache.get("data", {})
     div = flow_data.get("delta_divergence", {})
     if div.get("divergence"):
         if (div["type"] == "BEARISH" and direction == "LONG"):
-            setup -= 20
-            details += " ⚠️DIV:BEAR"
-            log_btc(f"⚠️ Bearish divergence detected — LONG penalized")
+            size_mult *= 0.75
+            details += " ⚠️DIV:BEAR(size×0.75)"
+            log_btc(f"⚠️ Bearish divergence — LONG size reduced")
         elif (div["type"] == "BULLISH" and direction == "SHORT"):
-            setup -= 20
-            details += " ⚠️DIV:BULL"
-            log_btc(f"⚠️ Bullish divergence detected — SHORT penalized")
+            size_mult *= 0.75
+            details += " ⚠️DIV:BULL(size×0.75)"
+            log_btc(f"⚠️ Bullish divergence — SHORT size reduced")
 
     # Re-check setup after adjustments
-    if setup < 35:
+    if setup < 25:
         log_btc(f"⚠️ Setup score {setup}/100 dopo analytics layer — troppo basso")
         return None
 
@@ -2204,8 +2205,10 @@ def check_signal():
     if ml_adj.get("ml_active"):
         action = ml_adj.get("action", "NORMAL")
         if action == "BLOCK":
-            log_btc(f"🤖 [ML] BLOCKED — P(win)={ml_prob:.0%} | {ml_adj.get('reason','')}")
-            return None
+            # V7.3: ML non blocca mai — riduce size al minimo invece
+            size_mult *= 0.4
+            log_btc(f"🤖 [ML] LOW prob P(win)={ml_prob:.0%} → size×0.4 (was BLOCK)")
+            action = "REDUCE_HARD"
         elif action == "REDUCE":
             size_mult *= ml_adj.get("size_mult", 0.6)
             log_btc(f"🤖 [ML] REDUCE — P(win)={ml_prob:.0%} size_mult→{size_mult:.2f}")
