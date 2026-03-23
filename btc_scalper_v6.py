@@ -1253,12 +1253,14 @@ def compute_hourly_bias():
         bias = "LONG_ONLY"; reason = f"1h UPTREND ({short_momentum_1h:+.2%})"
     elif sentiment < 25:
         bias = "LONG_ONLY"; reason = f"EXTREME FEAR ({sentiment})"
-    elif _btc_regime == "BEAR":
-        bias = "SHORT_ONLY" if fz > -0.5 else "NEUTRAL"
-        reason = f"BEAR REGIME + FZ:{fz:+.1f}"
-    elif _btc_regime == "BULL":
-        bias = "LONG_ONLY" if short_momentum_1h >= -0.0005 else "NEUTRAL"
-        reason = f"BULL REGIME + Mom:{short_momentum_1h:+.2%}"
+    elif _btc_regime == "RANGE_LOW_VOL":
+        bias = "NEUTRAL"; reason = f"LOW VOL — no trade"
+    elif _btc_regime in ("TREND", "TREND_STRONG"):
+        trend_up = ema9_1h > ema21_1h if 'ema9_1h' in dir() else short_momentum_1h > 0
+        if trend_up:
+            bias = "LONG_ONLY"; reason = f"TREND regime + up"
+        else:
+            bias = "SHORT_ONLY"; reason = f"TREND regime + down"
     else:
         bias = "NEUTRAL"; reason = f"RANGE (F&G:{sentiment})"
 
@@ -1542,27 +1544,45 @@ _btc_regime = "RANGE"
 _btc_regime_ts = 0
 
 def update_regime():
+    """
+    4-state regime detection basato su ADX + ATR relativo.
+    
+    RANGE_LOW_VOL: ADX < 18 + ATR sotto media → NO TRADE (spread mangia TP)
+    RANGE:         ADX < 22 → mean reversion, entrambe direzioni
+    TREND:         ADX >= 22 → momentum, segui EMA direction
+    TREND_STRONG:  ADX >= 22 + ATR sopra media → trend forte, size piena
+    """
     global _btc_regime, _btc_regime_ts
     if time.time() - _btc_regime_ts < BTC_REGIME_INTERVAL:
         return _btc_regime
 
     df = fetch_df("4h", 90)
-    if df is None or len(df) < 200:
+    if df is None or len(df) < 60:
         return _btc_regime
 
     r = df.iloc[-1]
-    px = float(r['close'])
-    e50 = float(r['ema50']); e200 = float(r['ema200'])
-    rsi = float(r['rsi']); macd = float(r['macd_hist'])
+    adx = float(r.get('adx', 20))
+    atr = float(r.get('atr', 0))
 
-    if px > e50 > e200 and rsi > 50:
-        _btc_regime = "BULL"
-    elif px < e50 < e200 and rsi < 50:
-        _btc_regime = "BEAR"
-    else:
+    # ATR medio su 50 candele (12.5 giorni su 4h)
+    atr_series = df['atr'].astype(float)
+    atr_mean = float(atr_series.rolling(50, min_periods=20).mean().iloc[-1])
+
+    low_vol = atr < atr_mean * 0.8  if atr_mean > 0 else False
+    high_vol = atr > atr_mean * 1.2 if atr_mean > 0 else False
+
+    if adx < 18 and low_vol:
+        _btc_regime = "RANGE_LOW_VOL"
+    elif adx < 22:
         _btc_regime = "RANGE"
+    elif adx >= 22 and high_vol:
+        _btc_regime = "TREND_STRONG"
+    else:
+        _btc_regime = "TREND"
 
     _btc_regime_ts = time.time()
+    log_btc(f"Regime: {_btc_regime} (ADX:{adx:.0f} ATR:{atr:.0f} mean:{atr_mean:.0f} "
+            f"{'LOW_VOL' if low_vol else 'HIGH_VOL' if high_vol else 'NORMAL'})")
     return _btc_regime
 
 # ================================================================
@@ -1811,39 +1831,52 @@ def is_signal_allowed(sig_type, direction):
     if pf >= 0.6 or pf_recent >= 0.6:
         return True
     return True  # nel dubbio, permetti — il mercato cambia
-def flow_trigger(flow_data, allow_long=True, allow_short=True):
+def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     """
-    Unico trigger di trade. Entry SOLO su accelerazione reale.
-    Returns: {"direction": "LONG"|"SHORT", "details": str} o None
+    Flow trigger adattivo al regime.
+    TREND_STRONG → aggressivo (CVD + OI bastano)
+    TREND        → medio (CVD + OB conferma)
+    RANGE        → leggero (solo CVD — qui nasce il profitto)
+    RANGE_LOW_VOL → None (non tradare)
     """
     cvd_data = flow_data.get("cvd_trend", {})
     ob_data = flow_data.get("ob_delta", {})
     oi_data = flow_data.get("oi_momentum", {})
 
     cvd = cvd_data.get("cvd", 0)
-    cvd_slope = cvd_data.get("cvd_slope", 0)
     ob = ob_data.get("imbalance_ratio", 0.5)
     oi = oi_data.get("oi_change_pct", 0)
 
-    cvd_prev = cvd - cvd_slope if cvd_slope != 0 else cvd * 0.8
+    direction = None
 
-    # BUY: CVD positivo + accelera >20% + OI cresce + OB bid-heavy
-    if (allow_long and
-        cvd > 0 and oi > 0 and ob > 0.55 and
-        abs(cvd_prev) > 0.1 and cvd > cvd_prev * 1.2):
-        accel = cvd / max(abs(cvd_prev), 0.01) * 100 - 100
-        details = f"CVD:{cvd:.1f}(+{accel:.0f}%) OI:+{oi:.1f}% OB:{ob:.0%}"
-        log_btc(f"⚡ FLOW BUY — {details}")
-        return {"direction": "LONG", "details": details}
+    # TREND_STRONG → aggressivo: CVD + OI bastano
+    if regime == "TREND_STRONG":
+        if cvd > 0 and oi > 0 and allow_long:
+            direction = "LONG"
+        elif cvd < 0 and oi > 0 and allow_short:
+            direction = "SHORT"
 
-    # SELL: CVD negativo + accelera >20% + OI cresce + OB ask-heavy
-    if (allow_short and
-        cvd < 0 and oi > 0 and ob < 0.45 and
-        abs(cvd_prev) > 0.1 and abs(cvd) > abs(cvd_prev) * 1.2):
-        accel = abs(cvd) / max(abs(cvd_prev), 0.01) * 100 - 100
-        details = f"CVD:{cvd:.1f}(+{accel:.0f}%) OI:+{oi:.1f}% OB:{ob:.0%}"
-        log_btc(f"⚡ FLOW SELL — {details}")
-        return {"direction": "SHORT", "details": details}
+    # TREND → medio: CVD + OB conferma
+    elif regime == "TREND":
+        if cvd > 0 and ob > 0.52 and allow_long:
+            direction = "LONG"
+        elif cvd < 0 and ob < 0.48 and allow_short:
+            direction = "SHORT"
+
+    # RANGE → leggero: solo CVD direzionale
+    elif regime == "RANGE":
+        if cvd > 0 and allow_long:
+            direction = "LONG"
+        elif cvd < 0 and allow_short:
+            direction = "SHORT"
+
+    # RANGE_LOW_VOL → non tradare
+    # (già gestito nel check_signal, ma safety net)
+
+    if direction:
+        details = f"CVD:{cvd:.1f} OI:{oi:+.1f}% OB:{ob:.0%} [{regime}]"
+        log_btc(f"⚡ FLOW {'BUY' if direction=='LONG' else 'SELL'} [{regime}] — {details}")
+        return {"direction": direction, "details": details}
 
     return None
 
@@ -1913,11 +1946,22 @@ def check_signal():
     sig_type = None
     details = ""
 
-    allow_long = (regime in ("BULL", "RANGE") or scalp_mode == "RANGE")
-    allow_short = (regime in ("BEAR", "RANGE") or scalp_mode == "RANGE")
+    # RANGE_LOW_VOL: non tradare — spread mangia il TP
+    if regime == "RANGE_LOW_VOL":
+        return None
+
+    # Direzioni permesse in base al regime
+    # RANGE/TREND: entrambe. TREND_STRONG: segui trend (EMA direction)
+    if regime == "TREND_STRONG":
+        trend_up = ema9_1h > ema21_1h
+        allow_long = trend_up
+        allow_short = not trend_up
+    else:
+        allow_long = True
+        allow_short = True
 
     # ── FLOW TRIGGER: unico gate ──
-    flow_sig = flow_trigger(_flow_cache.get("data", {}), allow_long, allow_short)
+    flow_sig = flow_trigger(_flow_cache.get("data", {}), regime, allow_long, allow_short)
     if not flow_sig:
         return None  # NO FLOW = NO TRADE
 
@@ -1925,63 +1969,77 @@ def check_signal():
     sig_type = "FLOW"
     details = flow_sig["details"]
 
-    # ── AI CONTEXT ANALYSIS (async — non blocca il calcolo SL/TP) ──
-    ai_future = None
-    try:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if api_key:
-            ohlcv_str = ""
-            for _, row in df_15m.iloc[-6:][['close','high','low','volume']].iterrows():
-                ohlcv_str += f"C:{row['close']:.1f} H:{row['high']:.1f} L:{row['low']:.1f} V:{row['volume']:.0f}\n"
+    # ══════════════════════════════════════════════════════════
+    # GERARCHIA DECISIONALE — pulita, 4 livelli
+    # 1. FLOW (MASTER) — già passato sopra
+    # 2. TREND (SOFT FILTER) — scala size, non blocca mai
+    # 3. ML (FILTRO FINALE) — blocca solo se ha dati E prob < 0.45
+    # 4. SENTIMENT (PESO) — scala size
+    # ══════════════════════════════════════════════════════════
 
-            mode_ctx = {
-                "RANGE": "Mean reversion scalp. TP fisso 0.4%, SL stretto. Cerchiamo rimbalzo su supporto/resistenza.",
-                "TREND": "Momentum pullback. TP con trailing, R:R 1:2. Cerchiamo continuazione del trend.",
-                "FLASH": "Volatility breakout. TP fulmineo 0.3%, entry/exit veloci. Volume spike o funding estremo.",
-            }.get(scalp_mode, "")
+    size_mult = 1.0
 
-            prompt = (f"BTC {direction} {sig_type} signal. Mode:{scalp_mode}. Regime:{regime}.\n"
-                     f"Strategy: {mode_ctx}\n"
-                     f"RSI15m:{rsi5:.0f} RSI1h:{rsi1h:.0f} ADX1h:{adx1h:.0f} MACD15m:{macd5:.1f} Vol:{vol5:.1f}x BB:{bb5:.2f}\n"
-                     f"Last 6 candles 15m:\n{ohlcv_str}"
-                     f"Rate confidence 1-10. In {scalp_mode} mode, "
-                     f"{'suggest tight SL for quick scalp' if scalp_mode in ('RANGE','FLASH') else 'suggest SL adjustment (tight/normal/wide)'}.\n"
-                     f"JSON only: {{\"confidence\":<1-10>,\"sl\":\"tight|normal|wide\",\"note\":\"<5 words>\"}}")
+    # ── 2. TREND: soft filter — mai blocca, scala size ──
+    trend_dir = "UP" if ema9_1h > ema21_1h else "DOWN" if ema9_1h < ema21_1h else "FLAT"
+    if trend_dir == "DOWN" and direction == "LONG":
+        size_mult *= 0.5
+        details += f" trend:DOWN→LONG(×0.5)"
+    elif trend_dir == "UP" and direction == "SHORT":
+        size_mult *= 0.5
+        details += f" trend:UP→SHORT(×0.5)"
+    elif (trend_dir == "UP" and direction == "LONG") or \
+         (trend_dir == "DOWN" and direction == "SHORT"):
+        details += f" trend:aligned"
+    else:
+        details += f" trend:FLAT"
 
-            def _ai_call():
-                r = requests.post("https://api.anthropic.com/v1/messages",
-                    headers={"Content-Type": "application/json", "x-api-key": api_key,
-                             "anthropic-version": "2023-06-01"},
-                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150,
-                          "messages": [{"role": "user", "content": prompt}]}, timeout=10)
-                return r
-            ai_future = _pool.submit(_ai_call)
-    except: pass
+    # ── 3. ML: filtro finale — blocca SOLO se ha dati sufficienti ──
+    sent_score = get_sentiment_score()
+    liq = fetch_liquidity()
+    ob_imbalance = liq.get("imbalance", 0.5)
+    spread_val = liq.get("spread", 0.0005) or 0.0005
+    flow_data_ml = _flow_cache.get("data", {})
+    cvd_data_ml = flow_data_ml.get("cvd_trend", {})
+    oi_data_ml = flow_data_ml.get("oi_momentum", {})
 
-    # ── SL / TP (calcolati MENTRE l'AI risponde) ──
-    ai_confidence = 7
+    ml_features = build_ml_features(
+        rsi_15m=rsi5, rsi_1h=rsi1h, macd_hist=macd5, adx_1h=adx1h,
+        vol_rel=vol5, funding_z=fz, sentiment=sent_score,
+        ob_imbalance=ob_imbalance, cvd_slope=cvd_data_ml.get("cvd_slope", 0),
+        regime=regime, scalp_mode=scalp_mode, setup_score=50,
+        oi_change_pct=oi_data_ml.get("oi_change_pct", 0),
+        bb_pos=bb5, ema_slope=slope5, spread=spread_val
+    )
+
+    ml_prob, ml_adj = ml_predict_signal(ml_features)
+    if ml_adj.get("ml_active") and ml_prob < 0.45:
+        log_btc(f"🤖 ML block: P(win)={ml_prob:.0%} < 45% — skip")
+        return None
+    details += f" ML:{ml_prob:.0%}"
+
+    # ── 4. SENTIMENT: peso — mai blocca ──
+    if sent_score < 30 and direction == "LONG":
+        size_mult *= 0.7
+        details += f" sent:{sent_score}→LONG(×0.7)"
+    elif sent_score > 70 and direction == "SHORT":
+        size_mult *= 0.7
+        details += f" sent:{sent_score}→SHORT(×0.7)"
+    else:
+        details += f" sent:{sent_score}"
+
+    # Spread check — unico hard kill rimasto
+    if liq.get("spread") is not None and liq["spread"] > 0.001:
+        log_btc(f"⚠️ Spread {liq['spread']:.4%} > 0.1% — skip")
+        return None
+
+    size_mult = max(0.3, min(1.2, size_mult))
+    details += f" size:{size_mult:.2f}"
+
+    log_btc(f"[SIGNAL] {direction} {sig_type} | {details}")
+
+    # ── SL / TP — MODE ADAPTIVE ──
+    ai_confidence = 7  # default, no AI call overhead
     ai_sl_adj = 1.0
-    ai_note = ""
-
-    # Collect AI result (max 8s wait — se non risponde, defaults)
-    if ai_future:
-        try:
-            resp = ai_future.result(timeout=8)
-            if resp.status_code == 200:
-                txt = resp.json()["content"][0]["text"]
-                start = txt.find("{"); end = txt.rfind("}")+1
-                if start >= 0 and end > start:
-                    aj = json.loads(txt[start:end])
-                    ai_confidence = min(10, max(1, int(aj.get("confidence", 7))))
-                    sl_sug = aj.get("sl", "normal")
-                    if sl_sug == "tight": ai_sl_adj = 0.85
-                    elif sl_sug == "wide": ai_sl_adj = 1.2
-                    ai_note = aj.get("note", "")
-        except: pass
-
-    details += f" | AI:{ai_confidence}/10 {ai_note}"
-
-    # ── Funding z-score e OI (already called for mode detect) ──
     update_funding_oi()
     oi_chg = get_oi_change()
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
@@ -2049,151 +2107,10 @@ def check_signal():
 
     # Confidence sizing: AI confidence 1-10 → size multiplier 0.5-1.0
     size_mult = 0.5 + (ai_confidence - 1) * 0.055  # 1→0.5, 5→0.72, 10→1.0
-    size_mult = max(0.5, min(1.0, size_mult))
+    # (AI confidence sizing removed — flow trigger is the confidence)
+    # size_mult already set by 4-step hierarchy above
 
-    # ── FLOW TRIGGER ADJUSTMENTS ──
-    # Flow signals have no technical confirmation → tighter risk management
-    if sig_type == "FLOW":
-        sl_dist *= 0.7           # SL 30% più stretto
-        tp_dist = sl_dist * 1.5  # R:R minimo 1:1.5
-        size_mult *= 0.7         # size ridotta (no conferma tecnica)
-        # Ricalcola SL/TP
-        if direction == "LONG":
-            sl = px - sl_dist; tp = px + tp_dist
-        else:
-            sl = px + sl_dist; tp = px - tp_dist
-        log_btc(f"[FLOW] SL stretto ×0.7, size ×0.7, R:R 1:1.5")
-
-    # ── LIQUIDITY CHECK + SETUP SCORE ──
-    liq = fetch_liquidity()
-    if liq.get("spread") is not None and liq["spread"] > 0.001:
-        log_btc(f"⚠️ Spread troppo alto: {liq['spread']:.4%} — skip")
-        return None
-
-    ema50_1h = float(h.get('ema50', px))
-    ema200_1h = float(h.get('ema200', px))
-    setup = btc_compute_setup_score(direction, px, ema50_1h, ema200_1h,
-                                rsi5, ai_confidence, fz, liq)
-    if setup < 30:
-        log_btc(f"⚠️ Setup score {setup}/100 — troppo basso")
-        return None
-
-    details += f" score:{setup}"
-    liq_str = ""
-    if liq.get("spread") is not None:
-        liq_str = f" spread:{liq['spread']:.3%} imb:{liq['imbalance']:.0%}"
-        details += liq_str
-
-    # ══════════════════════════════════════════════════════════
-    # V7 PREDICTIVE ANALYTICS LAYER
-    # ══════════════════════════════════════════════════════════
-
-    # ── SENTIMENT ADJUSTMENT ──
-    sent_score = get_sentiment_score()
-    sent_size_adj, sent_sl_adj, sent_conf_adj = get_sentiment_adjustment()
-    sent_bias, _ = get_sentiment_bias()
-
-    # Contrarian filter: se extreme greed e stiamo andando long → penalizza
-    if sent_bias == "EXTREME_GREED" and direction == "LONG":
-        setup -= 15
-        details += f" ⚠️sent:GREED→LONG penalized"
-    elif sent_bias == "EXTREME_FEAR" and direction == "SHORT":
-        setup -= 15
-        details += f" ⚠️sent:FEAR→SHORT penalized"
-    # Contrarian boost: extreme fear + long o extreme greed + short
-    elif sent_bias == "EXTREME_FEAR" and direction == "LONG":
-        setup += 10
-        details += f" ✦sent:contrarian LONG"
-    elif sent_bias == "EXTREME_GREED" and direction == "SHORT":
-        setup += 10
-        details += f" ✦sent:contrarian SHORT"
-
-    # Apply sentiment adjustments
-    size_mult *= sent_size_adj
-    sl_dist *= sent_sl_adj
-    # Ricalcola SL/TP se sentiment ha modificato sl_dist
-    if sent_sl_adj != 1.0:
-        if direction == "LONG":
-            sl = px - sl_dist
-        else:
-            sl = px + sl_dist
-    details += f" sent:{sent_score}"
-
-    # ── ORDER FLOW CONFIRMATION ──
-    flow_sig = get_flow_signal()
-    flow_bias = flow_sig["bias"]
-    flow_conf = flow_sig["confidence"]
-
-    # Flow conferma la direzione → boost
-    if (flow_bias == "BUY" and direction == "LONG") or \
-       (flow_bias == "SELL" and direction == "SHORT"):
-        setup += 5 + flow_conf
-        size_mult = min(size_mult * 1.1, 1.2)
-        details += f" ✦flow:{flow_bias}({flow_conf})"
-    # Flow contraddice la direzione → penalizza
-    elif (flow_bias == "SELL" and direction == "LONG") or \
-         (flow_bias == "BUY" and direction == "SHORT"):
-        setup -= 5 + flow_conf
-        if flow_conf >= 6:
-            log_btc(f"⚠️ Flow {flow_bias} vs {direction} (conf:{flow_conf}) — signal weakened")
-            size_mult *= 0.7
-        details += f" ⚠️flow:{flow_bias}({flow_conf})vs{direction}"
-    else:
-        details += f" flow:NEUTRAL"
-
-    # Delta divergence: soft warning — reduce size, don't kill signal
-    flow_data = _flow_cache.get("data", {})
-    div = flow_data.get("delta_divergence", {})
-    if div.get("divergence"):
-        if (div["type"] == "BEARISH" and direction == "LONG"):
-            size_mult *= 0.75
-            details += " ⚠️DIV:BEAR(size×0.75)"
-            log_btc(f"⚠️ Bearish divergence — LONG size reduced")
-        elif (div["type"] == "BULLISH" and direction == "SHORT"):
-            size_mult *= 0.75
-            details += " ⚠️DIV:BULL(size×0.75)"
-            log_btc(f"⚠️ Bullish divergence — SHORT size reduced")
-
-    # Re-check setup after adjustments
-    if setup < 25:
-        log_btc(f"⚠️ Setup score {setup}/100 dopo analytics layer — troppo basso")
-        return None
-
-    # ── MACHINE LEARNING PREDICTION ──
-    ob_imbalance = liq.get("imbalance", 0.5)
-    cvd_data = flow_data.get("cvd_trend", {})
-    oi_data = flow_data.get("oi_momentum", {})
-    spread_val = liq.get("spread", 0.0005) or 0.0005
-
-    ml_features = build_ml_features(
-        rsi_15m=rsi5, rsi_1h=rsi1h, macd_hist=macd5, adx_1h=adx1h,
-        vol_rel=vol5, funding_z=fz, sentiment=sent_score,
-        ob_imbalance=ob_imbalance, cvd_slope=cvd_data.get("cvd_slope", 0),
-        regime=regime, scalp_mode=scalp_mode, setup_score=setup,
-        oi_change_pct=oi_data.get("oi_change_pct", 0),
-        bb_pos=bb5, ema_slope=slope5, spread=spread_val
-    )
-
-    ml_prob, ml_adj = ml_predict_signal(ml_features)
-
-    # ML come filtro finale passivo — solo size scaling leggero
-    if ml_adj.get("ml_active"):
-        ml_size = ml_adj.get("size_mult", 1.0)
-        size_mult *= ml_size
-        action = ml_adj.get("action", "OBSERVE")
-        if ml_size < 1.0:
-            log_btc(f"🤖 [ML] {action} P(win)={ml_prob:.0%} → size×{ml_size}")
-        details += f" ML:{ml_prob:.0%}({action})"
-    else:
-        details += f" ML:learning({ml_adj.get('n_samples',0)})"
-
-    # Store ML features for later outcome recording
     _last_ml_features = ml_features
-
-    size_mult = max(0.3, min(1.2, size_mult))
-
-    log_btc(f"[V7] Final: setup:{setup} size:{size_mult:.2f} sent:{sent_score} "
-        f"flow:{flow_bias} ML:{ml_prob:.0%} | {details[-80:]}")
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
             size_mult, regime, setup, scalp_mode, ml_features)
