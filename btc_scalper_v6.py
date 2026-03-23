@@ -1734,27 +1734,56 @@ def run_backtest():
     ]:
         trades = []
         i = 200
-        while i < n - fwd:
+        while i < n - fwd - 5:  # -5 per spazio delay
             try:
                 if not sig_cond(i):
                     i += 1; continue
             except:
                 i += 1; continue
 
-            px_i = c[i]; atr_i = atr5[i]
+            atr_i = atr5[i]
             if atr_i <= 0: i += 1; continue
+
+            # ══════════════════════════════════════════════════════
+            # REALISTIC EXECUTION MODEL
+            # ══════════════════════════════════════════════════════
+
+            # 1. ENTRY DELAY: 2-3 barre dopo il segnale (tempo di elaborazione)
+            #    Il bot vede il segnale alla chiusura di candela i,
+            #    processa per ~30s, entra alla candela i+2 o i+3.
+            #    Usiamo un delay random tra 2 e 3 barre.
+            delay = 2 + (i % 2)  # alternato 2 e 3 per simulare variabilità
+            entry_bar = i + delay
+            if entry_bar >= n - fwd:
+                i += fwd; continue
+
+            # 2. ENTRY IMPERFETTA: non al close, ma nell'intervallo della candela
+            #    Simuliamo entry al midpoint open-close della candela di entry
+            #    (a volte prendi un prezzo migliore, a volte peggiore)
+            entry_open = merged['open'].values[entry_bar] if 'open' in merged.columns else c[entry_bar]
+            entry_close = c[entry_bar]
+            entry_mid = (float(entry_open) + float(entry_close)) / 2
+
+            # 3. SLIPPAGE DINAMICO: basato su volatilità della candela di entry
+            #    Range della candela / prezzo = slippage naturale
+            bar_range = h[entry_bar] - l[entry_bar]
+            slippage_pct = min(bar_range / (entry_mid + 1e-10) * 0.3, 0.003)  # max 0.3%
+            # Slippage sempre sfavorevole
+            if sig_dir == "LONG":
+                px_entry = entry_mid * (1 + slippage_pct)  # compri più alto
+            else:
+                px_entry = entry_mid * (1 - slippage_pct)  # vendi più basso
 
             # ── Detect mode per questa candela ──
             adx_i = adx1h[i] if not np.isnan(adx1h[i]) else 20
             vol_i = vol5[i]
-            bb_i = bb[i] if not np.isnan(bb[i]) else 0
             e9 = ema9_1h[i]; e21 = ema21_1h[i]
-            is_trend = (e9 > e21) or (e9 < e21)  # direzionale
+            is_trend = (e9 > e21) or (e9 < e21)
 
             if vol_i >= 3.0:
                 m_sl_atr, m_sl_min, m_sl_max = FLASH_SL_ATR, FLASH_SL_MIN, FLASH_SL_MAX
                 m_tp_fixed = FLASH_TP_PCT
-                m_tp_rr = 0  # usa tp_fixed
+                m_tp_rr = 0
             elif adx_i > 25 and is_trend:
                 m_sl_atr, m_sl_min, m_sl_max = TREND_SL_ATR, TREND_SL_MIN, TREND_SL_MAX
                 m_tp_fixed = 0
@@ -1762,33 +1791,49 @@ def run_backtest():
             else:
                 m_sl_atr, m_sl_min, m_sl_max = RANGE_SL_ATR, RANGE_SL_MIN, RANGE_SL_MAX
                 m_tp_fixed = RANGE_TP_PCT
-                m_tp_rr = 0  # usa tp_fixed
+                m_tp_rr = 0
 
-            sl_d = max(atr_i * m_sl_atr, px_i * m_sl_min)
-            sl_d = min(sl_d, px_i * m_sl_max)
+            sl_d = max(atr_i * m_sl_atr, px_entry * m_sl_min)
+            sl_d = min(sl_d, px_entry * m_sl_max)
             if m_tp_fixed > 0:
-                tp_d = px_i * m_tp_fixed
+                tp_d = px_entry * m_tp_fixed
             else:
                 tp_d = sl_d * m_tp_rr
-            tp_d = max(tp_d, px_i * TP_PRICE_PCT * 0.8)  # floor
+            tp_d = max(tp_d, px_entry * TP_PRICE_PCT * 0.8)
+
+            # 4. TP/SL CHECK: da entry_bar+1 in poi (non dalla candela segnale)
+            check_start = entry_bar + 1
+            check_end = min(entry_bar + fwd, n)
+
+            if check_start >= check_end:
+                i += fwd; continue
 
             if sig_dir == "LONG":
-                tp_hits = np.where(h[i+1:i+fwd] >= px_i + tp_d)[0]
-                sl_hits = np.where(l[i+1:i+fwd] <= px_i - sl_d)[0]
+                tp_hits = np.where(h[check_start:check_end] >= px_entry + tp_d)[0]
+                sl_hits = np.where(l[check_start:check_end] <= px_entry - sl_d)[0]
             else:
-                tp_hits = np.where(l[i+1:i+fwd] <= px_i - tp_d)[0]
-                sl_hits = np.where(h[i+1:i+fwd] >= px_i + sl_d)[0]
+                tp_hits = np.where(l[check_start:check_end] <= px_entry - tp_d)[0]
+                sl_hits = np.where(h[check_start:check_end] >= px_entry + sl_d)[0]
 
             tp_f = tp_hits[0]+1 if len(tp_hits) else fwd+1
             sl_f = sl_hits[0]+1 if len(sl_hits) else fwd+1
 
             if tp_f == sl_f == fwd+1:
-                i += fwd; continue  # skip forward to avoid overlap
+                i += fwd; continue
 
-            win = 1 if tp_f < sl_f and tp_f != sl_f else 0
-            ret = (tp_d/px_i) if win else (-sl_d/px_i)
-            trades.append((win, ret, tp_d if win else 0, sl_d if not win else 0))
-            i += max(tp_f, sl_f, 3)  # skip past this trade
+            # 5. EXIT SLIPPAGE: SL exit ha slippage extra (market order sotto pressione)
+            win = 1 if tp_f < sl_f else 0
+            if win:
+                # TP hit — slippage minima (prezzo favorevole)
+                net_gain = tp_d * 0.95  # 5% haircut per slippage su TP
+                ret = net_gain / px_entry
+            else:
+                # SL hit — slippage peggiore (market order in panico)
+                net_loss = sl_d * 1.10  # 10% extra loss per slippage su SL
+                ret = -net_loss / px_entry
+
+            trades.append((win, ret, tp_d * 0.95 if win else 0, sl_d * 1.10 if not win else 0))
+            i += max(entry_bar - i + max(tp_f, sl_f), 4)  # skip past trade
 
         nt = len(trades)
         if nt >= 5:
