@@ -807,7 +807,14 @@ def get_sentiment_adjustment():
 _cvd_buffer = deque(maxlen=120)   # 120 readings (one per scan = ~20min window)
 _oi_momentum = deque(maxlen=30)   # 30 OI readings for momentum
 _flow_cache = {"ts": 0, "data": {}}
-FLOW_CACHE_TTL = 15  # aggiorna ogni 15s
+FLOW_CACHE_TTL = 60  # aggiorna ogni 15s
+
+# ── Shared API caches (reduce Hyperliquid rate limit pressure) ──
+_mid_cache = {"ts": 0, "value": 0}
+_pos_cache = {"ts": 0, "value": None}
+_bal_cache = {"ts": 0, "value": 0}
+API_CACHE_TTL = 3  # 3s cache for mid/pos/bal — fresh enough for scalping
+
 
 def get_btc_open_interest():
     """Returns current BTC open interest in USD notional."""
@@ -2398,25 +2405,27 @@ def get_max_leverage():
     return _btc_coin_meta.get("max_lev", 50)
 
 def get_position():
+    global _pos_cache
+    if time.time() - _pos_cache["ts"] < API_CACHE_TTL:
+        return _pos_cache["value"]
     try:
         s = call(_info.user_state, _account.address, timeout=15)
         for p in s.get("assetPositions", []):
             pp = p["position"]
             if pp["coin"] == BTC_COIN and float(pp["szi"]) != 0:
-                return {
+                result = {
                     "szi": float(pp["szi"]),
                     "entry": float(pp.get("entryPx", 0)),
                     "lev": int(pp.get("leverage", {}).get("value", BTC_LEVERAGE))
                             if isinstance(pp.get("leverage"), dict) else BTC_LEVERAGE
                 }
+                _pos_cache = {"ts": time.time(), "value": result}
+                return result
+        _pos_cache = {"ts": time.time(), "value": None}
     except: pass
-    return None
+    return _pos_cache.get("value")
 
 def get_effective_lev():
-    """
-    Legge la leva effettiva da Hyperliquid.
-    Hyperliquid può applicare leva diversa da quella richiesta.
-    """
     try:
         s = call(_info.user_state, _account.address, timeout=10)
         for p in s.get("assetPositions", []):
@@ -2432,16 +2441,27 @@ def get_effective_lev():
         return BTC_LEVERAGE
 
 def get_balance():
+    global _bal_cache
+    if time.time() - _bal_cache["ts"] < API_CACHE_TTL:
+        return _bal_cache["value"]
     try:
         s = call(_info.user_state, _account.address, timeout=10)
-        return float(s["marginSummary"]["accountValue"])
-    except: return 0
+        v = float(s["marginSummary"]["accountValue"])
+        _bal_cache = {"ts": time.time(), "value": v}
+        return v
+    except: return _bal_cache.get("value", 0)
 
 def get_mid():
+    global _mid_cache
+    if time.time() - _mid_cache["ts"] < API_CACHE_TTL and _mid_cache["value"] > 0:
+        return _mid_cache["value"]
     try:
         mids = call(_info.all_mids, timeout=10)
-        return float(mids.get(BTC_COIN, 0))
-    except: return 0
+        v = float(mids.get(BTC_COIN, 0))
+        if v > 0:
+            _mid_cache = {"ts": time.time(), "value": v}
+        return v
+    except: return _mid_cache.get("value", 0)
 
 def get_funding():
     """Returns current BTC funding rate (raw, not bps)."""
