@@ -1684,22 +1684,20 @@ def run_backtest():
             if entry_bar >= n - fwd:
                 i += fwd; continue
 
-            # 2. ENTRY IMPERFETTA: non al close, ma nell'intervallo della candela
-            #    Simuliamo entry al midpoint open-close della candela di entry
-            #    (a volte prendi un prezzo migliore, a volte peggiore)
-            entry_open = merged['open'].values[entry_bar] if 'open' in merged.columns else c[entry_bar]
-            entry_close = c[entry_bar]
-            entry_mid = (float(entry_open) + float(entry_close)) / 2
+            # 2. ENTRY = OPEN della candela di entry (non midpoint)
+            #    Nella realtà: il bot vede il segnale alla chiusura di candela i,
+            #    piazza ordine, viene fillato all'apertura della candela i+delay.
+            entry_open = float(merged['open'].values[entry_bar]) if 'open' in merged.columns else c[entry_bar]
 
-            # 3. SLIPPAGE DINAMICO: basato su volatilità della candela di entry
-            #    Range della candela / prezzo = slippage naturale
-            bar_range = h[entry_bar] - l[entry_bar]
-            slippage_pct = min(bar_range / (entry_mid + 1e-10) * 0.3, 0.003)  # max 0.3%
+            # 3. SLIPPAGE DINAMICO: basato su range della candela precedente
+            #    (la volatilità al momento dell'entry)
+            prev_range = h[entry_bar - 1] - l[entry_bar - 1]
+            slippage_pct = min(prev_range / (entry_open + 1e-10) * 0.3, 0.003)  # max 0.3%
             # Slippage sempre sfavorevole
             if sig_dir == "LONG":
-                px_entry = entry_mid * (1 + slippage_pct)  # compri più alto
+                px_entry = entry_open * (1 + slippage_pct)  # compri più alto dell'open
             else:
-                px_entry = entry_mid * (1 - slippage_pct)  # vendi più basso
+                px_entry = entry_open * (1 - slippage_pct)  # vendi più basso dell'open
 
             # ── Detect mode per questa candela ──
             adx_i = adx1h[i] if not np.isnan(adx1h[i]) else 20
