@@ -55,34 +55,36 @@ BTC_COIN = "BTC"
 BTC_LEVERAGE = 20
 BTC_RISK_USD = 5.0
 BTC_MAX_POSITIONS = 1
-BTC_COOLDOWN_SEC = 60
-BTC_SCAN_INTERVAL = 10
+BTC_COOLDOWN_SEC = 180
+BTC_COOLDOWN_AFTER_LOSS = 300  # 5 min dopo un loss
+MAX_TRADES_PER_HOUR = 3
+BTC_SCAN_INTERVAL = 30
 BTC_SIGNAL_MAX_AGE = 2 * 60
 BTC_REGIME_INTERVAL = 300
 
-# ROE-based SL/TP
-ROE_TP = 0.03; ROE_SL = 0.02
-TP_PRICE_PCT = ROE_TP / BTC_LEVERAGE
-SL_PRICE_PCT = ROE_SL / BTC_LEVERAGE
+# ROE-based SL/TP — SL minimo 0.3% per evitare noise stops
+ROE_TP = 0.06; ROE_SL = 0.06  # 0.3% SL, 0.3% TP base (R:R 1:1 minimo)
+TP_PRICE_PCT = ROE_TP / BTC_LEVERAGE  # 0.003 = 0.3%
+SL_PRICE_PCT = ROE_SL / BTC_LEVERAGE  # 0.003 = 0.3%
 
-RANGE_SL_ATR = 1.0; RANGE_TP_PCT = TP_PRICE_PCT
-RANGE_SL_MIN = SL_PRICE_PCT * 0.7; RANGE_SL_MAX = SL_PRICE_PCT * 1.5
-TREND_SL_ATR = 1.0; TREND_TP_RR = TP_PRICE_PCT / SL_PRICE_PCT
-TREND_SL_MIN = SL_PRICE_PCT * 0.7; TREND_SL_MAX = SL_PRICE_PCT * 1.5
-TREND_TRAIL_ATR = 0.5; TREND_PARTIAL = 0.6
-FLASH_SL_ATR = 0.8; FLASH_TP_PCT = TP_PRICE_PCT
-FLASH_SL_MIN = SL_PRICE_PCT * 0.5; FLASH_SL_MAX = SL_PRICE_PCT * 1.2
+RANGE_SL_ATR = 1.2; RANGE_TP_PCT = TP_PRICE_PCT
+RANGE_SL_MIN = 0.003; RANGE_SL_MAX = 0.006  # 0.3% - 0.6%
+TREND_SL_ATR = 1.2; TREND_TP_RR = 1.5  # R:R 1:1.5
+TREND_SL_MIN = 0.003; TREND_SL_MAX = 0.006
+TREND_TRAIL_ATR = 0.7; TREND_PARTIAL = 0.4
+FLASH_SL_ATR = 1.0; FLASH_TP_PCT = TP_PRICE_PCT
+FLASH_SL_MIN = 0.002; FLASH_SL_MAX = 0.004  # 0.2% - 0.4% (flash = più stretto)
 FLASH_TRAILING = False; FLASH_USE_IOC = True
 
 SL_ATR_MULT = TREND_SL_ATR; TP_RR = TREND_TP_RR
 SL_MIN_PCT = TREND_SL_MIN; SL_MAX_PCT = TREND_SL_MAX
-TRAILING_ACTIVATE = 0.5; TRAILING_ATR = TREND_TRAIL_ATR
-PARTIAL_CLOSE_PCT = TREND_PARTIAL
+TRAILING_ACTIVATE = 0.3; TRAILING_ATR = TREND_TRAIL_ATR
+PARTIAL_CLOSE_PCT = 0.4
 FUNDING_BLOCK_THRESH = 0.0003
 SLIPPAGE = 0.001; GTC_TIMEOUT = 6
 DRIFT_MAX_FAVORABLE = 0.004; DRIFT_MAX_ADVERSE = 0.008
 PENDING_ORDER_TTL = 120
-MAX_DAILY_LOSS = 20.0; MAX_CONSEC_LOSS = 3
+MAX_DAILY_LOSS = 20.0; MAX_CONSEC_LOSS = 2
 DAILY_REPORT_HOUR = 0
 
 # ── Altcoin Processor Config ────────────────────────────────────
@@ -111,7 +113,7 @@ SETUP_SCORE_MIN = 50
 TRAILING_STOP_INTERVAL = 5 * 60
 SCANNER_INTERVAL = 20 * 60; SCANNER_MAX_UNIVERSE = 229
 PROCESSOR_MAX_COINS = 30
-CORRELATION_THRESHOLD = 0.70
+CORRELATION_THRESHOLD = 0.55
 # ── Missing aliases (ALT engine compatibility) ───────────────────
 TRADE_SIZE_USD = ALT_TRADE_SIZE_USD
 LEVERAGE = ALT_LEVERAGE
@@ -1884,50 +1886,64 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
 
 def momentum_trigger(df_15m, allow_long=True, allow_short=True):
     """
-    Momentum puro — cattura move veloci che flow e tech non vedono.
-    Prezzo sale/scende >0.3% in ultime 2 candele 15m + volume sopra media.
-    Cattura short squeeze, liquidazioni, news spike.
+    Momentum puro — cattura move in CORSO, non esauriti.
+    Condizioni:
+    - Move >0.2% nelle ultime 2 candele (30min)
+    - Volume sopra media
+    - L'ultima candela sta ANCORA muovendosi nella direzione (non sta ritracciando)
     """
     if df_15m is None or len(df_15m) < 5:
         return None
 
     c_now = float(df_15m.iloc[-1]['close'])
+    c_1ago = float(df_15m.iloc[-2]['close'])
     c_2ago = float(df_15m.iloc[-3]['close'])
     vol = float(df_15m.iloc[-1]['vol_rel'])
 
-    move_pct = (c_now - c_2ago) / c_2ago
+    move_30m = (c_now - c_2ago) / c_2ago
+    move_last = (c_now - c_1ago) / c_1ago  # ultima candela
 
-    if allow_long and move_pct > 0.0015 and vol >= 0.5:
+    # BUY: move +0.2% in 30min E l'ultima candela è ancora UP (non sta ritracciando)
+    if allow_long and move_30m > 0.002 and move_last > 0 and vol >= 0.5:
         return {"direction": "LONG", "type": "MOMENTUM",
-                "details": f"move:+{move_pct:.2%}/30m vol:{vol:.1f}x"}
+                "details": f"move:+{move_30m:.2%}/30m last:+{move_last:.2%} vol:{vol:.1f}x"}
 
-    if allow_short and move_pct < -0.0015 and vol >= 0.5:
+    # SELL: move -0.2% in 30min E l'ultima candela è ancora DOWN
+    if allow_short and move_30m < -0.002 and move_last < 0 and vol >= 0.5:
         return {"direction": "SHORT", "type": "MOMENTUM",
-                "details": f"move:{move_pct:.2%}/30m vol:{vol:.1f}x"}
+                "details": f"move:{move_30m:.2%}/30m last:{move_last:.2%} vol:{vol:.1f}x"}
 
     return None
 
 
-def technical_trigger(r, r_prev, allow_long=True, allow_short=True):
+def technical_trigger(r, r_prev, h_1h, allow_long=True, allow_short=True):
     """
-    Technical trigger — pullback con volume confirmation.
-    RSI estremo + MACD turning + volume sopra media = entry reale.
-    Senza volume, il MACD turn è rumore su candela singola.
+    Technical trigger — pullback CON trend direction check.
+    Non genera SHORT se il trend 1h è UP (e viceversa).
+    Non entra se il move è già esaurito (RSI troppo lontano da estremi).
     """
     rsi = float(r['rsi'])
     macd = float(r['macd_hist'])
     macd_prev = float(r_prev['macd_hist'])
     vol = float(r['vol_rel'])
+    slope = float(r['ema_slope'])
 
-    # Pullback BUY: RSI oversold + MACD turning up + volume conferma
-    if allow_long and rsi < 45 and macd > macd_prev and vol >= 0.3:
+    # Trend 1h direction
+    ema9 = float(h_1h['ema9'])
+    ema21 = float(h_1h['ema21'])
+    trend_up = ema9 > ema21
+
+    # Pullback BUY: RSI oversold + MACD turning + trend 1h UP (non contro-trend)
+    if (allow_long and rsi < 40 and macd > macd_prev and vol >= 0.3
+        and trend_up and slope > -0.001):
         return {"direction": "LONG", "type": "PULLBACK",
-                "details": f"RSI:{rsi:.0f} MACD↑ vol:{vol:.1f}x"}
+                "details": f"RSI:{rsi:.0f} MACD↑ vol:{vol:.1f}x trend:UP"}
 
-    # Pullback SELL: RSI overbought + MACD turning down + volume conferma
-    if allow_short and rsi > 55 and macd < macd_prev and vol >= 0.3:
+    # Pullback SELL: RSI overbought + MACD turning + trend 1h DOWN
+    if (allow_short and rsi > 60 and macd < macd_prev and vol >= 0.3
+        and not trend_up and slope < 0.001):
         return {"direction": "SHORT", "type": "PULLBACK",
-                "details": f"RSI:{rsi:.0f} MACD↓ vol:{vol:.1f}x"}
+                "details": f"RSI:{rsi:.0f} MACD↓ vol:{vol:.1f}x trend:DOWN"}
 
     return None
 
@@ -2001,7 +2017,22 @@ def check_signal():
     if regime == "RANGE_LOW_VOL":
         return None
 
-    # Flow decide la direzione — regime scala la size, non blocca mai
+    # ── ENVIRONMENT CHECK: blocca se tutto è neutro ──
+    # Se flow NEUTRAL + sentiment 40-60 + ADX < 20 → mercato morto, non tradare
+    flow_sig_check = get_flow_signal()
+    flow_neutral = flow_sig_check.get("bias", "NEUTRAL") == "NEUTRAL"
+    sent = get_sentiment_score()
+    sent_neutral = 40 <= sent <= 60
+    adx_low = adx1h < 20
+
+    if flow_neutral and sent_neutral and adx_low:
+        return None  # mercato morto — nessun edge
+
+    # ATR troppo basso → volatilità insufficiente per raggiungere TP
+    atr_pct = atr5 / px if px > 0 else 0
+    if atr_pct < 0.0015:
+        return None
+
     allow_long = True
     allow_short = True
 
@@ -2010,7 +2041,7 @@ def check_signal():
     # ══════════════════════════════════════════════════════════
 
     flow_sig = flow_trigger(_flow_cache.get("data", {}), regime, allow_long, allow_short)
-    tech_sig = technical_trigger(r, r2, allow_long, allow_short)
+    tech_sig = technical_trigger(r, r2, h, allow_long, allow_short)
     mom_sig = momentum_trigger(df_15m, allow_long, allow_short)
 
     if flow_sig:
@@ -2052,8 +2083,8 @@ def check_signal():
 
     # Spread check
     liq = fetch_liquidity()
-    if liq.get("spread") is not None and liq["spread"] > 0.001:
-        log_btc(f"⚠️ Spread {liq['spread']:.4%} > 0.1% — skip")
+    if liq.get("spread") is not None and liq["spread"] > 0.0008:
+        log_btc(f"⚠️ Spread {liq['spread']:.4%} > 0.08% — skip")
         return None
 
     # ML: log only, no block (0 samples)
@@ -2100,81 +2131,34 @@ def check_signal():
         scalp_mode = "TREND"  # forza trailing attivo
         details += f" [REVERSAL vs trend:{trend_dir}]"
 
-    # ── SL / TP — MODE ADAPTIVE ──
-    ai_sl_adj = 1.0
+    # ── SL / TP — ATR-based, pulito ──
     update_funding_oi()
     oi_chg = get_oi_change()
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
-    # ── SL / TP — MODE ADAPTIVE + lev_scale ──
-    actual_lev = get_effective_lev()
-    lev_scale = BTC_LEVERAGE / max(actual_lev, 1)
-    if lev_scale != 1.0:
-        log_btc(f"⚠️ Lev {actual_lev}x vs {BTC_LEVERAGE}x → SL ×{lev_scale:.2f}")
+    # SL = 1.2× ATR, TP = 1.8× ATR → R:R = 1:1.5
+    sl_dist = atr5 * 1.2
+    tp_dist = atr5 * 1.8
 
-    sl_adj_redis, tp_adj_redis = get_sl_tp_adjustments()
-    buffer = px * 0.002 * lev_scale
+    # Floor: SL minimo 0.3%, TP minimo 0.3%
+    sl_dist = max(sl_dist, px * 0.003)
+    tp_dist = max(tp_dist, px * 0.003)
 
-    if scalp_mode == "FLASH":
-        # FLASH: SL stretto, TP fisso 0.3%, no trailing
-        sl_atr_m = FLASH_SL_ATR * lev_scale * sl_adj_redis * ai_sl_adj
-        sl_dist = atr5 * sl_atr_m
-        sl_dist = max(sl_dist, px * FLASH_SL_MIN * lev_scale)
-        sl_dist = min(sl_dist, px * FLASH_SL_MAX * lev_scale)
-        tp_dist = px * FLASH_TP_PCT * tp_adj_redis
-
-    elif scalp_mode == "RANGE":
-        # RANGE: SL da ATR, TP fisso 0.4%
-        sl_atr_m = RANGE_SL_ATR * lev_scale * sl_adj_redis * ai_sl_adj
-        sl_dist = atr5 * sl_atr_m
-        sl_dist = max(sl_dist, px * RANGE_SL_MIN * lev_scale)
-        sl_dist = min(sl_dist, px * RANGE_SL_MAX * lev_scale)
-        tp_dist = px * RANGE_TP_PCT * tp_adj_redis
-
-    else:  # TREND
-        # TREND: SL da ATR, TP da R:R (trailing farà il resto)
-        sl_atr_m = TREND_SL_ATR * lev_scale * sl_adj_redis * ai_sl_adj
-        sl_dist = atr5 * sl_atr_m
-        sl_dist = max(sl_dist, px * TREND_SL_MIN * lev_scale)
-        sl_dist = min(sl_dist, px * TREND_SL_MAX * lev_scale)
-        tp_dist = sl_dist * TREND_TP_RR * tp_adj_redis / lev_scale
-
-    # TP floor (non scalano con leva)
-    tp_dist = max(tp_dist, px * TP_PRICE_PCT * 0.8)
-
-    # ── APPLY EXPECTATION STRATEGY ──
-    # FOLLOW: TP stretto, SL stretto (prendi profitto rapido)
-    # REVERSAL: TP largo, SL normale (lascia correre l'inversione)
+    # Expectation strategy modifica TP
     sl_dist *= sl_mult
     tp_dist *= tp_mult
-    log_btc(f"[{strategy}] SL×{sl_mult} TP×{tp_mult} → SL:{sl_dist/px*100:.2f}% TP:{tp_dist/px*100:.2f}%")
 
-    # Swing SL override (se migliore dell'ATR)
     if direction == "LONG":
-        swing_low = float(df_15m['low'].iloc[-10:].min())
-        swing_sl = px - swing_low + buffer
-        sl_min = px * (FLASH_SL_MIN if scalp_mode=="FLASH" else RANGE_SL_MIN if scalp_mode=="RANGE" else TREND_SL_MIN)
-        sl_max = px * (FLASH_SL_MAX if scalp_mode=="FLASH" else RANGE_SL_MAX if scalp_mode=="RANGE" else TREND_SL_MAX) * lev_scale
-        if sl_min < swing_sl < sl_max:
-            sl_dist = swing_sl
         sl = px - sl_dist
         tp = px + tp_dist
     else:
-        swing_high = float(df_15m['high'].iloc[-10:].max())
-        swing_sl = swing_high - px + buffer
-        sl_min = px * (FLASH_SL_MIN if scalp_mode=="FLASH" else RANGE_SL_MIN if scalp_mode=="RANGE" else TREND_SL_MIN)
-        sl_max = px * (FLASH_SL_MAX if scalp_mode=="FLASH" else RANGE_SL_MAX if scalp_mode=="RANGE" else TREND_SL_MAX) * lev_scale
-        if sl_min < swing_sl < sl_max:
-            sl_dist = swing_sl
         sl = px + sl_dist
         tp = px - tp_dist
 
     sl_pct = sl_dist / px * 100
     tp_pct = tp_dist / px * 100
     rr = tp_dist / sl_dist if sl_dist > 0 else 0
-    log_btc(f"[{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} ADX:{adx1h:.0f} lev:{actual_lev}x")
-
-    # size_mult already set by hierarchy (FLOW_STRONG/WEAK/TECH/MOMENTUM + trend + ML + sentiment)
+    log_btc(f"SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} [{strategy}]")
 
     _last_ml_features = ml_features
 
@@ -3173,7 +3157,52 @@ def processor_thread(sz_dec, px_dec):
                 time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
-            # ── EXECUTE IMMEDIATELY — zero delay ──
+            # ── PRICE CONFIRMATION: aspetta 15s, verifica che il prezzo confermi ──
+            price_at_signal = get_mid()
+            log_btc(f"📡 Signal {direction} {sig_type} @ {price_at_signal:,.0f} — waiting 15s for confirmation...")
+            time.sleep(15)
+            price_after = get_mid()
+
+            if price_after <= 0:
+                log_btc(f"⚠️ Confirmation failed — no price")
+                continue
+
+            if direction == "LONG" and price_after < price_at_signal:
+                log_btc(f"❌ LONG not confirmed — price dropped {price_at_signal:,.0f}→{price_after:,.0f}")
+                continue
+            elif direction == "SHORT" and price_after > price_at_signal:
+                log_btc(f"❌ SHORT not confirmed — price rose {price_at_signal:,.0f}→{price_after:,.0f}")
+                continue
+
+            log_btc(f"✅ Confirmed: {direction} price {price_at_signal:,.0f}→{price_after:,.0f}")
+
+            # ── FLOW CONTRADICTION CHECK: non entrare contro il flow ──
+            flow_now = get_flow_signal()
+            if direction == "LONG" and flow_now.get("bias") == "SELL":
+                log_btc(f"❌ LONG vs Flow SELL — skip")
+                continue
+            if direction == "SHORT" and flow_now.get("bias") == "BUY":
+                log_btc(f"❌ SHORT vs Flow BUY — skip")
+                continue
+
+            # ── SENTIMENT CONTRARIAN CHECK ──
+            sent_score_now = get_sentiment_score()
+            if direction == "LONG" and sent_score_now > 70:
+                log_btc(f"❌ LONG ma sentiment {sent_score_now} > 70 (troppo greed) — skip")
+                continue
+            if direction == "SHORT" and sent_score_now < 30:
+                log_btc(f"❌ SHORT ma sentiment {sent_score_now} < 30 (troppo fear) — skip")
+                continue
+
+            # ── MAX TRADES PER HOUR ──
+            now = time.time()
+            trades_last_hour = len([t for t in _btc_trades_today
+                                    if now - t.get("ts_close", t.get("ts", 0)) < 3600])
+            if trades_last_hour >= MAX_TRADES_PER_HOUR:
+                log_btc(f"⏸️ {trades_last_hour} trades nell'ultima ora (max {MAX_TRADES_PER_HOUR}) — skip")
+                continue
+
+            # ── EXECUTE ──
             log_btc(f"⚡ DETECT+EXEC {direction} {sig_type} [{scalp_mode}] @ {entry_px:,.0f}")
 
             success = btc_open_trade(direction, sl, tp, entry_px,
@@ -6927,6 +6956,12 @@ def btc_executor_loop(sz_dec, px_dec):
                 log_btc(f"{emoji} CLOSED {d} | {close_reason} | ${pnl_usd:+.2f} ({pnl_pct:+.2f}%) | {dur_str}")
                 tg(f"{emoji} <b>BTC {d} CLOSED</b>\n${pnl_usd:+.2f} ({pnl_pct:+.2f}%)\n{close_reason}")
 
+                # Cooldown più lungo dopo un loss
+                if pnl_usd < 0:
+                    _btc_last_trade_ts = time.time()
+                    log_btc(f"⏸️ Loss — sleeping {BTC_COOLDOWN_AFTER_LOSS}s")
+                    time.sleep(BTC_COOLDOWN_AFTER_LOSS)
+
                 # ML online learning
                 ml_feats = last_pos_state.get("ml_features", [])
                 if ml_feats and len(ml_feats) == OnlineGBClassifier.N_FEATURES:
@@ -6941,6 +6976,8 @@ def btc_executor_loop(sz_dec, px_dec):
                 pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
                 trade_mode = last_pos_state.get("scalp_mode", "TREND")
                 atr_now = last_pos_state.get("atr", 0)
+                open_ts = last_pos_state.get("open_ts", 0)
+                time_in_trade = time.time() - open_ts if open_ts > 0 else 0
 
                 if cycle % 6 == 0:
                     df_m = fetch_df("15m", 1)
@@ -6949,22 +6986,57 @@ def btc_executor_loop(sz_dec, px_dec):
                         last_pos_state["atr"] = atr_now
 
                 # ── DYNAMIC TP: profitto >= 1.5× ATR → chiudi ──
-                # ATR-based TP si adatta alla volatilità attuale
-                # In mercato volatile il target è più largo
                 if atr_now > 0:
                     profit_abs = (mid - entry) if d == "LONG" else (entry - mid)
                     if profit_abs >= atr_now * 1.5:
-                        log_btc(f"🎯 ATR TP HIT! profit:{profit_abs:.0f} >= 1.5×ATR({atr_now:.0f}={atr_now*1.5:.0f})")
+                        log_btc(f"🎯 ATR TP HIT! profit:{profit_abs:.0f} >= 1.5×ATR({atr_now:.0f})")
                         try:
                             size_abs = rpx(abs(szi), sz_dec)
                             close_px = rpx(mid * (0.9997 if d == "LONG" else 1.0003), px_dec)
                             call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
                                  {"limit": {"tif": "Ioc"}}, False, timeout=15)
-                            last_pos_state["close_reason"] = f"🎯 ATR TP ({profit_abs:.0f} >= {atr_now*1.5:.0f})"
+                            last_pos_state["close_reason"] = f"🎯 ATR TP"
                             save_pos_state(last_pos_state)
-                            tg(f"🎯 <b>BTC ATR TP</b>\nProfit: {pnl_pct:+.2f}% ({profit_abs:.0f} >= 1.5×ATR)")
+                            tg(f"🎯 <b>BTC ATR TP</b>\n+{pnl_pct:.2f}%")
                         except Exception as e:
-                            log_btc(f"ATR TP execution error: {e}")
+                            log_btc(f"ATR TP error: {e}")
+
+                # ── SMART TP: in profitto >0.15% ma condizioni girano → chiudi ──
+                # Non aspettare che il profitto si trasformi in loss
+                if pnl_pct > 0.15 and time_in_trade > 60:
+                    flow_sig = get_flow_signal()
+                    flow_against = (
+                        (d == "LONG" and flow_sig.get("bias") == "SELL") or
+                        (d == "SHORT" and flow_sig.get("bias") == "BUY")
+                    )
+                    # Check se il momentum si sta esaurendo
+                    try:
+                        df_check = fetch_df("15m", 1)
+                        if df_check is not None and len(df_check) >= 2:
+                            last_close = float(df_check.iloc[-1]['close'])
+                            prev_close = float(df_check.iloc[-2]['close'])
+                            momentum_reversing = (
+                                (d == "LONG" and last_close < prev_close) or
+                                (d == "SHORT" and last_close > prev_close)
+                            )
+                        else:
+                            momentum_reversing = False
+                    except:
+                        momentum_reversing = False
+
+                    if flow_against or momentum_reversing:
+                        reason = f"flow_against:{flow_against} mom_reversing:{momentum_reversing}"
+                        log_btc(f"💰 SMART TP — in profit +{pnl_pct:.2f}% ma {reason} → chiudi")
+                        try:
+                            size_abs = rpx(abs(szi), sz_dec)
+                            close_px = rpx(mid * (0.9997 if d == "LONG" else 1.0003), px_dec)
+                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
+                                 {"limit": {"tif": "Ioc"}}, False, timeout=15)
+                            last_pos_state["close_reason"] = f"💰 Smart TP +{pnl_pct:.2f}%"
+                            save_pos_state(last_pos_state)
+                            tg(f"💰 <b>BTC Smart TP</b>\n+{pnl_pct:.2f}% | {reason}")
+                        except Exception as e:
+                            log_btc(f"Smart TP error: {e}")
 
                 # ══════════════════════════════════════════════════
                 # POST-ENTRY VALIDATION (runs once, 90-120s after entry)
