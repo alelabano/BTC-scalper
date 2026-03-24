@@ -727,7 +727,7 @@ def get_sentiment_adjustment():
 _cvd_buffer = deque(maxlen=120)   # 120 readings (one per scan = ~20min window)
 _oi_momentum = deque(maxlen=30)   # 30 OI readings for momentum
 _flow_cache = {"ts": 0, "data": {}}
-FLOW_CACHE_TTL = 60  # aggiorna ogni 15s
+FLOW_CACHE_TTL = 30  # aggiorna ogni 15s
 
 # ── Shared API caches (reduce Hyperliquid rate limit pressure) ──
 _mid_cache = {"ts": 0, "value": 0}
@@ -2040,76 +2040,18 @@ def check_signal():
     # MOMENTUM (solo)      = 0.5x (no flow)
     # ══════════════════════════════════════════════════════════
 
+    # Size fissa $5 — con questo capitale non si scala
     size_mult = 1.0
 
-    if "FLOW_STRONG" in sig_type:
-        size_mult = 1.0
-    elif "FLOW_WEAK" in sig_type and ("TECH" in sig_type or "MOM" in sig_type):
-        size_mult = 0.8
-    elif "FLOW_WEAK" in sig_type:
-        size_mult = 0.7
-    elif "MOMENTUM" in sig_type:
-        size_mult = 0.5
-        details += " (momentum×0.5)"
-    else:
-        size_mult = 0.5  # tech-only
-        details += " (tech-only×0.5)"
-
-    # ── 2. TREND: soft filter — mai blocca, scala size ──
-    trend_dir = "UP" if ema9_1h > ema21_1h else "DOWN" if ema9_1h < ema21_1h else "FLAT"
-    if trend_dir == "DOWN" and direction == "LONG":
-        size_mult *= 0.5
-        details += f" trend:DOWN→LONG(×0.5)"
-    elif trend_dir == "UP" and direction == "SHORT":
-        size_mult *= 0.5
-        details += f" trend:UP→SHORT(×0.5)"
-    elif (trend_dir == "UP" and direction == "LONG") or \
-         (trend_dir == "DOWN" and direction == "SHORT"):
-        details += f" trend:aligned"
-    else:
-        details += f" trend:FLAT"
-
-    # ── 3. ML: filtro finale — blocca SOLO se ha dati sufficienti ──
-    sent_score = get_sentiment_score()
+    # Spread check
     liq = fetch_liquidity()
-    ob_imbalance = liq.get("imbalance", 0.5)
-    spread_val = liq.get("spread", 0.0005) or 0.0005
-    flow_data_ml = _flow_cache.get("data", {})
-    cvd_data_ml = flow_data_ml.get("cvd_trend", {})
-    oi_data_ml = flow_data_ml.get("oi_momentum", {})
-
-    ml_features = build_ml_features(
-        rsi_15m=rsi5, rsi_1h=rsi1h, macd_hist=macd5, adx_1h=adx1h,
-        vol_rel=vol5, funding_z=fz, sentiment=sent_score,
-        ob_imbalance=ob_imbalance, cvd_slope=cvd_data_ml.get("cvd_slope", 0),
-        regime=regime, scalp_mode=scalp_mode, setup_score=50,
-        oi_change_pct=oi_data_ml.get("oi_change_pct", 0),
-        bb_pos=bb5, ema_slope=slope5, spread=spread_val
-    )
-
-    ml_prob, ml_adj = ml_predict_signal(ml_features)
-    if ml_adj.get("ml_active") and ml_prob < 0.45:
-        log_btc(f"🤖 ML block: P(win)={ml_prob:.0%} < 45% — skip")
-        return None
-    details += f" ML:{ml_prob:.0%}"
-
-    # ── 4. SENTIMENT: peso — mai blocca ──
-    if sent_score < 30 and direction == "LONG":
-        size_mult *= 0.7
-        details += f" sent:{sent_score}→LONG(×0.7)"
-    elif sent_score > 70 and direction == "SHORT":
-        size_mult *= 0.7
-        details += f" sent:{sent_score}→SHORT(×0.7)"
-    else:
-        details += f" sent:{sent_score}"
-
-    # Spread check — unico hard kill rimasto
     if liq.get("spread") is not None and liq["spread"] > 0.001:
         log_btc(f"⚠️ Spread {liq['spread']:.4%} > 0.1% — skip")
         return None
 
-    size_mult = max(0.3, min(1.2, size_mult))
-    details += f" size:{size_mult:.2f}"
+    # ML: log only, no block (0 samples)
+    ml_features = []
+    details += f" sent:{get_sentiment_score()}"
 
     log_btc(f"[SIGNAL] {direction} {sig_type} | {details}")
 
@@ -4959,16 +4901,16 @@ def run_processor():
                 active_positions=_active_positions_cache
             )
 
+            # AI è soft filter — non blocca, scala size
+            # ai_score < 3 → size ×0.5, ai_score 3-5 → size ×0.7, 6+ → size ×1.0
             if not ai_valid:
-                skip_counts["ai"] += 1
-                log_alt(f"[{coin}] ❌ AI rifiuta — {ai_reason}")
-                if "⏳" not in ai_reason:
-                    clear_candidate(coin)
-                continue
+                log_alt(f"[{coin}] ⚠️ AI scettica — {ai_reason} (size ridotta, non bloccata)")
+                ai_score = max(ai_score, 2)  # floor a 2 per non bloccare
+            ai_size_mult = 1.0
             if ai_score < 3:
-                skip_counts["ai"] += 1
-                clear_candidate(coin)
-                continue
+                ai_size_mult = 0.5
+            elif ai_score < 6:
+                ai_size_mult = 0.7
 
             setup_score = compute_setup_score(
                 direction, px, ema50_val, ema200_4h,
