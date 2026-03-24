@@ -186,7 +186,20 @@ def tg(msg, silent=False):
                   "disable_notification": silent}, timeout=5)
     except: pass
 
+_api_call_times = []
+_api_lock = threading.Lock()
+API_MAX_CALLS_PER_MIN = 80  # Hyperliquid limit ~120, stay safe
+
 def call(fn, *a, timeout=20, label='', **kw):
+    # Rate limiter: max 80 calls/min across all threads
+    with _api_lock:
+        now = time.time()
+        _api_call_times[:] = [t for t in _api_call_times if now - t < 60]
+        if len(_api_call_times) >= API_MAX_CALLS_PER_MIN:
+            wait = 60 - (now - _api_call_times[0]) + 0.5
+            if wait > 0:
+                time.sleep(min(wait, 10))  # max 10s wait
+        _api_call_times.append(time.time())
     f = _pool.submit(fn, *a, **kw)
     try: return f.result(timeout=timeout)
     except FuturesTimeout:
