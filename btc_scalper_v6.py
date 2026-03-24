@@ -2936,15 +2936,18 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     sl_pct = sl_dist / entry_px
     notional = (BTC_RISK_USD * size_mult) / sl_pct
     bal = get_balance()
-    max_notional = bal * BTC_LEVERAGE * 0.95
-    notional = min(notional, max_notional)
+
+    # Cap: margine usato non può superare 90% del balance
+    max_margin = bal * 0.90
+    max_notional = max_margin * BTC_LEVERAGE
+    if notional > max_notional:
+        notional = max_notional
+        log_btc(f"Size capped: bal=${bal:.2f} max_margin=${max_margin:.2f} notional=${notional:.0f}")
+
     size = rpx(notional / entry_px, sz_dec)
 
     if size <= 0:
         log_btc(f"Size zero: notional=${notional:.0f} px={entry_px}")
-        return False
-
-    if not check_margin(size, entry_px):
         return False
 
     # ── LEVERAGE ──
