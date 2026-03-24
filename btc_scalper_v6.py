@@ -2200,20 +2200,8 @@ def get_meta():
                     sz_dec = int(a["szDecimals"])
                     max_lev = int(a.get("maxLeverage", 50))
 
-                    # Price decimals: Hyperliquid non ha questo campo.
-                    # BTC usa 1 decimale ($73692.0), ma per SL/TP precisi
-                    # calcoliamo dal prezzo corrente.
-                    # calcoliamo dal prezzo corrente.
-                    px_dec = 1  # default BTC
-                    try:
-                        mid = float(call(_info.all_mids, timeout=10).get(BTC_COIN, 0))
-                        if mid > 0:
-                            # Conta decimali significativi dal prezzo
-                            px_str = f"{mid:.10f}".rstrip('0')
-                            if '.' in px_str:
-                                px_dec = len(px_str.split('.')[1])
-                                px_dec = max(1, min(px_dec, 6))  # clamp 1-6
-                    except: pass
+                    # Price decimals: BTC su Hyperliquid ha tick size $1 = 0 decimali
+                    px_dec = 0  # BTC = numeri interi
 
                     _btc_coin_meta = {
                         "sz_dec":  sz_dec,
@@ -2230,7 +2218,7 @@ def get_meta():
         except Exception as e:
             if attempt < 2: time.sleep(3 * (attempt + 1))
             else: log_btc(f"get_meta failed: {e}")
-    return 5, 1  # BTC defaults
+    return 5, 0  # BTC defaults: szDec=5, pxDec=0
 
 def get_max_leverage():
     return _btc_coin_meta.get("max_lev", 50)
