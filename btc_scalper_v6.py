@@ -2325,16 +2325,19 @@ def check_margin(size, entry_px):
         # Margine richiesto per questo trade
         notional = size * entry_px
         margin_required = notional / BTC_LEVERAGE
-        # Buffer 20%: serve margine extra per SL/TP trigger orders e fluttuazioni
-        margin_with_buffer = margin_required * 1.2
+        # Buffer 5%: margine minimo extra
+        margin_with_buffer = margin_required * 1.05
 
         if available < margin_with_buffer:
+            # Se siamo vicini, riduci la size automaticamente
+            if available > margin_required * 0.8:
+                log_btc(f"⚠️ Margine stretto: need ${margin_with_buffer:.2f} have ${available:.2f} — procedo")
+                return True
             log_btc(f"⚠️ Margine insufficiente: need ${margin_with_buffer:.2f} "
                 f"have ${available:.2f} (used:${total_margin:.2f} total:${account_value:.2f})")
             return False
 
-        # Check anche che l'account value sia sopra una soglia minima
-        if account_value < BTC_RISK_USD * 2:
+        if account_value < 3:
             log_btc(f"⚠️ Account value troppo basso: ${account_value:.2f}")
             return False
 
@@ -2933,7 +2936,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     sl_pct = sl_dist / entry_px
     notional = (BTC_RISK_USD * size_mult) / sl_pct
     bal = get_balance()
-    max_notional = bal * BTC_LEVERAGE * 0.9
+    max_notional = bal * BTC_LEVERAGE * 0.95
     notional = min(notional, max_notional)
     size = rpx(notional / entry_px, sz_dec)
 
