@@ -6984,7 +6984,7 @@ def btc_executor_loop(sz_dec, px_dec):
                     btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
 
                 # ── 3. MODE-SPECIFIC ──
-                if trade_mode == "RANGE" and pnl_pct > 0.1:
+                if trade_mode == "RANGE" and pnl_pct > 0.15:
                     log_btc(f"💰 RANGE TP +{pnl_pct:.2f}%")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
                     last_pos_state["close_reason"] = f"💰 RANGE TP"
