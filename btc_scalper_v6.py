@@ -740,7 +740,7 @@ def get_sentiment_adjustment():
 _cvd_buffer = deque(maxlen=120)   # 120 readings (one per scan = ~20min window)
 _oi_momentum = deque(maxlen=30)   # 30 OI readings for momentum
 _flow_cache = {"ts": 0, "data": {}}
-FLOW_CACHE_TTL = 30  # aggiorna ogni 15s
+FLOW_CACHE_TTL = 15  # aggiorna ogni 15s
 
 # ── Shared API caches (reduce Hyperliquid rate limit pressure) ──
 _mid_cache = {"ts": 0, "value": 0}
@@ -856,10 +856,11 @@ def _compute_cvd_trend():
     """
     CVD Trend: somma cumulativa dei delta nel buffer.
     Rising CVD = pressione compratori, Falling = venditori.
-    Returns: {"cvd": float, "cvd_slope": float, "signal": "BUY"|"SELL"|"NEUTRAL"}
+    Soglia dinamica basata su std dei delta recenti — filtra rumore.
+    Returns: {"cvd": float, "cvd_slope": float, "threshold": float, "signal": "BUY"|"SELL"|"NEUTRAL"}
     """
     if len(_cvd_buffer) < 5:
-        return {"cvd": 0, "cvd_slope": 0, "signal": "NEUTRAL"}
+        return {"cvd": 0, "cvd_slope": 0, "threshold": 0, "signal": "NEUTRAL"}
 
     deltas = [d["delta"] for d in _cvd_buffer]
     cvd = sum(deltas)
@@ -872,13 +873,18 @@ def _compute_cvd_trend():
     else:
         slope = 0
 
+    # Soglia dinamica: CVD deve superare 0.7× std dei delta recenti
+    # In mercato rumoroso la soglia sale, in mercato calmo scende
+    threshold = float(np.std(recent)) * 0.7 if len(recent) > 5 else 0
+
     signal = "NEUTRAL"
-    if cvd > 0 and slope > 0:
+    if cvd > threshold and slope > 0:
         signal = "BUY"
-    elif cvd < 0 and slope < 0:
+    elif cvd < -threshold and slope < 0:
         signal = "SELL"
 
-    return {"cvd": round(cvd, 2), "cvd_slope": round(slope, 4), "signal": signal}
+    return {"cvd": round(cvd, 2), "cvd_slope": round(slope, 4),
+            "threshold": round(threshold, 2), "signal": signal}
 
 
 def _compute_oi_momentum():
@@ -1821,42 +1827,37 @@ def run_backtest():
     return results
 
 def is_signal_allowed(sig_type, direction):
-    """
-    Check if signal has edge from backtest.
-    V7.3: soglie rilassate — il backtest è informativo, non bloccante.
-    Il setup score + size scaling gestiscono la qualità.
-    Blocca SOLO segnali chiaramente perdenti (PF < 0.5 su entrambi).
-    """
+    """Backtest gate — recent PF >= 0.9 passa sempre, PF < 0.6 su entrambi blocca."""
     key = f"{sig_type}_{direction}"
     bt = _btc_bt_results.get(key, {})
     pf = bt.get("pf", 0)
     pf_recent = bt.get("pf_recent", 0)
     n = bt.get("n", 0)
     if n < 10:
-        return True  # not enough data — allow
-    # Passa se il recent mostra qualsiasi edge
-    if pf_recent >= 0.7:
         return True
-    # Blocca solo se ENTRAMBI sono chiaramente perdenti
-    if pf < 0.5 and pf_recent < 0.5:
+    if pf_recent >= 0.9:
+        return True
+    if pf < 0.6 and pf_recent < 0.6:
         return False
+    return True
     # Edge debole — permetti ma il setup score + ML scaleranno la size
     if pf >= 0.6 or pf_recent >= 0.6:
         return True
     return True  # nel dubbio, permetti — il mercato cambia
 def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     """
-    Flow trigger a 2 livelli:
-    FLOW_STRONG → tutte le condizioni (CVD + OB > 0.58 + OI non unwind + RSI + vol)
-    FLOW_WEAK   → fallback controllato (CVD + OB > 0.52 + OI non in unwind)
-    RANGE_LOW_VOL → None
+    Flow trigger a 2 livelli.
+    Usa CVD sopra soglia dinamica (std-based) + slope positivo.
+    CVD sopra threshold = pressione reale, non rumore.
+    Slope > 0 = la pressione sta accelerando.
     """
     cvd_data = flow_data.get("cvd_trend", {})
     ob_data = flow_data.get("ob_delta", {})
     oi_data = flow_data.get("oi_momentum", {})
 
     cvd = cvd_data.get("cvd", 0)
-    cvd_signal = cvd_data.get("signal", "NEUTRAL")
+    slope = cvd_data.get("cvd_slope", 0)
+    threshold = cvd_data.get("threshold", 0)
     ob = ob_data.get("imbalance_ratio", 0.5)
     oi = oi_data.get("oi_change_pct", 0)
     oi_signal = oi_data.get("signal", "NEUTRAL")
@@ -1864,24 +1865,24 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     direction = None
     sig_type = None
 
-    # ── FLOW_STRONG: tutte le condizioni ──
-    if (allow_long and cvd > 0 and cvd_signal == "BUY" and
+    # ── FLOW_STRONG: CVD sopra soglia + slope + OB forte + OI cresce ──
+    if (allow_long and cvd > threshold and slope > 0 and
         ob > 0.58 and oi_signal != "UNWIND" and oi > 0):
         direction = "LONG"; sig_type = "FLOW_STRONG"
-    elif (allow_short and cvd < 0 and cvd_signal == "SELL" and
+    elif (allow_short and cvd < -threshold and slope < 0 and
           ob < 0.42 and oi_signal != "UNWIND" and oi > 0):
         direction = "SHORT"; sig_type = "FLOW_STRONG"
 
-    # ── FLOW_WEAK: fallback controllato ──
-    elif (allow_long and cvd > 0 and cvd_signal == "BUY" and
-          ob > 0.52 and oi_signal in ("BUILDING", "NEUTRAL", "CONVICTION")):
+    # ── FLOW_WEAK: CVD sopra soglia + slope + OB conferma ──
+    elif (allow_long and cvd > threshold and slope > 0 and ob > 0.52 and
+          oi_signal in ("BUILDING", "CONVICTION")):
         direction = "LONG"; sig_type = "FLOW_WEAK"
-    elif (allow_short and cvd < 0 and cvd_signal == "SELL" and
-          ob < 0.48 and oi_signal in ("BUILDING", "NEUTRAL", "CONVICTION")):
+    elif (allow_short and cvd < -threshold and slope < 0 and ob < 0.48 and
+          oi_signal in ("BUILDING", "CONVICTION")):
         direction = "SHORT"; sig_type = "FLOW_WEAK"
 
     if direction:
-        details = f"CVD:{cvd:.1f}({cvd_signal}) OI:{oi:+.1f}%({oi_signal}) OB:{ob:.0%} [{regime}]"
+        details = f"CVD:{cvd:.1f}(thr:{threshold:.1f}) slope:{slope:.3f} OI:{oi:+.1f}%({oi_signal}) OB:{ob:.0%} [{regime}]"
         log_btc(f"⚡ {sig_type} {'BUY' if direction=='LONG' else 'SELL'} — {details}")
         return {"direction": direction, "sig_type": sig_type, "details": details}
 
@@ -6531,6 +6532,18 @@ def executor_thread_alt():
                             coin, direction, entry_px, mid_px, sig, mids
                         )
                         if exit_now:
+                            # PnL gate: AI può suggerire exit, ma serve PnL che lo giustifichi
+                            pnl_ratio = (mid_px - entry_px) / entry_px if direction == "LONG" else (entry_px - mid_px) / entry_px
+                            if pnl_ratio > 0.001 or pnl_ratio < -0.003:
+                                # In profitto >0.1% → prendi e scappa
+                                # In loss >-0.3% → taglia prima dello SL
+                                pass  # procedi con exit
+                            else:
+                                # Tra -0.3% e +0.1% → dai tempo al trade
+                                exit_now = False
+                                log_exec(f"[{coin}] AI vuole exit ma PnL {pnl_ratio:+.2%} in zona neutra — hold")
+
+                        if exit_now:
                             actual_size = round_to_decimals(abs(pos["szi"]), sz_decimals.get(coin, 4))
                             try:
                                 # Chiudi posizione a mercato
@@ -6942,6 +6955,24 @@ def btc_executor_loop(sz_dec, px_dec):
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
+                # ── DYNAMIC TP: profitto >= 1.5× ATR → chiudi ──
+                # ATR-based TP si adatta alla volatilità attuale
+                # In mercato volatile il target è più largo
+                if atr_now > 0:
+                    profit_abs = (mid - entry) if d == "LONG" else (entry - mid)
+                    if profit_abs >= atr_now * 1.5:
+                        log_btc(f"🎯 ATR TP HIT! profit:{profit_abs:.0f} >= 1.5×ATR({atr_now:.0f}={atr_now*1.5:.0f})")
+                        try:
+                            size_abs = rpx(abs(szi), sz_dec)
+                            close_px = rpx(mid * (0.9997 if d == "LONG" else 1.0003), px_dec)
+                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
+                                 {"limit": {"tif": "Ioc"}}, False, timeout=15)
+                            last_pos_state["close_reason"] = f"🎯 ATR TP ({profit_abs:.0f} >= {atr_now*1.5:.0f})"
+                            save_pos_state(last_pos_state)
+                            tg(f"🎯 <b>BTC ATR TP</b>\nProfit: {pnl_pct:+.2f}% ({profit_abs:.0f} >= 1.5×ATR)")
+                        except Exception as e:
+                            log_btc(f"ATR TP execution error: {e}")
+
                 # ══════════════════════════════════════════════════
                 # POST-ENTRY VALIDATION (runs once, 90-120s after entry)
                 # ══════════════════════════════════════════════════
@@ -7005,7 +7036,15 @@ def btc_executor_loop(sz_dec, px_dec):
                     except Exception as e:
                         log_btc(f"Post-validation error: {e}")
 
-                    # EARLY CUT: chiudi con IoC se validazione fallita
+                    # EARLY CUT: solo se PnL giustifica l'uscita
+                    if cut_reason:
+                        pnl_ratio = pnl_pct / 100  # convert to ratio
+                        if pnl_ratio > 0.001 or pnl_ratio < -0.003:
+                            log_btc(f"✂️ EARLY CUT — {cut_reason}")
+                        else:
+                            log_btc(f"⚠️ Validation fail ma PnL {pnl_pct:+.2f}% in zona neutra — hold")
+                            cut_reason = ""  # cancel cut
+
                     if cut_reason:
                         log_btc(f"✂️ EARLY CUT — {cut_reason}")
                         try:
