@@ -2225,10 +2225,7 @@ def check_signal():
     rr = tp_dist / sl_dist if sl_dist > 0 else 0
     log_btc(f"[{scalp_mode}] SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} ADX:{adx1h:.0f} lev:{actual_lev}x")
 
-    # Confidence sizing: AI confidence 1-10 → size multiplier 0.5-1.0
-    size_mult = 0.5 + (ai_confidence - 1) * 0.055  # 1→0.5, 5→0.72, 10→1.0
-    # (AI confidence sizing removed — flow trigger is the confidence)
-    # size_mult already set by 4-step hierarchy above
+    # size_mult already set by hierarchy (FLOW_STRONG/WEAK/TECH/MOMENTUM + trend + ML + sentiment)
 
     _last_ml_features = ml_features
 
