@@ -875,7 +875,7 @@ def _compute_cvd_trend():
 
     # Soglia dinamica: CVD deve superare 0.7× std dei delta recenti
     # In mercato rumoroso la soglia sale, in mercato calmo scende
-    threshold = float(np.std(recent)) * 0.7 if len(recent) > 5 else 0
+    threshold = float(np.std(recent)) * 0.3 if len(recent) > 5 else 0
 
     signal = "NEUTRAL"
     if cvd > threshold and slope > 0:
@@ -1243,48 +1243,41 @@ def ml_load_model():
 
 
 def compute_hourly_bias():
-    """Multi-timeframe Momentum + Order Flow + Sentiment → Fleet bias."""
-    global _last_oi, _btc_regime
-    fz = get_funding_z()
-    sentiment = get_sentiment_score()
-    current_oi = get_btc_open_interest()
-
-    oi_change = (current_oi - _last_oi) / _last_oi if _last_oi > 0 else 0
-    _last_oi = current_oi
-
-    short_momentum_5m = 0
-    short_momentum_1h = 0
+    """
+    Fleet bias basato su momentum BTC reale.
+    BTC è il leader — quando BTC si muove, le ALT seguono.
+    Bias NEUTRAL = ALT decidono per sé. LONG/SHORT = BTC sta spingendo.
+    """
+    global _last_oi
     try:
-        df_5m = fetch_df("15m", 2)
+        df_15m = fetch_df("15m", 3)
         df_1h = fetch_df("1h", 2)
-        if df_5m is not None and len(df_5m) >= 2:
-            short_momentum_5m = (float(df_5m['close'].iloc[-1]) / float(df_5m['close'].iloc[-2])) - 1
-        if df_1h is not None and len(df_1h) >= 2:
-            short_momentum_1h = (float(df_1h['close'].iloc[-1]) / float(df_1h['close'].iloc[-2])) - 1
-    except Exception as e:
-        log_btc(f"Bias momentum error: {e}")
+    except:
+        fleet_set_bias("NEUTRAL", "data error")
+        return "NEUTRAL"
 
-    if short_momentum_5m < -0.002:
-        bias = "SHORT_ONLY"; reason = f"FAST DUMP 5m ({short_momentum_5m:+.2%}) OI:{oi_change:+.2%}"
-    elif short_momentum_1h < -0.004:
-        bias = "SHORT_ONLY"; reason = f"1h DOWNTREND ({short_momentum_1h:+.2%})"
-    elif short_momentum_1h > 0.004:
-        bias = "LONG_ONLY"; reason = f"1h UPTREND ({short_momentum_1h:+.2%})"
-    elif sentiment < 25:
-        bias = "LONG_ONLY"; reason = f"EXTREME FEAR ({sentiment})"
-    elif _btc_regime == "RANGE_LOW_VOL":
-        bias = "NEUTRAL"; reason = f"LOW VOL — no trade"
-    elif _btc_regime in ("TREND", "TREND_STRONG"):
-        trend_up = ema9_1h > ema21_1h if 'ema9_1h' in dir() else short_momentum_1h > 0
-        if trend_up:
-            bias = "LONG_ONLY"; reason = f"TREND regime + up"
-        else:
-            bias = "SHORT_ONLY"; reason = f"TREND regime + down"
+    mom_15m = 0
+    mom_1h = 0
+    if df_15m is not None and len(df_15m) >= 3:
+        mom_15m = (float(df_15m['close'].iloc[-1]) / float(df_15m['close'].iloc[-3])) - 1  # 30min
+    if df_1h is not None and len(df_1h) >= 2:
+        mom_1h = (float(df_1h['close'].iloc[-1]) / float(df_1h['close'].iloc[-2])) - 1
+
+    # BTC si muove >0.15% in 30min → segnale per ALT
+    if mom_15m > 0.0015:
+        bias = "LONG_BIAS"; reason = f"BTC +{mom_15m:.2%}/30m"
+    elif mom_15m < -0.0015:
+        bias = "SHORT_BIAS"; reason = f"BTC {mom_15m:.2%}/30m"
+    # BTC si muove >0.4% in 1h → segnale forte
+    elif mom_1h > 0.004:
+        bias = "LONG_BIAS"; reason = f"BTC +{mom_1h:.2%}/1h"
+    elif mom_1h < -0.004:
+        bias = "SHORT_BIAS"; reason = f"BTC {mom_1h:.2%}/1h"
     else:
-        bias = "NEUTRAL"; reason = f"RANGE (F&G:{sentiment})"
+        bias = "NEUTRAL"; reason = f"BTC flat ({mom_15m:+.2%}/30m)"
 
     fleet_set_bias(bias, reason)
-    log_btc(f"Fleet bias: {bias} | {reason}")
+    log_btc(f"Fleet: {bias} | {reason}")
     return bias
 
 
@@ -1904,11 +1897,11 @@ def momentum_trigger(df_15m, allow_long=True, allow_short=True):
 
     move_pct = (c_now - c_2ago) / c_2ago
 
-    if allow_long and move_pct > 0.003 and vol >= 0.8:
+    if allow_long and move_pct > 0.0015 and vol >= 0.5:
         return {"direction": "LONG", "type": "MOMENTUM",
                 "details": f"move:+{move_pct:.2%}/30m vol:{vol:.1f}x"}
 
-    if allow_short and move_pct < -0.003 and vol >= 0.8:
+    if allow_short and move_pct < -0.0015 and vol >= 0.5:
         return {"direction": "SHORT", "type": "MOMENTUM",
                 "details": f"move:{move_pct:.2%}/30m vol:{vol:.1f}x"}
 
@@ -1927,12 +1920,12 @@ def technical_trigger(r, r_prev, allow_long=True, allow_short=True):
     vol = float(r['vol_rel'])
 
     # Pullback BUY: RSI oversold + MACD turning up + volume conferma
-    if allow_long and rsi < 40 and macd > macd_prev and vol >= 0.5:
+    if allow_long and rsi < 45 and macd > macd_prev and vol >= 0.3:
         return {"direction": "LONG", "type": "PULLBACK",
                 "details": f"RSI:{rsi:.0f} MACD↑ vol:{vol:.1f}x"}
 
     # Pullback SELL: RSI overbought + MACD turning down + volume conferma
-    if allow_short and rsi > 60 and macd < macd_prev and vol >= 0.5:
+    if allow_short and rsi > 55 and macd < macd_prev and vol >= 0.3:
         return {"direction": "SHORT", "type": "PULLBACK",
                 "details": f"RSI:{rsi:.0f} MACD↓ vol:{vol:.1f}x"}
 
@@ -6670,12 +6663,17 @@ def executor_thread_alt():
 
                     direction_sig = sig.get("direction", "")
 
-                    # Fleet bias: informativo, non bloccante
-                    # Le ALT hanno dinamiche proprie — FET può salire mentre BTC scende
-                    if fleet_bias == "LONG_ONLY" and direction_sig == "SHORT":
-                        log_exec(f"[{coin}] ⚠️ Fleet SHORT_ONLY ma ALT va SHORT — procedo")
-                    if fleet_bias == "SHORT_ONLY" and direction_sig == "LONG":
-                        log_exec(f"[{coin}] ⚠️ Fleet SHORT_ONLY ma ALT va LONG — procedo")
+                    # Fleet bias: BTC come leading indicator per ALT
+                    # LONG_BIAS/SHORT_BIAS = BTC si muove, ALT probabilmente seguono
+                    # Allineamento = conferma, disallineamento = procedi comunque (ALT ha dinamiche proprie)
+                    btc_aligns = (
+                        (fleet_bias == "LONG_BIAS" and direction_sig == "LONG") or
+                        (fleet_bias == "SHORT_BIAS" and direction_sig == "SHORT")
+                    )
+                    if btc_aligns:
+                        log_exec(f"[{coin}] ✦ BTC conferma {direction_sig} ({bias_reason})")
+                    elif fleet_bias != "NEUTRAL" and direction_sig:
+                        log_exec(f"[{coin}] ⚠️ BTC {fleet_bias} vs ALT {direction_sig} — procedo")
 
                     # ── FLEET: correlazione con posizione BTC ──
                     if btc_dir and coin in BTC_ETH_COINS:
