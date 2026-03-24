@@ -5911,15 +5911,15 @@ def is_active_window() -> bool:
     """45min ON / 20min OFF ogni 65min — 22 pause/giorno, ~500h/mese."""
     minute_of_day = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
     cycle = minute_of_day % 65
-    return cycle < 45  # primi 45 min del ciclo = ON, ultimi 20 = OFF
+    return cycle < 55  # 55min ON / 10min OFF — 85% uptime, meno pause più corte
 
 def minutes_until_pause() -> int:
     """Minuti rimanenti prima della prossima pausa. 0 = già in pausa."""
     minute_of_day = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
     cycle = minute_of_day % 65
-    if cycle >= 45:
+    if cycle >= 55:
         return 0
-    return 45 - cycle
+    return 55 - cycle
 
 def should_abort_cycle(prefix: str = "") -> bool:
     """
