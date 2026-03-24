@@ -80,6 +80,7 @@ SL_ATR_MULT = TREND_SL_ATR; TP_RR = TREND_TP_RR
 SL_MIN_PCT = TREND_SL_MIN; SL_MAX_PCT = TREND_SL_MAX
 TRAILING_ACTIVATE = 0.3; TRAILING_ATR = TREND_TRAIL_ATR
 PARTIAL_CLOSE_PCT = 0.4
+TRAILING_STOP_INTERVAL = 20  # check trailing ogni 20s
 FUNDING_BLOCK_THRESH = 0.0003
 SLIPPAGE = 0.001; GTC_TIMEOUT = 6
 DRIFT_MAX_FAVORABLE = 0.004; DRIFT_MAX_ADVERSE = 0.008
@@ -1297,6 +1298,8 @@ _btc_regime_ts = 0
 _btc_bt_results = {}
 _btc_bt_ts = 0
 _btc_current_signal = None
+_btc_sl_oid = None
+_btc_tp_oid = None
 _btc_coin_meta = {}
 _btc_funding_history = []
 _btc_oi_cache = 0.0
@@ -1727,38 +1730,18 @@ def run_backtest():
             #    (la volatilità al momento dell'entry)
             prev_range = h[entry_bar - 1] - l[entry_bar - 1]
             slippage_pct = min(prev_range / (entry_open + 1e-10) * 0.3, 0.003)  # max 0.3%
-            # Slippage sempre sfavorevole
+            # Slippage + fee sempre sfavorevoli
+            fee = 0.0005  # 0.05% per lato
             if sig_dir == "LONG":
-                px_entry = entry_open * (1 + slippage_pct)  # compri più alto dell'open
+                px_entry = entry_open * (1 + slippage_pct + fee)
             else:
-                px_entry = entry_open * (1 - slippage_pct)  # vendi più basso dell'open
+                px_entry = entry_open * (1 - slippage_pct - fee)
 
-            # ── Detect mode per questa candela ──
-            adx_i = adx1h[i] if not np.isnan(adx1h[i]) else 20
-            vol_i = vol5[i]
-            e9 = ema9_1h[i]; e21 = ema21_1h[i]
-            is_trend = (e9 > e21) or (e9 < e21)
-
-            if vol_i >= 3.0:
-                m_sl_atr, m_sl_min, m_sl_max = FLASH_SL_ATR, FLASH_SL_MIN, FLASH_SL_MAX
-                m_tp_fixed = FLASH_TP_PCT
-                m_tp_rr = 0
-            elif adx_i > 25 and is_trend:
-                m_sl_atr, m_sl_min, m_sl_max = TREND_SL_ATR, TREND_SL_MIN, TREND_SL_MAX
-                m_tp_fixed = 0
-                m_tp_rr = TREND_TP_RR
-            else:
-                m_sl_atr, m_sl_min, m_sl_max = RANGE_SL_ATR, RANGE_SL_MIN, RANGE_SL_MAX
-                m_tp_fixed = RANGE_TP_PCT
-                m_tp_rr = 0
-
-            sl_d = max(atr_i * m_sl_atr, px_entry * m_sl_min)
-            sl_d = min(sl_d, px_entry * m_sl_max)
-            if m_tp_fixed > 0:
-                tp_d = px_entry * m_tp_fixed
-            else:
-                tp_d = sl_d * m_tp_rr
-            tp_d = max(tp_d, px_entry * TP_PRICE_PCT * 0.8)
+            # SL/TP: ATR-based (come il live)
+            sl_d = atr_i * 1.2
+            tp_d = atr_i * 1.8
+            sl_d = max(sl_d, px_entry * 0.003)
+            tp_d = max(tp_d, px_entry * 0.003)
 
             # 4. TP/SL CHECK: da entry_bar+1 in poi (non dalla candela segnale)
             check_start = entry_bar + 1
@@ -1784,11 +1767,11 @@ def run_backtest():
             win = 1 if tp_f < sl_f else 0
             if win:
                 # TP hit — slippage minima (prezzo favorevole)
-                net_gain = tp_d * 0.95  # 5% haircut per slippage su TP
+                net_gain = tp_d - (px_entry * fee)  # TP minus exit fee
                 ret = net_gain / px_entry
             else:
                 # SL hit — slippage peggiore (market order in panico)
-                net_loss = sl_d * 1.10  # 10% extra loss per slippage su SL
+                net_loss = sl_d + (px_entry * fee)  # SL plus exit fee
                 ret = -net_loss / px_entry
 
             trades.append((win, ret, tp_d * 0.95 if win else 0, sl_d * 1.10 if not win else 0))
@@ -2620,7 +2603,7 @@ def recover_position(sz_dec, px_dec):
 
     if not has_sl:
         # Emergency SL at 3× SL_MAX_PCT (wide, just protection)
-        emergency_dist = entry * SL_MAX_PCT * 2
+        emergency_dist = entry * 0.01  # 1%
         if d == "LONG":
             sl_px = rpx(entry - emergency_dist, px_dec)
         else:
@@ -2706,19 +2689,32 @@ def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
     if d == "SHORT" and new_ts >= old_ts and old_ts > 0:
         return
 
-    # Aggiorna SL su exchange
+    # Aggiorna SL su exchange — cancel old by OID, place new
     try:
-        orders = get_open_orders()
-        for o in orders:
-            if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
-                call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
-        time.sleep(0.3)
+        global _btc_sl_oid
+        if _btc_sl_oid:
+            try:
+                call(_exchange.cancel, BTC_COIN, _btc_sl_oid, timeout=10)
+            except:
+                pass  # OID might be stale, try scan fallback
+        else:
+            # Fallback: scan open orders
+            orders = get_open_orders()
+            for o in orders:
+                if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
+                    call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
+        time.sleep(0.2)
 
         size_abs = rpx(abs(szi), sz_dec)
         is_buy = d == "LONG"
-        call(_exchange.order, BTC_COIN, not is_buy, size_abs, new_ts,
+        sl_res = call(_exchange.order, BTC_COIN, not is_buy, size_abs, new_ts,
              {"trigger": {"triggerPx": new_ts, "isMarket": True, "tpsl": "sl"}},
              True, timeout=15)
+        # Update OID
+        if sl_res and sl_res.get("status") == "ok":
+            for s in sl_res.get("response", {}).get("data", {}).get("statuses", []):
+                if "resting" in s:
+                    _btc_sl_oid = s["resting"]["oid"]
 
         pos_state["current_ts"] = new_ts
         pos_state["trailing_moves"] = pos_state.get("trailing_moves", 0) + 1
@@ -3008,15 +3004,25 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
             tp_px = rpx(actual_entry - new_sl_dist * TP_RR, px_dec)
         log_btc(f"⚠️ Lev {actual_lev}x → SL/TP ricalcolati")
 
-    # ── Place SL + TP ──
+    # ── Place SL + TP — capture OIDs for later cancel/update ──
+    sl_oid = None
+    tp_oid = None
     try:
-        call(_exchange.order, BTC_COIN, not is_buy, actual_size, sl_px,
+        sl_res = call(_exchange.order, BTC_COIN, not is_buy, actual_size, sl_px,
              {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
              True, timeout=15)
+        if sl_res and sl_res.get("status") == "ok":
+            for s in sl_res.get("response", {}).get("data", {}).get("statuses", []):
+                if "resting" in s:
+                    sl_oid = s["resting"]["oid"]
         time.sleep(0.2)
-        call(_exchange.order, BTC_COIN, not is_buy, actual_size, tp_px,
+        tp_res = call(_exchange.order, BTC_COIN, not is_buy, actual_size, tp_px,
              {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
              True, timeout=15)
+        if tp_res and tp_res.get("status") == "ok":
+            for s in tp_res.get("response", {}).get("data", {}).get("statuses", []):
+                if "resting" in s:
+                    tp_oid = s["resting"]["oid"]
     except Exception as e:
         log_btc(f"🚨 SL/TP ERROR: {e}")
         tg(f"🚨 BTC SL/TP ERROR — check!")
@@ -3027,10 +3033,15 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     tp_pct_real = abs(tp_px - actual_entry) / actual_entry * 100
 
     log_btc(f"✅ FILLED @ {actual_entry} size:{actual_size} lev:{actual_lev}x "
-            f"SL:{sl_px}({sl_pct_real:.2f}%) TP:{tp_px}({tp_pct_real:.2f}%)")
+            f"SL:{sl_px}({sl_pct_real:.2f}%) TP:{tp_px}({tp_pct_real:.2f}%) "
+            f"sl_oid:{sl_oid} tp_oid:{tp_oid}")
     tg(f"{'🟢' if is_buy else '🔴'} <b>BTC</b> {direction} @ {actual_entry}\n"
        f"SL:{sl_px} ({sl_pct_real:.1f}%) | TP:{tp_px} ({tp_pct_real:.1f}%)\n"
        f"Size:{actual_size} | Lev:{actual_lev}x | Risk:${BTC_RISK_USD*size_mult:.1f}")
+    # Return OIDs for trailing SL management
+    global _btc_sl_oid, _btc_tp_oid
+    _btc_sl_oid = sl_oid
+    _btc_tp_oid = tp_oid
     return True
 
 
@@ -6800,7 +6811,7 @@ def _recover_unprotected_positions():
                     continue
 
                 # SL emergenza: 3% dal prezzo corrente (conservativo)
-                emergency_dist = mid_px * 0.03
+                emergency_dist = mid_px * 0.01  # 1%
                 if direction == "LONG":
                     sl_px = mid_px - emergency_dist
                 else:
@@ -6918,13 +6929,14 @@ def btc_executor_loop(sz_dec, px_dec):
                 open_ts = last_pos_state.get("open_ts", time.time() - 3600)
                 real_exit, real_pnl = btc_compute_real_exit(d, entry, open_ts)
 
-                if real_exit > 0 and real_pnl != 0:
-                    exit_px = real_exit; pnl_pct = real_pnl * 100
-                    pnl_usd = real_pnl * size_abs * entry
-                else:
-                    exit_px = mid
-                    pnl_pct = ((mid - entry)/entry if d == "LONG" else (entry - mid)/entry) * 100
-                    pnl_usd = pnl_pct/100 * size_abs * entry
+                if real_exit <= 0 or real_pnl == 0:
+                    # Dati fill non ancora disponibili — riprova al prossimo ciclo
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue
+
+                exit_px = real_exit
+                pnl_pct = real_pnl * 100
+                pnl_usd = real_pnl * size_abs * entry
 
                 close_reason = last_pos_state.get("close_reason", "")
                 if not close_reason:
@@ -6985,6 +6997,23 @@ def btc_executor_loop(sz_dec, px_dec):
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
+                # ── INSTANT CUT: loss > -0.15% → chiudi subito ──
+                # Non aspettare lo SL a -0.3%. Se dopo pochi secondi sei già a -0.15%
+                # il trade è sbagliato — taglia prima che peggiori.
+                pnl_ratio = pnl_pct / 100
+                if pnl_ratio < -0.0015 and time_in_trade > 30:
+                    log_btc(f"✂️ INSTANT CUT — loss {pnl_pct:+.2f}% > -0.15% dopo {time_in_trade:.0f}s")
+                    try:
+                        size_abs = rpx(abs(szi), sz_dec)
+                        close_px = rpx(mid, px_dec)
+                        call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
+                             {"limit": {"tif": "Ioc"}}, False, timeout=15)
+                        last_pos_state["close_reason"] = f"✂️ Instant cut {pnl_pct:+.2f}%"
+                        save_pos_state(last_pos_state)
+                        tg(f"✂️ <b>BTC INSTANT CUT</b>\n{pnl_pct:+.2f}%")
+                    except Exception as e:
+                        log_btc(f"Instant cut error: {e}")
+
                 # ── DYNAMIC TP: profitto >= 1.5× ATR → chiudi ──
                 if atr_now > 0:
                     profit_abs = (mid - entry) if d == "LONG" else (entry - mid)
@@ -6992,7 +7021,7 @@ def btc_executor_loop(sz_dec, px_dec):
                         log_btc(f"🎯 ATR TP HIT! profit:{profit_abs:.0f} >= 1.5×ATR({atr_now:.0f})")
                         try:
                             size_abs = rpx(abs(szi), sz_dec)
-                            close_px = rpx(mid * (0.9997 if d == "LONG" else 1.0003), px_dec)
+                            close_px = rpx(mid, px_dec)
                             call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
                                  {"limit": {"tif": "Ioc"}}, False, timeout=15)
                             last_pos_state["close_reason"] = f"🎯 ATR TP"
@@ -7029,7 +7058,7 @@ def btc_executor_loop(sz_dec, px_dec):
                         log_btc(f"💰 SMART TP — in profit +{pnl_pct:.2f}% ma {reason} → chiudi")
                         try:
                             size_abs = rpx(abs(szi), sz_dec)
-                            close_px = rpx(mid * (0.9997 if d == "LONG" else 1.0003), px_dec)
+                            close_px = rpx(mid, px_dec)
                             call(_exchange.order, BTC_COIN, d != "LONG", size_abs, close_px,
                                  {"limit": {"tif": "Ioc"}}, False, timeout=15)
                             last_pos_state["close_reason"] = f"💰 Smart TP +{pnl_pct:.2f}%"
@@ -7123,11 +7152,34 @@ def btc_executor_loop(sz_dec, px_dec):
                         except Exception as e:
                             log_btc(f"Early cut execution error: {e}")
 
-                # Normal management: trailing + partial
-                if atr_now > 0 and trade_mode == "TREND":
-                    update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
-                if trade_mode == "TREND":
-                    btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
+                # ── MODE-SPECIFIC MANAGEMENT ──
+                # RANGE → TP veloce, no trailing (mean reversion, prendi e scappa)
+                # TREND → trailing forte (lascia correre il momentum)
+                # FLASH → TP fisso, niente gestione (dentro e fuori veloce)
+                last_trail_check = last_pos_state.get("last_trail_check", 0)
+
+                if trade_mode == "RANGE":
+                    # TP veloce: se in profitto >0.1% → chiudi
+                    if pnl_pct > 0.1:
+                        log_btc(f"💰 RANGE TP — +{pnl_pct:.2f}% → chiudi")
+                        try:
+                            size_abs = rpx(abs(szi), sz_dec)
+                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs,
+                                 rpx(mid, px_dec), {"limit": {"tif": "Ioc"}}, False, timeout=15)
+                            last_pos_state["close_reason"] = f"💰 RANGE TP +{pnl_pct:.2f}%"
+                            save_pos_state(last_pos_state)
+                        except Exception as e:
+                            log_btc(f"RANGE TP error: {e}")
+
+                elif trade_mode == "TREND":
+                    # Trailing + partial close
+                    if time.time() - last_trail_check >= TRAILING_STOP_INTERVAL:
+                        last_pos_state["last_trail_check"] = time.time()
+                        if atr_now > 0:
+                            update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
+                        btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
+
+                # FLASH: niente gestione — SL/TP fissi sull'exchange fanno tutto
 
                 # Fleet: pubblica posizione BTC per ALT engine
                 fleet_set_btc_position({"direction": d, "size": abs(szi), "entry": entry})
