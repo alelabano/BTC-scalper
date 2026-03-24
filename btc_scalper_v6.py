@@ -80,7 +80,7 @@ SL_ATR_MULT = TREND_SL_ATR; TP_RR = TREND_TP_RR
 SL_MIN_PCT = TREND_SL_MIN; SL_MAX_PCT = TREND_SL_MAX
 TRAILING_ACTIVATE = 0.3; TRAILING_ATR = TREND_TRAIL_ATR
 PARTIAL_CLOSE_PCT = 0.4
-TRAILING_STOP_INTERVAL = 20  # check trailing ogni 20s
+TRAILING_STOP_INTERVAL = 15  # check trailing ogni 20s
 FUNDING_BLOCK_THRESH = 0.0003
 SLIPPAGE = 0.001; GTC_TIMEOUT = 6
 DRIFT_MAX_FAVORABLE = 0.004; DRIFT_MAX_ADVERSE = 0.008
@@ -2968,6 +2968,24 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         _btc_is_trading = False
 
 
+def btc_market_close(side, size, mid, sz_dec, px_dec):
+    """
+    Chiudi posizione con IoC aggressivo (simula market order).
+    Prezzo 0.5% sfavorevole = fill garantito.
+    """
+    is_long = side == "LONG"
+    # Prezzo aggressivo: vendi basso, compra alto
+    close_px = rpx(mid * (0.995 if is_long else 1.005), px_dec)
+    size_abs = rpx(size, sz_dec)
+    try:
+        res = call(_exchange.order, BTC_COIN, not is_long, size_abs, close_px,
+                   {"limit": {"tif": "Ioc"}}, False, timeout=15)
+        return res and res.get("status") == "ok"
+    except Exception as e:
+        log_btc(f"Market close error: {e}")
+        return False
+
+
 # ================================================================
 # THREAD A — SCANNER (regime + backtest ogni 5 min)
 # ================================================================
@@ -3717,10 +3735,17 @@ def update_mechanical_trailing(coin, pos, mid, atr, direction, open_trade_meta,
         return
 
     try:
-        orders = get_open_trigger_orders(coin)
-        for o in orders:
-            if o.get("orderType") == "Stop Market":
-                cancel_order(coin, o["oid"])
+        # Cancel solo il nostro SL per OID
+        sl_oid = meta.get("sl_oid")
+        if sl_oid:
+            try: cancel_order(coin, sl_oid)
+            except: pass
+        else:
+            # Fallback: scan (solo per vecchie posizioni senza OID)
+            orders = get_open_trigger_orders(coin)
+            for o in orders:
+                if o.get("orderType") == "Stop Market":
+                    cancel_order(coin, o["oid"])
         time.sleep(0.3)
         size_abs = round_to_decimals(abs(szi), sz_dec.get(coin, 2))
         call(_exchange.order, str(coin), not is_long, size_abs, new_ts,
@@ -6861,17 +6886,24 @@ def btc_executor_loop(sz_dec, px_dec):
 
             # ── Detect trade close ──
             if last_pos_state is not None and pos is None:
-                entry = last_pos_state["entry"]
-                szi = last_pos_state["szi"]
-                d = "LONG" if szi > 0 else "SHORT"
-                size_abs = abs(szi)
+                entry = last_pos_state.get("entry_px", last_pos_state.get("entry", 0))
+                szi = last_pos_state.get("szi", 0)
+                d = last_pos_state.get("side", "LONG" if szi > 0 else "SHORT")
+                size_abs = last_pos_state.get("size", abs(szi))
 
-                open_ts = last_pos_state.get("open_ts", time.time() - 3600)
+                open_ts = last_pos_state.get("open_ts", last_pos_state.get("entry_time", time.time() - 3600))
                 real_exit, real_pnl = btc_compute_real_exit(d, entry, open_ts)
 
-                if real_exit <= 0 or real_pnl == 0:
-                    # Dati fill non ancora disponibili — riprova al prossimo ciclo
-                    time.sleep(BTC_SCAN_INTERVAL)
+                if real_exit <= 0:
+                    # Fill non disponibili — riprova max 3 volte poi skip
+                    retry = last_pos_state.get("_exit_retry", 0) + 1
+                    last_pos_state["_exit_retry"] = retry
+                    if retry >= 3:
+                        log_btc(f"⚠️ Exit unknown dopo {retry} tentativi — skip trade logging")
+                        save_pos_state(None)
+                        last_pos_state = None
+                    else:
+                        time.sleep(BTC_SCAN_INTERVAL)
                     continue
 
                 exit_px = real_exit
@@ -6942,15 +6974,10 @@ def btc_executor_loop(sz_dec, px_dec):
                 pnl_ratio = pnl_pct / 100
                 if pnl_ratio < -0.0015 and time_in_trade > 30:
                     log_btc(f"✂️ EARLY CUT {pnl_pct:+.2f}%")
-                    try:
-                        size_abs = rpx(abs(szi), sz_dec)
-                        call(_exchange.order, BTC_COIN, d != "LONG", size_abs,
-                             rpx(mid, px_dec), {"limit": {"tif": "Ioc"}}, False, timeout=15)
-                        last_pos_state["close_reason"] = f"✂️ Cut {pnl_pct:+.2f}%"
-                        save_pos_state(last_pos_state)
-                        tg(f"✂️ <b>BTC CUT</b> {pnl_pct:+.2f}%")
-                    except Exception as e:
-                        log_btc(f"Cut error: {e}")
+                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
+                    last_pos_state["close_reason"] = f"✂️ Cut {pnl_pct:+.2f}%"
+                    save_pos_state(last_pos_state)
+                    tg(f"✂️ <b>BTC CUT</b> {pnl_pct:+.2f}%")
 
                 # ── 2. PARTIAL CLOSE: +0.4% → chiudi 40% ──
                 elif trade_mode == "TREND":
@@ -6958,17 +6985,11 @@ def btc_executor_loop(sz_dec, px_dec):
 
                 # ── 3. MODE-SPECIFIC ──
                 if trade_mode == "RANGE" and pnl_pct > 0.1:
-                    # RANGE: TP veloce
                     log_btc(f"💰 RANGE TP +{pnl_pct:.2f}%")
-                    try:
-                        size_abs = rpx(abs(szi), sz_dec)
-                        call(_exchange.order, BTC_COIN, d != "LONG", size_abs,
-                             rpx(mid, px_dec), {"limit": {"tif": "Ioc"}}, False, timeout=15)
-                        last_pos_state["close_reason"] = f"💰 RANGE TP"
-                        save_pos_state(last_pos_state)
-                    except: pass
+                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
+                    last_pos_state["close_reason"] = f"💰 RANGE TP"
+                    save_pos_state(last_pos_state)
                 elif trade_mode == "TREND" and atr_now > 0:
-                    # TREND: trailing
                     last_trail = last_pos_state.get("last_trail_check", 0)
                     if time.time() - last_trail >= TRAILING_STOP_INTERVAL:
                         last_pos_state["last_trail_check"] = time.time()
