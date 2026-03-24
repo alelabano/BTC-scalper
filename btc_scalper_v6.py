@@ -2958,6 +2958,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     # ── PRICE: market price + piccolo slippage ──
     order_px = get_mid()
     if order_px <= 0:
+        log_btc(f"❌ get_mid() failed — cannot execute")
         return False
 
     if is_buy:
@@ -3002,7 +3003,7 @@ def _execute_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         log_btc(f"Order error: {e}")
 
     if not filled:
-        log_btc(f"❌ IoC not filled — no trade")
+        log_btc(f"❌ IoC not filled — res: {res}")
         return False
 
     # ── Conferma posizione ──
