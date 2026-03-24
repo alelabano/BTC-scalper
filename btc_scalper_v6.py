@@ -6644,18 +6644,12 @@ def executor_thread_alt():
 
                     direction_sig = sig.get("direction", "")
 
-                    # ── FLEET: bias filter dal BTC Scalper ──
+                    # Fleet bias: informativo, non bloccante
+                    # Le ALT hanno dinamiche proprie — FET può salire mentre BTC scende
                     if fleet_bias == "LONG_ONLY" and direction_sig == "SHORT":
-                        log_exec(f"[{coin}] skip SHORT — Fleet bias: LONG_ONLY ({bias_reason})")
-                        continue
+                        log_exec(f"[{coin}] ⚠️ Fleet SHORT_ONLY ma ALT va SHORT — procedo")
                     if fleet_bias == "SHORT_ONLY" and direction_sig == "LONG":
-                        log_exec(f"[{coin}] skip LONG — Fleet bias: SHORT_ONLY ({bias_reason})")
-                        continue
-
-                    # ── FLEET: BTC regime override ──
-                    if btc_regime == "BEAR" and direction_sig == "LONG" and coin not in BTC_ETH_COINS:
-                        log_exec(f"[{coin}] skip LONG — BTC regime BEAR")
-                        continue
+                        log_exec(f"[{coin}] ⚠️ Fleet SHORT_ONLY ma ALT va LONG — procedo")
 
                     # ── FLEET: correlazione con posizione BTC ──
                     if btc_dir and coin in BTC_ETH_COINS:
