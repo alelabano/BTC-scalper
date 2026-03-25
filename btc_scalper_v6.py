@@ -2945,14 +2945,23 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         _btc_sl_oid = None
         _btc_tp_oid = None
         try:
+            # SL sull'exchange (safety net)
             sl_res = call(_exchange.order, BTC_COIN, not is_long, size_real, sl_px,
                          {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
                          True, timeout=15)
             if sl_res and sl_res.get("status") == "ok":
                 for s in sl_res.get("response", {}).get("data", {}).get("statuses", []):
                     if "resting" in s: _btc_sl_oid = s["resting"]["oid"]
+            time.sleep(0.2)
+            # TP sull'exchange (prende profitto automatico)
+            tp_res = call(_exchange.order, BTC_COIN, not is_long, size_real, tp_px,
+                         {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
+                         True, timeout=15)
+            if tp_res and tp_res.get("status") == "ok":
+                for s in tp_res.get("response", {}).get("data", {}).get("statuses", []):
+                    if "resting" in s: _btc_tp_oid = s["resting"]["oid"]
         except Exception as e:
-            log_btc(f"🚨 SL ERROR: {e}")
+            log_btc(f"🚨 SL/TP ERROR: {e}")
 
         _btc_last_trade_ts = time.time()
         sl_pct = abs(entry_real - sl_px) / entry_real * 100
