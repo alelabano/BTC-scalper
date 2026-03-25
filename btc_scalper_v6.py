@@ -5606,14 +5606,14 @@ def open_trade(coin, signal, mids, sz_dec, px_dec) -> bool:
 
         oid = None
         try:
-            # Recuperiamo l'ID dell'ordine dallo stato dell'ordine GTC (Step 1)
-            # 'res' qui deve essere la risposta dell'ordine inviato nello Step 1
-            statuses = res.get("response", {}).get("data", {}).get("statuses", [])
-            if statuses:
-                # Cerchiamo l'oid sia se l'ordine è 'resting' (nel book) sia se è già 'filled'
-                status_info = statuses[0]
-                oid = (status_info.get("resting", {}) or {}).get("oid") or \
-                      (status_info.get("filled", {}) or {}).get("oid")
+            if res is None:
+                log_err(f"[{coin}] Order response is None — API failed")
+            else:
+                statuses = res.get("response", {}).get("data", {}).get("statuses", [])
+                if statuses:
+                    status_info = statuses[0]
+                    oid = (status_info.get("resting", {}) or {}).get("oid") or \
+                          (status_info.get("filled", {}) or {}).get("oid")
         except Exception as e:
             log_err(f"[{coin}] Errore nel recupero dell'OID: {e}")
 
