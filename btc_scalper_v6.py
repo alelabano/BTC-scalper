@@ -3264,7 +3264,7 @@ def processor_thread(sz_dec, px_dec):
 _state_lock = threading.Lock()
 _scanner_lock = threading.Lock()
 _alt_scanner_ready = threading.Event()
-COIN_BLACKLIST = set()  # coins to never trade
+COIN_BLACKLIST = {"kPEPE", "kBONK", "kSHIB", "kFLOKI", "NEIRO", "LUCE", "GOAT"}  # coins to never trade
 pending_orders = {}  # {coin: {oid, placed_at, signal, ...}}
 last_trade_time = {}  # {coin: timestamp}
 BTC_ETH_COINS = {"BTC", "ETH"}  # high-cap coins with different signal_max_age
