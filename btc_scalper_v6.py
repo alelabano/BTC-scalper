@@ -92,7 +92,7 @@ DAILY_REPORT_HOUR = 0
 TIMEFRAME_TREND = "1h"; TIMEFRAME_SETUP = "15m"; TIMEFRAME_ENTRY = "5m"
 LOOKBACK_DAYS_TREND = 60; LOOKBACK_DAYS_SETUP = 14; LOOKBACK_DAYS_ENTRY = 5
 MIN_CANDLES_TREND = 200; MIN_CANDLES_SETUP = 200; MIN_CANDLES_ENTRY = 200
-MIN_VOLUME_24H_USD = 1_000_000; MIN_VOLUME_TREND_MULT = 1.8
+MIN_VOLUME_24H_USD = 200_000; MIN_VOLUME_TREND_MULT = 1.8
 FORWARD_WINDOW = 36
 MIN_PRECISION = 0.35; MIN_PRECISION_FLOOR = 0.28
 MIN_PROFIT_FACTOR = 0.9; MIN_PROFIT_FACTOR_FLOOR = 0.6
@@ -6753,7 +6753,6 @@ def executor_thread_alt():
                             continue
                         if direction_sig == "LONG" and btc_change_fast < -0.005:
                             log_exec(f"[{coin}] ⏳ LONG rimandato: BTC scende {btc_change_fast:+.2%} in 15min")
-                            continue
                             continue
 
                     log_exec(f"→ {coin} [{direction_sig}] score:{sig.get('score'):.3f}")
