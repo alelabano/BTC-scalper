@@ -1292,6 +1292,8 @@ _btc_last_trade_ts = 0
 _btc_consec_losses = 0
 _btc_params = {}
 _btc_is_trading = False
+_btc_start_balance = None
+_btc_kill_switch = False
 _btc_pending_order = {}
 _btc_regime = "RANGE"
 _btc_regime_ts = 0
@@ -3088,6 +3090,30 @@ def processor_thread(sz_dec, px_dec):
 
             if _btc_is_trading:
                 time.sleep(BTC_SCAN_INTERVAL)
+                continue
+
+            # ── KILL SWITCH: daily loss limit ──
+            global _btc_start_balance, _btc_kill_switch
+            bal = get_balance()
+            if _btc_start_balance is None:
+                _btc_start_balance = bal
+                log_btc(f"📊 Start balance: ${bal:.2f}")
+
+            if bal > 0 and _btc_start_balance > 0:
+                daily_loss_pct = (1 - bal / _btc_start_balance) * 100
+                if daily_loss_pct >= MAX_DAILY_LOSS_PCT:
+                    if not _btc_kill_switch:
+                        _btc_kill_switch = True
+                        log_btc(f"🛑 KILL SWITCH — daily loss {daily_loss_pct:.1f}% >= {MAX_DAILY_LOSS_PCT}%")
+                        tg(f"🛑 <b>KILL SWITCH</b>\nDaily loss: {daily_loss_pct:.1f}%\nStart: ${_btc_start_balance:.2f} → Now: ${bal:.2f}")
+
+            if _btc_kill_switch:
+                time.sleep(300)  # check ogni 5 min se il giorno è cambiato
+                # Reset a mezzanotte UTC
+                if datetime.now(timezone.utc).hour == 0 and datetime.now(timezone.utc).minute < 6:
+                    _btc_kill_switch = False
+                    _btc_start_balance = bal
+                    log_btc(f"📊 Kill switch reset — new day, balance: ${bal:.2f}")
                 continue
 
             # ── DETECT ──
