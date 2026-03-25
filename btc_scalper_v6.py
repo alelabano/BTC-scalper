@@ -191,17 +191,16 @@ def tg(msg, silent=False):
 
 _api_call_times = []
 _api_lock = threading.Lock()
-API_MAX_CALLS_PER_MIN = 80  # Hyperliquid limit ~120, stay safe
+API_MAX_CALLS_PER_MIN = 40  # Aggressive limit — stop 429s
 
 def call(fn, *a, timeout=20, label='', **kw):
-    # Rate limiter: max 80 calls/min across all threads
     with _api_lock:
         now = time.time()
         _api_call_times[:] = [t for t in _api_call_times if now - t < 60]
         if len(_api_call_times) >= API_MAX_CALLS_PER_MIN:
-            wait = 60 - (now - _api_call_times[0]) + 0.5
+            wait = 61 - (now - _api_call_times[0])
             if wait > 0:
-                time.sleep(min(wait, 10))  # max 10s wait
+                time.sleep(wait)  # full wait, no cap
         _api_call_times.append(time.time())
     f = _pool.submit(fn, *a, **kw)
     try: return f.result(timeout=timeout)
