@@ -2121,34 +2121,41 @@ def check_signal():
     oi_chg = get_oi_change()
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
-    # SL = 1.2× ATR, TP = 1.8× ATR → R:R = 1:1.5
+    # SL = 1.2× ATR
+    # TP1 = ATR×1.0 → chiudi 50% (profitto veloce)
+    # TP2 = ATR×1.8 → chiudi resto (lascia correre)
     sl_dist = atr5 * 1.2
-    tp_dist = atr5 * 1.8
+    tp1_dist = atr5 * 1.0
+    tp2_dist = atr5 * 1.8
 
-    # Floor: SL minimo 0.3%, TP minimo 0.3%
+    # Floor
     sl_dist = max(sl_dist, px * 0.003)
-    tp_dist = max(tp_dist, px * 0.003)
+    tp1_dist = max(tp1_dist, px * 0.002)
+    tp2_dist = max(tp2_dist, px * 0.003)
 
-    # Expectation strategy modifica TP
+    # Expectation strategy
     sl_dist *= sl_mult
-    tp_dist *= tp_mult
+    tp1_dist *= tp_mult
+    tp2_dist *= tp_mult
 
     if direction == "LONG":
         sl = px - sl_dist
-        tp = px + tp_dist
+        tp = px + tp2_dist   # TP exchange = TP2 (il più lontano)
+        tp1 = px + tp1_dist
     else:
         sl = px + sl_dist
-        tp = px - tp_dist
+        tp = px - tp2_dist
+        tp1 = px - tp1_dist
 
     sl_pct = sl_dist / px * 100
-    tp_pct = tp_dist / px * 100
-    rr = tp_dist / sl_dist if sl_dist > 0 else 0
-    log_btc(f"SL:{sl_pct:.2f}% TP:{tp_pct:.2f}% R:R=1:{rr:.1f} [{strategy}]")
+    tp1_pct = tp1_dist / px * 100
+    tp2_pct = tp2_dist / px * 100
+    log_btc(f"SL:{sl_pct:.2f}% TP1:{tp1_pct:.2f}%(50%) TP2:{tp2_pct:.2f}%(rest) [{strategy}]")
 
     _last_ml_features = ml_features
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
-            size_mult, regime, 50, scalp_mode, ml_features)
+            size_mult, regime, 50, scalp_mode, ml_features, tp1)
 
 # ================================================================
 # EXECUTION
@@ -2729,33 +2736,40 @@ def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
 # PARTIAL CLOSE
 # ================================================================
 def btc_check_partial_close(pos_state, mid, sz_dec, px_dec):
-    """Partial close 40% a +0.4% di profitto. Market order, niente edge perso."""
+    """
+    TP1 = ATR×1.0 → chiudi 50%. Il resto corre fino a TP2 (exchange) o trailing.
+    """
     if pos_state.get("partial_done"):
         return
 
     is_long = pos_state.get("side", "LONG" if pos_state.get("szi", 0) > 0 else "SHORT") == "LONG"
-    entry = pos_state.get("entry_px", pos_state.get("entry", 0))
-    size = pos_state.get("size", abs(pos_state.get("szi", 0)))
+    tp1 = pos_state.get("tp1_px", 0)
 
-    pnl = (mid - entry) / entry if is_long else (entry - mid) / entry
-    if pnl < 0.004:
+    if tp1 <= 0:
         return
 
-    close_size = rpx(size * 0.4, sz_dec)
+    # TP1 raggiunto?
+    hit = (is_long and mid >= tp1) or (not is_long and mid <= tp1)
+    if not hit:
+        return
+
+    size = pos_state.get("size", abs(pos_state.get("szi", 0)))
+    close_size = rpx(size * 0.5, sz_dec)
     if close_size <= 0:
         return
 
-    try:
-        call(_exchange.order, BTC_COIN, not is_long, close_size,
-             rpx(mid, px_dec), {"limit": {"tif": "Ioc"}}, False, timeout=15)
+    entry = pos_state.get("entry_px", pos_state.get("entry", 0))
+    pnl = (mid - entry) / entry if is_long else (entry - mid) / entry
 
+    try:
+        btc_market_close(pos_state.get("side", "LONG"), close_size, mid, sz_dec, px_dec)
         pos_state["partial_done"] = True
-        pos_state["size"] = rpx(size * 0.6, sz_dec)
-        log_btc(f"💰 PARTIAL 40% @ {mid:.0f} (+{pnl:.2%}) — remaining {pos_state['size']}")
-        tg(f"💰 BTC partial 40% +{pnl:.2%}", silent=True)
+        pos_state["size"] = rpx(size * 0.5, sz_dec)
+        log_btc(f"💰 TP1 HIT — 50% closed @ {mid:.0f} (+{pnl:.2%}) — rest runs to TP2")
+        tg(f"💰 <b>BTC TP1</b> 50% +{pnl:.2%}", silent=True)
         save_pos_state(pos_state)
     except Exception as e:
-        log_btc(f"Partial close error: {e}")
+        log_btc(f"TP1 close error: {e}")
 
 # ================================================================
 # FUNDING CHECK
@@ -3133,7 +3147,7 @@ def processor_thread(sz_dec, px_dec):
                 time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
-            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode, ml_features = sig
+            direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode, ml_features, tp1 = sig
 
             # Blocca entry vecchie — se check_signal ha impiegato >5s il prezzo è stale
             if time.time() - sig_ts > 5:
@@ -3207,7 +3221,8 @@ def processor_thread(sz_dec, px_dec):
                         "entry_time": time.time(),
                         "open_ts": time.time(),
                         "sl_px": sl,
-                        "tp_px": tp,
+                        "tp_px": tp,       # TP2 = ATR×1.8 (exchange)
+                        "tp1_px": tp1,     # TP1 = ATR×1.0 (close 50%)
                         "sl_dist": sl_dist,
                         "sl_oid": _btc_sl_oid,
                         "tp_oid": _btc_tp_oid,
