@@ -5568,7 +5568,7 @@ def open_trade(coin, signal, mids, sz_dec, px_dec) -> bool:
                     entry_px * (1 + SLIPPAGE) if is_buy else entry_px * (1 - SLIPPAGE),
                     effective_px_dec)
                 res = call(_exchange.order, str(coin), is_buy, size_nominal, gtc_px,
-                           {"limit": {"tif": "PostOnly"}}, False,
+                           {"limit": {"tif": "Gtc"}}, False,
                            timeout=15, label=f'gtc_{coin}')
                 log_exec(f"[{coin}] GTC Maker @ {gtc_px}: {res}")
 
