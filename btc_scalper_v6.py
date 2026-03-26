@@ -6512,144 +6512,66 @@ def executor_thread_alt():
                 process_pending_orders(active_positions, sz_decimals, px_decimals)
                 cleanup_pending_orders(active_positions)
 
-            # ── Aggiornamento trailing stop ogni 15 minuti ──
+            # ── Aggiornamento trailing stop + ACTIVE MANAGEMENT ──
             now = time.time()
-            if now - last_ts_update >= TRAILING_STOP_INTERVAL and active_positions:
+            if active_positions:
                 for coin, pos in active_positions.items():
                     try:
                         mid_px = float(mids.get(coin, 0) or 0)
-                        atr_approx = abs(float((get_all_signals().get(coin,{}) or {}).get("sl", mid_px)) - mid_px) / 2.2
-                        if atr_approx > 0 and mid_px > 0:
-                            # V7: Trailing meccanico + partial close
-                            update_mechanical_trailing(coin, pos, mid_px, atr_approx,
-                                "LONG" if pos.get("szi",0) > 0 else "SHORT",
-                                open_trade_meta, sz_decimals, px_decimals)
-                            check_partial_close(coin, pos, mid_px, open_trade_meta,
-                                sz_decimals, px_decimals)
-                    except Exception as e:
-                        log_err(f"[{coin}] V7 trailing/partial: {e}")
+                        if mid_px <= 0: continue
+                        entry_px = float(pos.get("entry_px") or mid_px)
+                        szi = pos.get("szi", 0)
+                        direction = "LONG" if szi > 0 else "SHORT"
+                        pnl_ratio = (mid_px - entry_px) / entry_px if direction == "LONG" else (entry_px - mid_px) / entry_px
+                        meta = open_trade_meta.get(coin, {})
+                        trade_age = now - meta.get("ts_open", now)
 
-                    try:
-                        sig = get_all_signals().get(coin)
-                        if not sig:
-                            continue
-                        direction  = sig.get("direction", "LONG")
-                        mid_px     = float(mids.get(coin, 0) or 0)
-                        old_ts     = float(sig.get("trailing_stop", 0) or 0)
-                        entry_px   = float(pos.get("entry_px") or mid_px)
-                        atr_approx = abs(float(sig.get("sl", entry_px)) - entry_px) / 2.2
-                        if atr_approx <= 0:
-                            continue
-
-                        # ── Break Even: sposta SL a entry quando profitto ≥ 1×ATR ──
-                        be_triggered = sig.get("be_triggered", False)
-                        if not be_triggered:
-                            profit = (mid_px - entry_px) if direction == "LONG" else (entry_px - mid_px)
-                            if profit >= atr_approx:
-                                be_px       = round_to_decimals(entry_px, px_decimals.get(coin, 4))
-                                actual_size = round_to_decimals(abs(pos["szi"]), sz_decimals.get(coin, 4))
-                                try:
-                                    # Cancella SL esistenti
-                                    for o in get_open_trigger_orders(coin):
-                                        if o.get("orderType") == "Stop Market":
-                                            cancel_order(coin, o["oid"])
-                                            time.sleep(0.2)
-                                    # Piazza nuovo SL a break even
-                                    call(_exchange.order, str(coin),
-                                         direction != "LONG",
-                                         actual_size, be_px,
-                                         {"trigger": {"triggerPx": be_px, "isMarket": True, "tpsl": "sl"}},
-                                         True, timeout=10, label=f'be_{coin}')
-                                    with _state_lock:
-                                        if coin in _signals_store:
-                                            _signals_store[coin]["be_triggered"] = True
-                                    _persist_signals()
-                                    log_exec(f"[{coin}] 🔒 Break Even @ {be_px:.4f} (profitto {profit:.4f} ≥ ATR {atr_approx:.4f})")
-                                    tg(f"🔒 <b>{coin}</b> Break Even attivato @ {be_px}", silent=True)
-                                except Exception as e:
-                                    log_err(f"[{coin}] break even: {e}")
-
-                        # ── Exit anticipata: AI valuta se chiudere ora ────────
-                        exit_now, exit_reason = ai_should_exit_early(
-                            coin, direction, entry_px, mid_px, sig, mids
-                        )
-                        if exit_now:
-                            # PnL gate: AI può suggerire exit, ma serve PnL che lo giustifichi
-                            pnl_ratio = (mid_px - entry_px) / entry_px if direction == "LONG" else (entry_px - mid_px) / entry_px
-                            if pnl_ratio > 0.001 or pnl_ratio < -0.003:
-                                # In profitto >0.1% → prendi e scappa
-                                # In loss >-0.3% → taglia prima dello SL
-                                pass  # procedi con exit
-                            else:
-                                # Tra -0.3% e +0.1% → dai tempo al trade
-                                exit_now = False
-                                log_exec(f"[{coin}] AI vuole exit ma PnL {pnl_ratio:+.2%} in zona neutra — hold")
-
-                        if exit_now:
-                            actual_size = round_to_decimals(abs(pos["szi"]), sz_decimals.get(coin, 4))
+                        # ── 1. EARLY CUT: loss > -0.2% dopo 30s → chiudi subito ──
+                        if pnl_ratio < -0.002 and trade_age > 30:
+                            log_exec(f"[{coin}] ✂️ EARLY CUT {pnl_ratio:+.2%}")
+                            actual_size = round_to_decimals(abs(szi), sz_decimals.get(coin, 4))
                             try:
-                                # Chiudi posizione a mercato
-                                call(_exchange.order, str(coin),
-                                     direction != "LONG",
-                                     actual_size, mid_px,
-                                     {"limit": {"tif": "Ioc"}},
-                                     False, timeout=10, label=f'exit_{coin}')
+                                close_px = round_to_decimals(mid_px * (0.995 if direction == "LONG" else 1.005), px_decimals.get(coin, 4))
+                                call(_exchange.order, str(coin), direction != "LONG",
+                                     actual_size, close_px,
+                                     {"limit": {"tif": "Ioc"}}, False, timeout=10)
                                 delete_signal(coin)
-                                log_exec(f"[{coin}] 🚪 Exit anticipata AI: {exit_reason}")
-                                tg(f"🚪 <b>{coin}</b> [{direction}] exit anticipata\n💬 {exit_reason}", silent=True)
+                                tg(f"✂️ <b>{coin}</b> CUT {pnl_ratio:+.2%}", silent=True)
                             except Exception as e:
-                                log_err(f"[{coin}] exit anticipata: {e}")
+                                log_err(f"[{coin}] early cut: {e}")
                             continue
 
-                        # ── Trailing stop: AI decide se e dove spostare ──
-                        trade_mode   = sig.get("mode", "SCALPING")
-                        eff_lev      = int(sig.get("effective_leverage", LEVERAGE))
-                        new_ts_mech  = compute_trailing_stop(mid_px, atr_approx, direction, ai_score=7, mode=trade_mode, effective_leverage=eff_lev)
-                        should_move_mech = (direction == "LONG" and new_ts_mech > old_ts) or \
-                                           (direction == "SHORT" and new_ts_mech < old_ts)
+                        # ── 2. SMART TP: in profitto >0.2% → prendi profitto ──
+                        if pnl_ratio > 0.002 and trade_age > 60:
+                            # Check se momentum sta girando contro
+                            try:
+                                sig = get_all_signals().get(coin, {})
+                                atr_approx = abs(float(sig.get("sl", entry_px)) - entry_px) / 1.2 if sig else mid_px * 0.01
+                                if pnl_ratio > 0.004 or (atr_approx > 0 and (mid_px - entry_px if direction == "LONG" else entry_px - mid_px) >= atr_approx * 1.0):
+                                    log_exec(f"[{coin}] 💰 SMART TP +{pnl_ratio:.2%}")
+                                    actual_size = round_to_decimals(abs(szi), sz_decimals.get(coin, 4))
+                                    close_px = round_to_decimals(mid_px * (0.995 if direction == "LONG" else 1.005), px_decimals.get(coin, 4))
+                                    call(_exchange.order, str(coin), direction != "LONG",
+                                         actual_size, close_px,
+                                         {"limit": {"tif": "Ioc"}}, False, timeout=10)
+                                    delete_signal(coin)
+                                    tg(f"💰 <b>{coin}</b> TP +{pnl_ratio:.2%}", silent=True)
+                            except Exception as e:
+                                log_err(f"[{coin}] smart tp: {e}")
+                            continue
 
-                        if should_move_mech:
-                            # Chiedi all'AI conferma e raffinamento
-                            ai_ts = ai_trailing_decision(
-                                coin, direction, entry_px, mid_px, old_ts,
-                                new_ts_mech, atr_approx,
-                                sig.get("regime", "RANGE"),
-                                float(sig.get("funding_z", 0) or 0),
-                                trade_mode, mids
-                            )
-                            if ai_ts["move"]:
-                                new_ts      = ai_ts["new_ts"]
-                                # Sicurezza: non peggiorare il trailing rispetto al meccanico
-                                if direction == "LONG":
-                                    new_ts = max(new_ts, old_ts)   # non arretrare mai
-                                else:
-                                    new_ts = min(new_ts, old_ts)
+                        # ── 3. Trailing (solo se non early cut e non smart TP) ──
+                        if now - last_ts_update >= TRAILING_STOP_INTERVAL:
+                            atr_approx = abs(float((get_all_signals().get(coin,{}) or {}).get("sl", mid_px)) - mid_px) / 1.2
+                            if atr_approx > 0:
+                                update_mechanical_trailing(coin, pos, mid_px, atr_approx,
+                                    direction, open_trade_meta, sz_decimals, px_decimals)
 
-                                actual_size = round_to_decimals(abs(pos["szi"]), sz_decimals.get(coin, 4))
-                                ts_px       = round_to_decimals(new_ts, px_decimals.get(coin, 4))
-                                try:
-                                    for o in get_open_trigger_orders(coin):
-                                        if o.get("orderType") == "Stop Market":
-                                            cancel_order(coin, o["oid"])
-                                            time.sleep(0.2)
-                                    call(_exchange.order, str(coin),
-                                         direction != "LONG",
-                                         actual_size, ts_px,
-                                         {"trigger": {"triggerPx": ts_px, "isMarket": True, "tpsl": "sl"}},
-                                         True, timeout=10, label=f'trail_{coin}')
-                                    with _state_lock:
-                                        if coin in _signals_store:
-                                            _signals_store[coin]["trailing_stop"] = new_ts
-                                    _persist_signals()
-                                    log_exec(f"[{coin}] TS: {old_ts:.4f} → {new_ts:.4f} [{ai_ts['sentiment']}] {ai_ts['reasoning']}")
-                                    tg(f"📍 <b>{coin}</b> TS → {ts_px} [{ai_ts['sentiment']}] {ai_ts['reasoning']}", silent=True)
-                                except Exception as e:
-                                    log_err(f"[{coin}] trailing update: {e}")
-                            else:
-                                log_exec(f"[{coin}] TS invariato per AI: {ai_ts['reasoning']}")
                     except Exception as e:
-                        log_err(f"[{coin}] trailing stop update: {e}")
-                last_ts_update = now
+                        log_err(f"[{coin}] position mgmt: {e}")
+
+                if now - last_ts_update >= TRAILING_STOP_INTERVAL:
+                    last_ts_update = now
 
             signals    = get_all_signals()
             if signals:
