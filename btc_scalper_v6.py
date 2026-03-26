@@ -54,7 +54,7 @@ if not PRIVATE_KEY:
 BTC_COIN = "BTC"
 BTC_LEVERAGE = 5
 BTC_RISK_USD = 5.0  # overridden by balance % in execute
-BTC_MAX_POSITIONS = 1
+BTC_MAX_POSITIONS = 2
 BTC_COOLDOWN_SEC = 180
 BTC_COOLDOWN_AFTER_LOSS = 300  # 5 min dopo un loss
 MAX_TRADES_PER_HOUR = 3
@@ -102,7 +102,7 @@ API_TIMEOUT_SEC = 30; PROCESSOR_INTERVAL = 2 * 60
 ALT_FUNDING_HISTORY_LEN = 42
 
 # ── Unified Executor Config ─────────────────────────────────────
-ALT_MAX_CONCURRENT = 1         # max altcoin positions
+ALT_MAX_CONCURRENT = 2         # max altcoin positions
 ALT_TRADE_SIZE_USD = 5.0  # overridden by balance % in execute
 ALT_LEVERAGE = 5
 ALT_CHECK_INTERVAL = 15
