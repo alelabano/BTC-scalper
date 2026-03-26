@@ -2707,11 +2707,35 @@ def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
     if not is_long and (new_sl >= old_sl and old_sl > 0):
         return
 
-    # Cancel vecchio SL per OID → piazza nuovo
+    # Cancel TUTTI gli SL esistenti prima di piazzarne uno nuovo
     try:
+        # Prima: cancel per OID se disponibile
+        cancelled = False
         if _btc_sl_oid:
-            try: call(_exchange.cancel, BTC_COIN, _btc_sl_oid, timeout=10)
-            except: pass
+            try:
+                call(_exchange.cancel, BTC_COIN, _btc_sl_oid, timeout=10)
+                cancelled = True
+            except:
+                pass
+
+        # Poi: scan e cancel tutti gli Stop Market rimasti (cleanup)
+        try:
+            orders = get_open_orders()
+            for o in (orders or []):
+                if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
+                    try:
+                        call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
+                        cancelled = True
+                    except:
+                        pass
+        except:
+            pass
+
+        if not cancelled:
+            log_btc(f"⚠️ Trailing: nessun SL cancellato — NON piazzo nuovo")
+            return
+
+        time.sleep(0.3)
 
         size_abs = rpx(pos_state.get("size", abs(pos_state.get("szi", 0))), sz_dec)
         sl_res = call(_exchange.order, BTC_COIN, not is_long, size_abs, new_sl,
