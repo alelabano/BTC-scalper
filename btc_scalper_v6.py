@@ -53,7 +53,7 @@ if not PRIVATE_KEY:
 # ── BTC Scalper Config ───────────────────────────────────────────
 BTC_COIN = "BTC"
 BTC_LEVERAGE = 20
-BTC_RISK_USD = 5.0
+BTC_RISK_USD = 5.0  # overridden by balance % in execute
 BTC_MAX_POSITIONS = 1
 BTC_COOLDOWN_SEC = 180
 BTC_COOLDOWN_AFTER_LOSS = 300  # 5 min dopo un loss
@@ -95,7 +95,7 @@ MIN_CANDLES_TREND = 200; MIN_CANDLES_SETUP = 200; MIN_CANDLES_ENTRY = 200
 MIN_VOLUME_24H_USD = 200_000; MIN_VOLUME_TREND_MULT = 1.8
 FORWARD_WINDOW = 36
 MIN_PRECISION = 0.35; MIN_PRECISION_FLOOR = 0.28
-MIN_PROFIT_FACTOR = 0.9; MIN_PROFIT_FACTOR_FLOOR = 0.6
+MIN_PROFIT_FACTOR = 1.2; MIN_PROFIT_FACTOR_FLOOR = 1.0
 MIN_BACKTEST_TRADES = 20; VOLATILITY_MIN = 0.0015
 DEFAULT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL_USD", "1000"))
 API_TIMEOUT_SEC = 30; PROCESSOR_INTERVAL = 5 * 60
@@ -103,7 +103,7 @@ ALT_FUNDING_HISTORY_LEN = 42
 
 # ── Unified Executor Config ─────────────────────────────────────
 ALT_MAX_CONCURRENT = 1         # max altcoin positions
-ALT_TRADE_SIZE_USD = 5.0
+ALT_TRADE_SIZE_USD = 5.0  # overridden by balance % in execute
 ALT_LEVERAGE = 20
 ALT_CHECK_INTERVAL = 15
 ALT_SIGNAL_MAX_AGE = 2 * 60
@@ -4895,7 +4895,7 @@ def run_processor():
                 # L'edge storico è buono, ma il regime attuale lo supporta?
                 # Se gli ultimi 50 trade hanno PF < 0.8 → mercato cambiato, skip
                 pf_recent = bt["profit_factor_recent"]
-                if bt["n_trades_recent"] >= 10 and pf_recent < 0.5:
+                if bt["n_trades_recent"] >= 10 and pf_recent < 0.8:
                     log_alt(f"[{coin}] ❌ Regime sfavorevole: PF recente {pf_recent:.2f} < 0.8 (edge storico ok: {pf_full:.2f})")
                     clear_candidate(coin)
                     continue
@@ -5065,6 +5065,7 @@ def run_processor():
             "funding_z":       round(best["funding_z"], 3),
             "confluence":      best["confluence"],
             "win_rate":        best["wr"],
+            "profit_factor":   best["pf"],
             "win_rate_recent": 0,
             "signal_max_age":  BTC_SIGNAL_MAX_AGE if best["is_btc_eth"] else SIGNAL_MAX_AGE,
             "mode":            best["mode"],
@@ -6600,10 +6601,17 @@ def executor_thread_alt():
 
                 score     = float(sig.get("score", 0) or 0)
                 direction = sig.get("direction", "")
+                pf = float(sig.get("profit_factor", 0) or 0)
+                wr = float(sig.get("win_rate", 0) or 0)
+
+                # Hard filter: PF > 1.2 E WR > 45% — senza edge reale non tradare
+                if pf < 1.2 or wr < 0.45:
+                    continue
+
                 if direction == "LONG"  and score >= SETUP_SCORE_MIN:
-                    candidates.append((score, coin, sig))
+                    candidates.append((pf, coin, sig))  # rank by PF, not score
                 elif direction == "SHORT" and score >= SETUP_SCORE_MIN:
-                    candidates.append((score, coin, sig))
+                    candidates.append((pf, coin, sig))
 
             candidates.sort(key=lambda x: x[0], reverse=True)
             log_top3_per_category(signals, mids, set(active_positions.keys()), now)
