@@ -5520,7 +5520,7 @@ def open_trade(coin, signal, mids, sz_dec, px_dec) -> bool:
         # ── Imposta leva e verifica quella effettiva ──────────────
         for attempt in range(3):
             try:
-                call(_exchange.update_leverage, int(LEVERAGE), str(coin),
+                call(_exchange.update_leverage, int(LEVERAGE), str(coin), is_cross=False,
                      timeout=10, label=f'lev_{coin}')
                 break
             except Exception as e:
