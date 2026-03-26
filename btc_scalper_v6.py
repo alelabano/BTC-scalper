@@ -1185,14 +1185,9 @@ def build_ml_features(rsi_15m, rsi_1h, macd_hist, adx_1h, vol_rel,
 
 def ml_predict_signal(features):
     """
-    ML come filtro finale passivo — solo osservazione + scaling leggero.
-    
-    NON blocca mai. NON boosta mai.
-    Solo leggera riduzione size (-10% a -20%) se il modello è
-    abbastanza maturo E la probabilità è bassa.
-    
-    Il vero decision making è: backtest PF + setup score + tecnici.
-    ML è un tracker statistico che impara col tempo.
+    ML filter:
+    - < 50 samples: OSSERVA (non blocca)
+    - >= 50 samples + accuracy > 55%: BLOCCA se P(win) < 40%
     """
     prob = _ml_model.predict_proba(features)
     acc = _ml_model.get_accuracy()
@@ -1204,15 +1199,14 @@ def ml_predict_signal(features):
         "acc": round(acc, 3),
         "n_samples": n,
         "action": "OBSERVE",
-        "size_mult": 1.0,
+        "block": False,
     }
 
-    # Serve almeno 50 samples E accuracy > 55% per influenzare la size
     if n >= 50 and acc >= 0.55:
         info["ml_active"] = True
-        if prob < 0.35:
-            # Bassa probabilità → riduci size del 20% (mai blocca)
-            info["size_mult"] = 0.80
+        if prob < 0.40:
+            info["action"] = "BLOCK"
+            info["block"] = True
             info["action"] = "SOFT_REDUCE"
         elif prob < 0.45:
             # Sotto media → riduci size del 10%
@@ -2159,7 +2153,7 @@ def check_signal():
     log_btc(f"SL:{sl_pct:.2f}% TP1:{tp1_pct:.2f}%(50%) TP2:{tp2_pct:.2f}%(rest) R:R={effective_rr:.1f} [{strategy}]")
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
-            size_mult, regime, 50, scalp_mode, [], tp1)
+            size_mult, regime, 50, scalp_mode, ml_features, tp1)
 
 # ================================================================
 # EXECUTION
@@ -3198,6 +3192,13 @@ def processor_thread(sz_dec, px_dec):
             if direction == "SHORT" and sent_score_now < 30:
                 log_btc(f"❌ SHORT ma sentiment {sent_score_now} < 30 (troppo fear) — skip")
                 continue
+
+            # ── ML FILTER: blocca se ha dati sufficienti e P(win) bassa ──
+            if ml_features:
+                ml_result = ml_predict_signal(ml_features)
+                if ml_result.get("block"):
+                    log_btc(f"🤖 ML BLOCK: P(win)={ml_result['prob']:.0%} < 40% ({ml_result['n_samples']} samples, acc:{ml_result['acc']:.0%})")
+                    continue
 
             # ── MAX TRADES PER HOUR ──
             now = time.time()
