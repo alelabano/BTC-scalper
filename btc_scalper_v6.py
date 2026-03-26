@@ -3085,9 +3085,9 @@ def scanner_thread():
             _btc_scanner_ready.set()
             log_btc("Scanner ready")
 
-        for i in range(30):
+        for i in range(6):
             time.sleep(10)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [BTC] wait {(i+1)*10}s/300s", flush=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [BTC] wait {(i+1)*10}s/60s", flush=True)
 
 
 # ================================================================
