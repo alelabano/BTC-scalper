@@ -2919,7 +2919,7 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
             log_btc(f"Size zero: bal=${bal:.2f}"); return False
 
         # ── LEVERAGE ──
-        try: call(_exchange.update_leverage, min(BTC_LEVERAGE, get_max_leverage()), BTC_COIN, timeout=10)
+        try: call(_exchange.update_leverage, min(BTC_LEVERAGE, get_max_leverage()), BTC_COIN, is_cross=False, timeout=10)
         except: pass
 
         # ── ENTRY: prezzo aggressivo ──
