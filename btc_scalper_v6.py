@@ -52,7 +52,7 @@ if not PRIVATE_KEY:
 
 # ── BTC Scalper Config ───────────────────────────────────────────
 BTC_COIN = "BTC"
-BTC_LEVERAGE = 20
+BTC_LEVERAGE = 5
 BTC_RISK_USD = 5.0  # overridden by balance % in execute
 BTC_MAX_POSITIONS = 1
 BTC_COOLDOWN_SEC = 180
