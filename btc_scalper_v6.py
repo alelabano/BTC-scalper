@@ -2121,25 +2121,32 @@ def check_signal():
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
     # SL = 1.2× ATR
-    # TP1 = ATR×1.0 → chiudi 50% (profitto veloce)
-    # TP2 = ATR×1.8 → chiudi resto (lascia correre)
+    # SL = 1.2× ATR
+    # TP1 = ATR×1.2 → chiudi 50% (R:R 1:1 minimo)
+    # TP2 = ATR×2.0 → chiudi resto (R:R 1:1.67)
     sl_dist = atr5 * 1.2
-    tp1_dist = atr5 * 1.0
-    tp2_dist = atr5 * 1.8
+    tp1_dist = atr5 * 1.2   # R:R 1:1 con SL
+    tp2_dist = atr5 * 2.0   # R:R 1:1.67 con SL
 
     # Floor
     sl_dist = max(sl_dist, px * 0.003)
-    tp1_dist = max(tp1_dist, px * 0.002)
-    tp2_dist = max(tp2_dist, px * 0.003)
+    tp1_dist = max(tp1_dist, px * 0.003)
+    tp2_dist = max(tp2_dist, px * 0.005)
 
     # Expectation strategy
     sl_dist *= sl_mult
     tp1_dist *= tp_mult
     tp2_dist *= tp_mult
 
+    # R:R check: TP2 deve essere almeno 1.5× SL dopo fee
+    fee_cost = px * 0.001  # 0.05% × 2 lati
+    effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
+    if effective_rr < 1.3:
+        return None  # R:R troppo basso dopo fee
+
     if direction == "LONG":
         sl = px - sl_dist
-        tp = px + tp2_dist   # TP exchange = TP2 (il più lontano)
+        tp = px + tp2_dist
         tp1 = px + tp1_dist
     else:
         sl = px + sl_dist
@@ -2149,12 +2156,10 @@ def check_signal():
     sl_pct = sl_dist / px * 100
     tp1_pct = tp1_dist / px * 100
     tp2_pct = tp2_dist / px * 100
-    log_btc(f"SL:{sl_pct:.2f}% TP1:{tp1_pct:.2f}%(50%) TP2:{tp2_pct:.2f}%(rest) [{strategy}]")
-
-    _last_ml_features = ml_features
+    log_btc(f"SL:{sl_pct:.2f}% TP1:{tp1_pct:.2f}%(50%) TP2:{tp2_pct:.2f}%(rest) R:R={effective_rr:.1f} [{strategy}]")
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
-            size_mult, regime, 50, scalp_mode, ml_features, tp1)
+            size_mult, regime, 50, scalp_mode, [], tp1)
 
 # ================================================================
 # EXECUTION
