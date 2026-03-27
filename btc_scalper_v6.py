@@ -1911,6 +1911,17 @@ def technical_trigger(r, r_prev, h_1h, allow_long=True, allow_short=True):
     ema21 = float(h_1h['ema21'])
     trend_up = ema9 > ema21
 
+    if rsi < 20:
+        if allow_long and macd > macd_prev:
+            return {
+                "direction": "LONG", 
+                "type": "MEAN_REVERSION",
+                "details": f"🔥 RSI:{rsi:.1f} ESTREMO - Rimbalzo tecnico cercato (MACD↑)"
+            }
+        return None # Blocca lo Short se RSI < 20 anche se le altre condizioni Short sono vere
+
+    # --- LOGICA PULLBACK STANDARD (ESISTENTE) ---
+
     # Pullback BUY: RSI oversold + MACD turning + trend 1h UP (non contro-trend)
     if (allow_long and rsi < 40 and macd > macd_prev and vol >= 0.3
         and trend_up and slope > -0.001):
