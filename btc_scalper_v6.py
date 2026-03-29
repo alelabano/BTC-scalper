@@ -2965,7 +2965,7 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
 
         # ── SIZE ──
         bal = get_balance()
-        max_margin = bal * 0.90
+        max_margin = bal * 0.40  # max 40% del balance per BTC — lascia spazio per ALT
         max_notional = max_margin * BTC_LEVERAGE
         sl_pct = sl_dist / entry_px
         notional = min((BTC_RISK_USD * size_mult) / sl_pct, max_notional)
