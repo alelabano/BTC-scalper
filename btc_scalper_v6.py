@@ -58,7 +58,7 @@ BTC_MAX_POSITIONS = 2
 BTC_COOLDOWN_SEC = 180
 BTC_COOLDOWN_AFTER_LOSS = 300  # 5 min dopo un loss
 MAX_TRADES_PER_HOUR = 2
-BTC_SCAN_INTERVAL = 30
+BTC_SCAN_INTERVAL = 15
 BTC_SIGNAL_MAX_AGE = 2 * 60
 BTC_REGIME_INTERVAL = 300
 
@@ -106,7 +106,7 @@ ALT_MAX_CONCURRENT = 2         # max altcoin positions
 ALT_TRADE_SIZE_USD = 2.0  # overridden by balance % in execute
 ALT_LEVERAGE = 5
 ALT_CHECK_INTERVAL = 15
-ALT_SIGNAL_MAX_AGE = 2 * 60
+ALT_SIGNAL_MAX_AGE = 3 * 60
 META_REFRESH_CYCLES = 20
 ENTRY_POLL_ATTEMPTS = 8; ENTRY_POLL_INTERVAL = 0.5
 COIN_COOLDOWN_MR = 3600; COIN_COOLDOWN_TREND = 14400; COIN_COOLDOWN = 3600
@@ -3237,8 +3237,8 @@ def processor_thread(sz_dec, px_dec):
 
             # ── PRICE CONFIRMATION: aspetta 15s, verifica che il prezzo confermi ──
             price_at_signal = get_mid()
-            log_btc(f"📡 Signal {direction} {sig_type} @ {price_at_signal:,.0f} — waiting 15s for confirmation...")
-            time.sleep(15)
+            log_btc(f"📡 Signal {direction} {sig_type} @ {price_at_signal:,.0f} — waiting 8s for confirmation...")
+            time.sleep(8)
             price_after = get_mid()
 
             if price_after <= 0:
@@ -3367,7 +3367,7 @@ _oi_prev_cache = {}     # {coin: previous_oi}
 _alt_trade_history = []
 _alt_daily_pnl = 0.0
 _alt_consec_losses = 0
-ALT_SIGNAL_MAX_AGE = 2 * 60
+ALT_SIGNAL_MAX_AGE = 3 * 60
 SIGNAL_MAX_AGE = ALT_SIGNAL_MAX_AGE  # alias for ALT engine
 
 # ── Carica stato da Redis all'avvio ─────────────────────────────
@@ -6778,7 +6778,7 @@ def executor_thread_alt():
                 wr = float(sig.get("win_rate", 0) or 0)
 
                 # Hard filter: PF > 1.2 E WR > 45% — senza edge reale non tradare
-                if pf < 1.2 or wr < 0.45:
+                if pf < 1.2 or wr < 0.40:
                     continue
 
                 if direction == "LONG"  and score >= SETUP_SCORE_MIN:
