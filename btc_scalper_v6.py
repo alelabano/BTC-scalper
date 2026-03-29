@@ -103,7 +103,7 @@ ALT_FUNDING_HISTORY_LEN = 42
 
 # ── Unified Executor Config ─────────────────────────────────────
 ALT_MAX_CONCURRENT = 2         # max altcoin positions
-ALT_TRADE_SIZE_USD = 5.0  # overridden by balance % in execute
+ALT_TRADE_SIZE_USD = 2.0  # overridden by balance % in execute
 ALT_LEVERAGE = 5
 ALT_CHECK_INTERVAL = 15
 ALT_SIGNAL_MAX_AGE = 2 * 60
