@@ -53,11 +53,11 @@ if not PRIVATE_KEY:
 # ── BTC Scalper Config ───────────────────────────────────────────
 BTC_COIN = "BTC"
 BTC_LEVERAGE = 5
-BTC_RISK_USD = 5.0  # overridden by balance % in execute
+BTC_RISK_USD = 2.0
 BTC_MAX_POSITIONS = 2
 BTC_COOLDOWN_SEC = 180
 BTC_COOLDOWN_AFTER_LOSS = 300  # 5 min dopo un loss
-MAX_TRADES_PER_HOUR = 3
+MAX_TRADES_PER_HOUR = 2
 BTC_SCAN_INTERVAL = 30
 BTC_SIGNAL_MAX_AGE = 2 * 60
 BTC_REGIME_INTERVAL = 300
@@ -121,7 +121,7 @@ LEVERAGE = ALT_LEVERAGE
 CHECK_INTERVAL = ALT_CHECK_INTERVAL
 MAX_CONCURRENT_TRADES = ALT_MAX_CONCURRENT
 FUNDING_HISTORY_LEN = ALT_FUNDING_HISTORY_LEN
-MAX_DAILY_LOSS_PCT = 5.0
+MAX_DAILY_LOSS_PCT = 15.0
 MAX_CONSECUTIVE_LOSSES = 4
 
 def log_err(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  {msg}", flush=True)
@@ -4886,10 +4886,27 @@ def run_processor():
                 continue
 
             # ── FILTRO SLOPE 1h: blocca controtendenza forte ─────────
-            # Soglia 0.002 (non 0.001 — troppo sensibile a noise)
             if direction == "SHORT" and slope_4h > 0.002:
                 continue
             if direction == "LONG" and slope_4h < -0.002:
+                continue
+
+            # ── BTC DECOUPLING: trada solo se allineato o BTC fermo ──
+            btc_dir = "BULL" if btc_momentum > 0.002 else "BEAR" if btc_momentum < -0.002 else "NEUTRAL"
+            btc_vol = abs(btc_momentum) * 10000  # scala a 0-100
+
+            can_trade = False
+            if (btc_dir == "BULL" and direction == "LONG") or \
+               (btc_dir == "BEAR" and direction == "SHORT"):
+                can_trade = True  # allineato a BTC
+            elif btc_dir == "NEUTRAL" and btc_vol < 15:
+                # BTC fermo — cerchiamo forza relativa nella coin
+                if direction == "LONG" and rsi > 55:
+                    can_trade = True
+                elif direction == "SHORT" and rsi < 45:
+                    can_trade = True
+
+            if not can_trade:
                 continue
 
             recent_closes = df['close'].iloc[-12:].tolist()
