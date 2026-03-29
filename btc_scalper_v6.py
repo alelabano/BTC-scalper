@@ -2656,16 +2656,60 @@ def recover_position(sz_dec, px_dec):
             tg(f"🚨🚨 BTC NO SL — MANUAL CHECK!")
 
     if not has_tp:
-        log_btc(f"⚠️ No TP order — trade will be managed by AI only")
+        # Piazza TP a 2×ATR (o 2% se ATR non disponibile)
+        try:
+            df_r = fetch_df("15m", 1)
+            atr_r = float(df_r.iloc[-1]['atr']) if df_r is not None and len(df_r) >= 5 else entry * 0.02
+        except:
+            atr_r = entry * 0.02
+        tp_dist = atr_r * 2.0
+        size_abs = rpx(abs(szi), sz_dec)
+        if d == "LONG":
+            tp_px = rpx(entry + tp_dist, px_dec)
+        else:
+            tp_px = rpx(entry - tp_dist, px_dec)
+        try:
+            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, tp_px,
+                 {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
+                 True, timeout=15)
+            log_btc(f"🎯 Recovery TP placed @ {tp_px}")
+        except Exception as e:
+            log_btc(f"⚠️ Recovery TP failed: {e}")
+        tp1_px = rpx(entry + atr_r * 1.2 if d == "LONG" else entry - atr_r * 1.2, px_dec)
+    else:
+        tp1_px = 0
 
-    pos_state = pos.copy()
-    pos_state["type"] = "RECOVERED"
-    pos_state["regime"] = _btc_regime
-    pos_state["sl_dist"] = entry * SL_MAX_PCT
-    pos_state["last_mgmt"] = 0
-    pos_state["partial_done"] = False
-    pos_state["trailing_active"] = False
-    pos_state["atr"] = 0
+    pos_state = {
+        "coin": BTC_COIN,
+        "side": d,
+        "entry_px": entry,
+        "entry": entry,
+        "size": abs(szi),
+        "szi": szi,
+        "open_ts": time.time(),
+        "entry_time": time.time(),
+        "sl_px": sl_px if not has_sl else 0,
+        "tp_px": tp_px if not has_tp else 0,
+        "tp1_px": tp1_px,
+        "sl_dist": entry * 0.012,
+        "sl_oid": None,
+        "tp_oid": None,
+        "partial_done": False,
+        "max_favorable_px": entry,
+        "mode": "TREND",
+        "scalp_mode": "TREND",
+        "type": "RECOVERED",
+        "regime": _btc_regime,
+        "trailing_active": False,
+        "trailing_moves": 0,
+        "current_ts": 0,
+        "atr": 0,
+        "post_validated": True,
+        "close_reason": "",
+        "ml_features": [],
+        "last_trail_check": 0,
+        "lev": pos.get("lev", BTC_LEVERAGE),
+    }
     return pos_state
 
 # ================================================================
