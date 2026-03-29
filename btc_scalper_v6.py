@@ -2147,7 +2147,7 @@ def check_signal():
     fee_cost = px * 0.001  # 0.05% × 2 lati
     effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
     if effective_rr < 1.3:
-        return None  # R:R troppo basso dopo fee
+        log_btc(f"❌ R:R {effective_rr:.2f} < 1.3 — skip"); return None
 
     if direction == "LONG":
         sl = px - sl_dist
@@ -6253,7 +6253,7 @@ def run_scanner():
 
     for asset, ctx in zip(meta_assets, ctxs_main):
         coin = asset["name"]
-        if coin in COIN_BLACKLIST:
+        if coin in COIN_BLACKLIST or coin.startswith("@") or coin.startswith("k"):
             continue
         try:
             px     = float(ctx.get("markPx", 0) or 0)
@@ -6512,6 +6512,8 @@ def fast_track_thread():
                     if px <= 0:
                         continue
                     if coin in COIN_BLACKLIST:
+                        continue
+                    if coin.startswith("@"):
                         continue
 
                     prev = _fast_track_prev_prices.get(coin, 0)
