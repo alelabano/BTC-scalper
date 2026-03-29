@@ -4891,19 +4891,23 @@ def run_processor():
             if direction == "LONG" and slope_4h < -0.002:
                 continue
 
-            # ── BTC DECOUPLING: trada solo se allineato o BTC fermo ──
+            # ── BTC DECOUPLING: trada solo se allineato o coin indipendente ──
             btc_dir = "BULL" if btc_momentum > 0.002 else "BEAR" if btc_momentum < -0.002 else "NEUTRAL"
-            btc_vol = abs(btc_momentum) * 10000  # scala a 0-100
 
             can_trade = False
+            # 1. Allineato a BTC → sempre OK
             if (btc_dir == "BULL" and direction == "LONG") or \
                (btc_dir == "BEAR" and direction == "SHORT"):
-                can_trade = True  # allineato a BTC
-            elif btc_dir == "NEUTRAL" and btc_vol < 15:
-                # BTC fermo — cerchiamo forza relativa nella coin
-                if direction == "LONG" and rsi > 55:
-                    can_trade = True
-                elif direction == "SHORT" and rsi < 45:
+                can_trade = True
+
+            # 2. BTC neutro + coin con volume alto → coin indipendente, trada
+            elif btc_dir == "NEUTRAL" and vol_rel_15m > 1.5:
+                can_trade = True
+
+            # 3. BTC neutro + volume basso → serve RSI forte come conferma
+            elif btc_dir == "NEUTRAL":
+                if (direction == "LONG" and rsi > 55) or \
+                   (direction == "SHORT" and rsi < 45):
                     can_trade = True
 
             if not can_trade:
@@ -6212,7 +6216,15 @@ def run_scanner():
             vol24h = float(ctx.get("dayNtlVlm", 0) or 0)
             oi_raw = float(ctx.get("openInterest", 0) or 0)
             oi_usd = oi_raw * px
-            if vol24h < 500_000 or oi_usd < 500_000 or px <= 0:
+
+            # ── MOMENTUM SCORE: chi si sta muovendo ORA ──
+            # prevDayPx è il prezzo 24h fa — misura il move in corso
+            prev_px = float(ctx.get("prevDayPx", 0) or 0)
+            day_change = abs(px - prev_px) / prev_px if prev_px > 0 else 0
+            # Score: bilancia movimento (abs day change) con liquidità (volume)
+            momentum_score = min(day_change * 100, 10)  # cap a 10 (= 10% move)
+
+            if vol24h < 200_000 or px <= 0:
                 continue
 
             funding_bps = float(ctx.get("funding", 0) or 0) * 10000
@@ -6368,17 +6380,19 @@ def run_scanner():
                 composite = (
                     vol_oi_score      * 10 +
                     fz_score          * 10 +
-                    rvol_score        * 15 +
-                    btc_align_score   * 25 +
-                    structure_score   * 40    # trend structure dominante
+                    rvol_score        * 10 +
+                    btc_align_score   * 20 +
+                    structure_score   * 30 +
+                    momentum_score    * 20    # chi si muove ORA
                 ) - meme_lag_penalty
             else:  # RANGE
                 composite = (
-                    vol_oi_score      * 15 +
-                    fz_score          * 15 +
-                    rvol_score        * 15 +
+                    vol_oi_score      * 10 +
+                    fz_score          * 10 +
+                    rvol_score        * 10 +
                     btc_align_score   * 20 +
-                    structure_score   * 35    # range structure importante
+                    structure_score   * 25 +
+                    momentum_score    * 25    # ancora più importante in range
                 ) - meme_lag_penalty
 
             composite = max(0, min(100, composite))
@@ -6424,6 +6438,63 @@ def run_scanner():
         log("SCAN", f"  {c['coin']:<8} score:{c['composite']:>5.1f} | struct:{c['structure']:.2f} {c['direction']:>4} | FZ:{c['funding_z']:+.2f} | BTC:{c['btc_align']:.2f}{meme_tag}")
     log("SCAN", f"=== FINE | {len(candidates)} candidati → top {len(top)} per Processor | {elapsed:.1f}s ===")
     _alt_scanner_ready.set()
+
+
+# ================================================================
+# FAST TRACK — spike detection ogni 60s
+# ================================================================
+_fast_track_coins = set()
+_fast_track_prev_prices = {}
+
+def fast_track_thread():
+    """
+    Thread leggero: ogni 60s controlla all_mids.
+    Se una coin si muove >2% in 60s → aggiungila ai candidati del processor.
+    """
+    global _fast_track_coins, _fast_track_prev_prices
+    log("FAST", "Fast track thread avviato")
+
+    while True:
+        try:
+            mids = call(_info.all_mids, timeout=10, label='fast_mids')
+            if not mids:
+                time.sleep(60)
+                continue
+
+            urgent = set()
+            for coin, px_str in mids.items():
+                try:
+                    px = float(px_str)
+                    if px <= 0:
+                        continue
+                    if coin in COIN_BLACKLIST:
+                        continue
+
+                    prev = _fast_track_prev_prices.get(coin, 0)
+                    if prev > 0:
+                        change = abs(px - prev) / prev
+                        if change > 0.02:  # >2% in 60s = spike
+                            urgent.add(coin)
+                            direction = "UP" if px > prev else "DOWN"
+                            log("FAST", f"⚡ {coin} {direction} {change:.1%} in 60s")
+                    _fast_track_prev_prices[coin] = px
+                except:
+                    continue
+
+            if urgent:
+                with _scanner_lock:
+                    for coin in urgent:
+                        if coin not in _scanner_candidates:
+                            _scanner_candidates.append(coin)
+                _fast_track_coins = urgent
+                log("FAST", f"⚡ {len(urgent)} coin aggiunte: {urgent}")
+            else:
+                _fast_track_coins = set()
+
+        except Exception as e:
+            log_err(f"Fast track: {e}")
+
+        time.sleep(60)
 
 
 def scanner_thread_combined():
@@ -6879,6 +6950,9 @@ def main():
 
     # Thread E — ALT Executor (runs in separate thread)
     threading.Thread(target=executor_thread_alt, name="ALT-Exec", daemon=True).start()
+
+    # Thread F — Fast Track (spike detection ogni 60s)
+    threading.Thread(target=fast_track_thread, name="Fast-Track", daemon=True).start()
 
     # Main thread — BTC Executor (simplified position management loop)
     try:
