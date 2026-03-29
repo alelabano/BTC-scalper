@@ -7014,22 +7014,27 @@ def btc_executor_loop(sz_dec, px_dec):
                     last_pos_state["close_reason"] = f"✂️ Cut {pnl_pct:+.2f}%"
                     save_pos_state(last_pos_state)
                     tg(f"✂️ <b>BTC CUT</b> {pnl_pct:+.2f}%")
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue  # skip tutto il resto — posizione chiusa
 
-                # ── 2. PARTIAL CLOSE: +0.4% → chiudi 40% ──
-                elif trade_mode == "TREND":
-                    btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
-
-                # ── 3. MODE-SPECIFIC ──
+                # ── 2. MODE-SPECIFIC ──
                 if trade_mode == "RANGE" and pnl_pct > 0.15:
                     log_btc(f"💰 RANGE TP +{pnl_pct:.2f}%")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
                     last_pos_state["close_reason"] = f"💰 RANGE TP"
                     save_pos_state(last_pos_state)
-                elif trade_mode == "TREND" and atr_now > 0:
-                    last_trail = last_pos_state.get("last_trail_check", 0)
-                    if time.time() - last_trail >= TRAILING_STOP_INTERVAL:
-                        last_pos_state["last_trail_check"] = time.time()
-                        update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue  # skip — posizione chiusa
+
+                elif trade_mode == "TREND":
+                    # TP1 partial close
+                    btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
+                    # Trailing
+                    if atr_now > 0:
+                        last_trail = last_pos_state.get("last_trail_check", 0)
+                        if time.time() - last_trail >= TRAILING_STOP_INTERVAL:
+                            last_pos_state["last_trail_check"] = time.time()
+                            update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
                 # FLASH: niente — SL/TP fissi
 
                 # ── 4. CHECK EXIT (fill reale) ──
