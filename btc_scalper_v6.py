@@ -5069,17 +5069,18 @@ def run_processor():
                     clear_candidate(coin)
                     continue
 
-                # ── CONSENSO MULTI-TIMEFRAME ─────────────────────────────
-                mtf_ok = False
-                if direction == "LONG":
-                    mtf_ok = (slope_4h > 0) and (rsi_4h < 70 or macd_hist_1h > 0)
-                elif direction == "SHORT":
-                    mtf_ok = (slope_4h < 0) and (rsi_4h > 30 or macd_hist_1h < 0)
+                # ── CONSENSO MULTI-TIMEFRAME (skip per REVERSAL — va contro il trend) ──
+                if signal_type != "REVERSAL":
+                    mtf_ok = False
+                    if direction == "LONG":
+                        mtf_ok = (slope_4h > 0) and (rsi_4h < 70 or macd_hist_1h > 0)
+                    elif direction == "SHORT":
+                        mtf_ok = (slope_4h < 0) and (rsi_4h > 30 or macd_hist_1h < 0)
 
-                if not mtf_ok:
-                    log_alt(f"[{coin}] ❌ MTF: slope_1h:{slope_4h:.4f} RSI_1h:{rsi_4h:.1f} MACD_1h:{macd_hist_1h:.4f}")
-                    clear_candidate(coin)
-                    continue
+                    if not mtf_ok:
+                        log_alt(f"[{coin}] ❌ MTF: slope_1h:{slope_4h:.4f} RSI_1h:{rsi_4h:.1f}")
+                        clear_candidate(coin)
+                        continue
 
                 set_candidate(coin, {
                     "direction":        direction,
@@ -5095,8 +5096,14 @@ def run_processor():
                     "avg_return":       bt.get("avg_return", 0),
                     "ts":               int(time.time())
                 })
-                log_alt(f"[{coin}] ⏳ Candidato salvato [{signal_type}] [{pre_mode}]")
-                continue
+
+                # PF >= 1.3 → skip double confirmation
+                if bt["profit_factor"] >= 1.3:
+                    log_alt(f"[{coin}] ⚡ PF:{bt['profit_factor']:.2f} >= 1.3 — skip double confirm")
+                    # Fall through to "Seconda vista" below
+                else:
+                    log_alt(f"[{coin}] ⏳ Candidato salvato [{signal_type}] [{pre_mode}]")
+                    continue
 
             # ── Seconda vista: confermato → AI + score → aggiungi a valid_signals ──
             log_alt(f"[{coin}] ✅ Confermato [{direction}] [{candidate.get('signal_type', '?')}]")
