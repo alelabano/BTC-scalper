@@ -3027,7 +3027,7 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         is_long = direction == "LONG"
 
         # ── SIZE: fisso $5 notional ──
-        BTC_MARGIN = 3.0
+        BTC_MARGIN = 5.0
         notional = BTC_MARGIN * BTC_LEVERAGE  # $5 margin × 5x = $25 notional
         
         bal = get_balance()
