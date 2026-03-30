@@ -2042,11 +2042,28 @@ def check_signal():
 
     # ══════════════════════════════════════════════════════════
     # TRIPLE TRIGGER: Flow (master) → Tech (fallback) → Momentum (catch-all)
+    # + RANGE TRIGGER: Bollinger Band mean reversion
     # ══════════════════════════════════════════════════════════
 
     flow_sig = flow_trigger(_flow_cache.get("data", {}), regime, allow_long, allow_short)
     tech_sig = technical_trigger(r, r2, h, allow_long, allow_short)
     mom_sig = momentum_trigger(df_15m, allow_long, allow_short)
+
+    # ── RANGE TRIGGER: mean reversion alle Bollinger Bands ──
+    # In RANGE: compra quando tocca BB bassa, vendi quando tocca BB alta
+    range_sig = None
+    if scalp_mode == "RANGE":
+        rsi_15m = float(r['rsi'])
+        bb_pos_now = float(r['bb_pos'])  # -1 = sotto BB bassa, +1 = sopra BB alta
+
+        # LONG: prezzo alla BB bassa + RSI oversold
+        if allow_long and bb_pos_now < -0.7 and rsi_15m < 35:
+            range_sig = {"direction": "LONG", "type": "RANGE_REV",
+                        "details": f"BB:{bb_pos_now:.2f} RSI:{rsi_15m:.0f} (mean reversion)"}
+        # SHORT: prezzo alla BB alta + RSI overbought
+        elif allow_short and bb_pos_now > 0.7 and rsi_15m > 65:
+            range_sig = {"direction": "SHORT", "type": "RANGE_REV",
+                        "details": f"BB:{bb_pos_now:.2f} RSI:{rsi_15m:.0f} (mean reversion)"}
 
     if flow_sig:
         direction = flow_sig["direction"]
@@ -2058,6 +2075,11 @@ def check_signal():
         if mom_sig and mom_sig["direction"] == direction:
             sig_type += "+MOM"
             details += f" +{mom_sig['details']}"
+    elif range_sig:
+        # RANGE mean reversion ha priorità su tech/momentum in RANGE mode
+        direction = range_sig["direction"]
+        sig_type = range_sig["type"]
+        details = range_sig["details"]
     elif tech_sig:
         direction = tech_sig["direction"]
         sig_type = tech_sig["type"]
