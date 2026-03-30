@@ -1877,14 +1877,42 @@ def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     return None
 
 
+_mid_price_cache = []  # [(timestamp, price), ...]
+
 def momentum_trigger(df_15m, allow_long=True, allow_short=True):
     """
-    Momentum puro — cattura move in CORSO, non esauriti.
-    Condizioni:
-    - Move >0.2% nelle ultime 2 candele (30min)
-    - Volume sopra media
-    - L'ultima candela sta ANCORA muovendosi nella direzione (non sta ritracciando)
+    Momentum a 2 velocità:
+    1. INSTANT: confronta mid attuale con 2-3 minuti fa (veloce, cattura inizio move)
+    2. CANDLE: conferma con candele 15m (robusto, filtra noise)
     """
+    global _mid_price_cache
+
+    # ── INSTANT MOMENTUM: mid price vs 2-3 min fa ──
+    mid_now = get_mid()
+    now = time.time()
+    if mid_now > 0:
+        _mid_price_cache.append((now, mid_now))
+        # Tieni solo ultimi 5 minuti
+        _mid_price_cache = [(t, p) for t, p in _mid_price_cache if now - t < 300]
+
+    # Confronta con 2 min fa
+    instant_sig = None
+    old_prices = [(t, p) for t, p in _mid_price_cache if 90 < now - t < 180]
+    if old_prices and mid_now > 0:
+        old_px = old_prices[0][1]
+        instant_move = (mid_now - old_px) / old_px
+
+        if allow_long and instant_move > 0.002:  # +0.2% in 2min
+            instant_sig = {"direction": "LONG", "type": "MOMENTUM",
+                          "details": f"move:+{instant_move:.2%}/2m (instant)"}
+        elif allow_short and instant_move < -0.002:
+            instant_sig = {"direction": "SHORT", "type": "MOMENTUM",
+                          "details": f"move:{instant_move:.2%}/2m (instant)"}
+
+    if instant_sig:
+        return instant_sig
+
+    # ── CANDLE MOMENTUM: fallback su candele 15m ──
     if df_15m is None or len(df_15m) < 5:
         return None
 
@@ -1894,14 +1922,12 @@ def momentum_trigger(df_15m, allow_long=True, allow_short=True):
     vol = float(df_15m.iloc[-1]['vol_rel'])
 
     move_30m = (c_now - c_2ago) / c_2ago
-    move_last = (c_now - c_1ago) / c_1ago  # ultima candela
+    move_last = (c_now - c_1ago) / c_1ago
 
-    # BUY: move +0.2% in 30min E l'ultima candela è ancora UP (non sta ritracciando)
     if allow_long and move_30m > 0.002 and move_last > 0 and vol >= 0.5:
         return {"direction": "LONG", "type": "MOMENTUM",
                 "details": f"move:+{move_30m:.2%}/30m last:+{move_last:.2%} vol:{vol:.1f}x"}
 
-    # SELL: move -0.2% in 30min E l'ultima candela è ancora DOWN
     if allow_short and move_30m < -0.002 and move_last < 0 and vol >= 0.5:
         return {"direction": "SHORT", "type": "MOMENTUM",
                 "details": f"move:{move_30m:.2%}/30m last:{move_last:.2%} vol:{vol:.1f}x"}
