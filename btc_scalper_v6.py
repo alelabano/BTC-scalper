@@ -2209,7 +2209,7 @@ def check_signal():
     # R:R check: TP2 deve essere almeno 1.5× SL dopo fee
     fee_cost = px * 0.001  # 0.05% × 2 lati
     effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
-    if effective_rr < 1.3:
+    if effective_rr < 1.0:
         log_btc(f"❌ R:R {effective_rr:.2f} < 1.3 — skip"); return None
 
     if direction == "LONG":
@@ -3027,7 +3027,7 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         is_long = direction == "LONG"
 
         # ── SIZE: fisso $5 notional ──
-        BTC_MARGIN = 5.0
+        BTC_MARGIN = 3.0
         notional = BTC_MARGIN * BTC_LEVERAGE  # $5 margin × 5x = $25 notional
         
         bal = get_balance()
@@ -3292,7 +3292,7 @@ def processor_thread(sz_dec, px_dec):
             direction, sig_type, sl, tp, entry_px, atr, details, sl_dist, size_mult, sig_regime, setup, scalp_mode, ml_features, tp1 = sig
 
             # Blocca entry vecchie — se check_signal ha impiegato >5s il prezzo è stale
-            if time.time() - sig_ts > 5:
+            if time.time() - sig_ts > 25:
                 log_btc(f"⚠️ Signal stale ({time.time()-sig_ts:.1f}s) — skip")
                 continue
 
