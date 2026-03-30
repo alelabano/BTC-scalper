@@ -5000,24 +5000,16 @@ def run_processor():
             if direction == "LONG" and slope_4h < -0.002:
                 continue
 
-            # ── BTC DECOUPLING: trada solo se allineato o coin indipendente ──
-            btc_dir = "BULL" if btc_momentum > 0.002 else "BEAR" if btc_momentum < -0.002 else "NEUTRAL"
+            # ── BTC DECOUPLING: blocca solo controtendenza forte ──
+            btc_dir = "BULL" if btc_momentum > 0.003 else "BEAR" if btc_momentum < -0.003 else "NEUTRAL"
 
-            can_trade = False
-            # 1. Allineato a BTC → sempre OK
-            if (btc_dir == "BULL" and direction == "LONG") or \
-               (btc_dir == "BEAR" and direction == "SHORT"):
-                can_trade = True
-
-            # 2. BTC neutro + coin con volume alto → coin indipendente, trada
-            elif btc_dir == "NEUTRAL" and vol_rel_15m > 1.5:
-                can_trade = True
-
-            # 3. BTC neutro + volume basso → serve RSI forte come conferma
-            elif btc_dir == "NEUTRAL":
-                if (direction == "LONG" and rsi > 55) or \
-                   (direction == "SHORT" and rsi < 45):
-                    can_trade = True
+            can_trade = True  # default: trada
+            # Blocca SOLO se controtendenza forte a BTC
+            if btc_dir == "BULL" and direction == "SHORT":
+                can_trade = False
+            elif btc_dir == "BEAR" and direction == "LONG":
+                can_trade = False
+            # BTC NEUTRAL → trada sempre (ALT hanno dinamiche proprie)
 
             if not can_trade:
                 continue
@@ -5071,18 +5063,9 @@ def run_processor():
                     clear_candidate(coin)
                     continue
 
-                # ── CONSENSO MULTI-TIMEFRAME (skip per REVERSAL — va contro il trend) ──
-                if signal_type != "REVERSAL":
-                    mtf_ok = False
-                    if direction == "LONG":
-                        mtf_ok = (slope_4h > 0) and (rsi_4h < 70 or macd_hist_1h > 0)
-                    elif direction == "SHORT":
-                        mtf_ok = (slope_4h < 0) and (rsi_4h > 30 or macd_hist_1h < 0)
-
-                    if not mtf_ok:
-                        log_alt(f"[{coin}] ❌ MTF: slope_1h:{slope_4h:.4f} RSI_1h:{rsi_4h:.1f}")
-                        clear_candidate(coin)
-                        continue
+                # MTF check rimosso — il backtest PF > 1.2 è la vera validazione
+                # slope_4h in un mercato flat/down blocca tutti i LONG
+                # anche quelli con edge reale (HEMI PF:1.84, RESOLV PF:1.37)
 
                 set_candidate(coin, {
                     "direction":        direction,
@@ -5100,8 +5083,8 @@ def run_processor():
                 })
 
                 # PF >= 1.3 → skip double confirmation
-                if bt["profit_factor"] >= 1.3:
-                    log_alt(f"[{coin}] ⚡ PF:{bt['profit_factor']:.2f} >= 1.3 — skip double confirm")
+                if bt["profit_factor"] >= 1.2:
+                    log_alt(f"[{coin}] ⚡ PF:{bt["profit_factor"]:.2f} >= 1.2 — skip double confirm")
                     # Fall through to "Seconda vista" below
                 else:
                     log_alt(f"[{coin}] ⏳ Candidato salvato [{signal_type}] [{pre_mode}]")
