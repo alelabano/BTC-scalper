@@ -3026,15 +3026,17 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
     try:
         is_long = direction == "LONG"
 
-        # ── SIZE ──
+        # ── SIZE: fisso $5 notional ──
+        BTC_MARGIN = 3.0
+        notional = BTC_MARGIN * BTC_LEVERAGE  # $5 margin × 5x = $25 notional
+        
         bal = get_balance()
-        max_margin = bal * 0.40  # max 40% del balance per BTC — lascia spazio per ALT
-        max_notional = max_margin * BTC_LEVERAGE
-        sl_pct = sl_dist / entry_px
-        notional = min((BTC_RISK_USD * size_mult) / sl_pct, max_notional)
+        if notional / BTC_LEVERAGE > bal * 0.9:
+            log_btc(f"❌ Balance ${bal:.2f} insufficiente per ${notional} notional")
+            return False
         size = rpx(notional / entry_px, sz_dec)
         if size <= 0:
-            log_btc(f"Size zero: bal=${bal:.2f}"); return False
+            log_btc(f"Size zero: notional=${notional:.0f}"); return False
 
         # ── LEVERAGE ──
         try: call(_exchange.update_leverage, min(BTC_LEVERAGE, get_max_leverage()), BTC_COIN, is_cross=False, timeout=10)
