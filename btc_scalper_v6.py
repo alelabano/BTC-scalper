@@ -2189,12 +2189,13 @@ def check_signal():
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
     # SL = 1.2× ATR
-    # SL = 1.2× ATR
-    # TP1 = ATR×1.2 → chiudi 50% (R:R 1:1 minimo)
-    # TP2 = ATR×2.0 → chiudi resto (R:R 1:1.67)
+    # SL = ATR×1.2 — respira col mercato
+    # TP1 = ATR×0.8 → chiudi 50% (profitto veloce e sicuro)
+    # TP2 = ATR×1.2 → chiudi resto (R:R 1:1)
+    # Se il trend continua → il bot rientra al prossimo segnale
     sl_dist = atr5 * 1.2
-    tp1_dist = atr5 * 1.2   # R:R 1:1 con SL
-    tp2_dist = atr5 * 2.0   # R:R 1:1.67 con SL
+    tp1_dist = atr5 * 0.8
+    tp2_dist = atr5 * 1.2
 
     # Floor
     sl_dist = max(sl_dist, px * 0.003)
@@ -2209,7 +2210,7 @@ def check_signal():
     # R:R check: TP2 deve essere almeno 1.5× SL dopo fee
     fee_cost = px * 0.001  # 0.05% × 2 lati
     effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
-    if effective_rr < 1.0:
+    if effective_rr < 0.8:
         log_btc(f"❌ R:R {effective_rr:.2f} < 1.3 — skip"); return None
 
     if direction == "LONG":
