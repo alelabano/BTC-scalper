@@ -5133,6 +5133,9 @@ def run_processor():
                 direction, px, ema50_val, ema200_4h,
                 rsi, spread_pct, ai_score, funding_z, liq=liq_data
             )
+            # PF forte sovrascrive setup score basso
+            if pf_hist >= 2.0:
+                setup_score = max(setup_score, 60)  # floor a 60
             if setup_score < SETUP_SCORE_MIN:
                 skip_counts["score"] += 1
                 log_alt(f"[{coin}] ❌ Setup score {setup_score} < {SETUP_SCORE_MIN}")
