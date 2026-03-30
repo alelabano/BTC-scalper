@@ -103,7 +103,7 @@ ALT_FUNDING_HISTORY_LEN = 42
 
 # ── Unified Executor Config ─────────────────────────────────────
 ALT_MAX_CONCURRENT = 2         # max altcoin positions
-ALT_TRADE_SIZE_USD = 2.5  # overridden by balance % in execute
+ALT_TRADE_SIZE_USD = 2.0  # overridden by balance % in execute
 ALT_LEVERAGE = 5
 ALT_CHECK_INTERVAL = 15
 ALT_SIGNAL_MAX_AGE = 3 * 60
@@ -3027,7 +3027,7 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         is_long = direction == "LONG"
 
         # ── SIZE: fisso $5 notional ──
-        BTC_MARGIN = 5.0
+        BTC_MARGIN = 3.0
         notional = BTC_MARGIN * BTC_LEVERAGE  # $5 margin × 5x = $25 notional
         
         bal = get_balance()
@@ -6076,8 +6076,11 @@ def log_top3_per_category(signals: dict, mids: dict, active_coins: set, now: flo
         else:
             rr = 0.0
 
+        pf_sig    = float(sig.get("profit_factor", 0) or 0)
+
         if coin in active_coins:                                 decision = "OPEN"
         elif age > SIGNAL_MAX_AGE:                               decision = "EXPIRED"
+        elif pf_sig < 1.2 or wr < 0.40:                         decision = f"{direction} ❌PF"
         elif direction == "LONG"  and score >= SETUP_SCORE_MIN:  decision = "LONG ✅"
         elif direction == "SHORT" and score >= SETUP_SCORE_MIN:  decision = "SHORT ✅"
         else:                                                    decision = "WAIT"
