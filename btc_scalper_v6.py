@@ -1240,9 +1240,8 @@ def ml_load_model():
 
 def compute_hourly_bias():
     """
-    Fleet bias basato su momentum BTC reale.
-    BTC è il leader — quando BTC si muove, le ALT seguono.
-    Bias NEUTRAL = ALT decidono per sé. LONG/SHORT = BTC sta spingendo.
+    Fleet bias basato su momentum BTC + trade in corso.
+    Se BTC ha un trade LONG in loss → il mercato scende → SHORT_BIAS per ALT.
     """
     global _last_oi
     try:
@@ -1255,16 +1254,32 @@ def compute_hourly_bias():
     mom_15m = 0
     mom_1h = 0
     if df_15m is not None and len(df_15m) >= 3:
-        mom_15m = (float(df_15m['close'].iloc[-1]) / float(df_15m['close'].iloc[-3])) - 1  # 30min
+        mom_15m = (float(df_15m['close'].iloc[-1]) / float(df_15m['close'].iloc[-3])) - 1
     if df_1h is not None and len(df_1h) >= 2:
         mom_1h = (float(df_1h['close'].iloc[-1]) / float(df_1h['close'].iloc[-2])) - 1
 
-    # BTC si muove >0.15% in 30min → segnale per ALT
+    # ── Trade in loss = segnale direzionale forte ──
+    pos = get_position()
+    if pos:
+        entry = pos["entry"]
+        mid = get_mid()
+        d = "LONG" if pos["szi"] > 0 else "SHORT"
+        pnl_pct = ((mid - entry) / entry if d == "LONG" else (entry - mid) / entry)
+        if pnl_pct < -0.003:  # in loss > -0.3%
+            # Trade LONG in loss → mercato scende → SHORT per ALT
+            if d == "LONG":
+                bias = "SHORT_BIAS"; reason = f"BTC LONG in loss {pnl_pct:+.2%} → mercato scende"
+            else:
+                bias = "LONG_BIAS"; reason = f"BTC SHORT in loss {pnl_pct:+.2%} → mercato sale"
+            fleet_set_bias(bias, reason)
+            log_btc(f"Fleet: {bias} | {reason}")
+            return bias
+
+    # ── Momentum standard ──
     if mom_15m > 0.0015:
         bias = "LONG_BIAS"; reason = f"BTC +{mom_15m:.2%}/30m"
     elif mom_15m < -0.0015:
         bias = "SHORT_BIAS"; reason = f"BTC {mom_15m:.2%}/30m"
-    # BTC si muove >0.4% in 1h → segnale forte
     elif mom_1h > 0.004:
         bias = "LONG_BIAS"; reason = f"BTC +{mom_1h:.2%}/1h"
     elif mom_1h < -0.004:
