@@ -6555,7 +6555,7 @@ def fast_track_thread():
         except Exception as e:
             log_err(f"Fast track: {e}")
 
-        time.sleep(60)
+        time.sleep(120)
 
 
 def scanner_thread_combined():
