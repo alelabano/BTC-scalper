@@ -5787,9 +5787,6 @@ def open_trade(coin, signal, mids, sz_dec, px_dec) -> bool:
             log_err(f"[{coin}] Errore critico: Ordine non inserito.")
             return False
 
-        # Se arriviamo qui, il bot sa che c'è un ordine aperto e lo monitorerà
-        return True
-
         # Polling fill
         filled_size  = 0.0
         filled_entry = entry_px
