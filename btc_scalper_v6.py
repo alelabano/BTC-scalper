@@ -3315,7 +3315,7 @@ def processor_thread(symbol, sz_dec, px_dec):
 
     log_btc(f"[{symbol}] Processor avviato — attendo Scanner...")
     _btc_scanner_ready.wait()
-    log(f"[{symbol}] Scanner pronto — avvio")
+    log_btc(f"[{symbol}] Scanner pronto — avvio")
 
     while True:
         try:
@@ -3352,7 +3352,7 @@ def processor_thread(symbol, sz_dec, px_dec):
 
             if _start_balance is None:
                 _start_balance = bal
-                log(f"[{symbol}] Start balance: ${bal:.2f}")
+                log_btc(f"[{symbol}] Start balance: ${bal:.2f}")
 
             if bal > 0 and _start_balance > 0:
                 loss_pct = (1 - bal / _start_balance) * 100
@@ -3360,7 +3360,7 @@ def processor_thread(symbol, sz_dec, px_dec):
                 if loss_pct >= MAX_DAILY_LOSS_PCT:
                     if not _kill_switch:
                         _kill_switch = True
-                        log(f"[{symbol}] 🛑 KILL SWITCH {loss_pct:.1f}%")
+                        log_btc(f"[{symbol}] 🛑 KILL SWITCH {loss_pct:.1f}%")
 
             if _kill_switch:
                 time.sleep(300)
@@ -3369,7 +3369,7 @@ def processor_thread(symbol, sz_dec, px_dec):
                 if now.hour == 0 and now.minute < 5:
                     _kill_switch = False
                     _start_balance = bal
-                    log(f"[{symbol}] Kill switch reset")
+                    log_btc(f"[{symbol}] Kill switch reset")
 
                 continue
 
@@ -3378,7 +3378,7 @@ def processor_thread(symbol, sz_dec, px_dec):
             sig = check_signal()
 
             if sig is None:
-                log(f"[{symbol}] no signal | ${mid:,.0f}")
+                log_btc(f"[{symbol}] no signal | ${mid:,.0f}")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
@@ -3390,7 +3390,7 @@ def processor_thread(symbol, sz_dec, px_dec):
 
             # ── STALE SIGNAL ──
             if time.time() - sig_ts > 25:
-                log(f"[{symbol}] ⚠️ Signal stale")
+                log_btc(f"[{symbol}] ⚠️ Signal stale")
                 continue
 
             if not is_funding_ok(symbol, direction):
@@ -3520,7 +3520,7 @@ def processor_thread(symbol, sz_dec, px_dec):
                 log_btc(f"❌ NOT FILLED")
 
         except Exception as e:
-            log(f"[{symbol}] ERROR: {e}")
+            log_btc(f"[{symbol}] ERROR: {e}")
             import traceback
             traceback.print_exc()
 
