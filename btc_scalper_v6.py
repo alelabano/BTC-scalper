@@ -3395,69 +3395,65 @@ def processor_thread(symbol, sz_dec, px_dec):
             if not is_funding_ok(symbol, direction):
                 continue
 
-            # ── PRICE CONFIRMATION: polling ogni 0.5s, max 8s ──
-            price_at_signal = get_mid(symbol)
-            log_btc(f"[{symbol}] Signal {direction} @ {price_at_signal:,.0f} — confirming...")
+            # ── PRICE CONFIRMATION V2 (robusta) ──
+            price_at_signal = get_mid()
+            if price_at_signal <= 0:
+                continue
+            log_btc(f"📡 Signal {direction} {sig_type} @ {price_at_signal:,.0f} — confirming...")
 
             confirm_ok = False
+            best_price = price_at_signal
             confirm_start = time.time()
-            while time.time() - confirm_start < 8:
-                px_now = get_mid(symbol)
+            while time.time() - confirm_start < 10:
+                px_now = get_mid()
                 if px_now <= 0:
                     time.sleep(0.5)
                     continue
-                if direction == "LONG" and px_now > price_at_signal:
+                # Track best price per anti-chasing
+                if direction == "LONG":
+                    best_price = max(best_price, px_now)
+                else:
+                    best_price = min(best_price, px_now)
+                # Conferma direzionale: prezzo si muove nella direzione del segnale
+                if direction == "LONG" and px_now > price_at_signal * 1.0003:
                     confirm_ok = True
                     break
-                elif direction == "SHORT" and px_now < price_at_signal:
+                if direction == "SHORT" and px_now < price_at_signal * 0.9997:
                     confirm_ok = True
                     break
                 time.sleep(0.5)
 
             if not confirm_ok:
-                log_btc(f"[{symbol}] ❌ Price not confirmed in {time.time()-confirm_start:.1f}s")
+                log_btc(f"❌ No confirmation in {time.time()-confirm_start:.1f}s")
                 continue
 
-            price_after = get_mid(symbol)
+            # ── ANTI-CHASING: se il prezzo è già scappato troppo, non inseguire ──
+            drift = abs(best_price - price_at_signal) / price_at_signal
+            if drift > 0.002:
+                log_btc(f"❌ Too late — drift {drift:.2%}")
+                continue
 
             # ── FLOW FILTER ──
-            flow = get_flow_signal(symbol)
-
+            flow = get_flow_signal()
             if direction == "LONG" and flow.get("bias") == "SELL":
+                log_btc(f"❌ {direction} vs Flow {flow.get('bias')} — skip")
                 continue
-
             if direction == "SHORT" and flow.get("bias") == "BUY":
+                log_btc(f"❌ {direction} vs Flow {flow.get('bias')} — skip")
                 continue
 
             # ── SENTIMENT FILTER ──
-            sentiment = get_sentiment_score(symbol)
-
+            sentiment = get_sentiment_score()
             if direction == "LONG" and sentiment > 70:
                 continue
-
             if direction == "SHORT" and sentiment < 30:
-                continue
-
-            # ── MOMENTUM (FIXED) ──
-            df = fetch_df(symbol, "5m", 20)
-
-            if df is None or len(df) < 20:
-                continue
-
-            last = df.iloc[-1]
-            last_range = last["high"] - last["low"]
-            avg_range = (df["high"] - df["low"]).mean()
-
-            if last_range < avg_range * 1.2:
-                log(f"[{symbol}] ❌ No momentum")
                 continue
 
             # ── ML FILTER ──
             if ml_features:
-                ml = ml_predict_signal(ml_features)
-
-                if ml.get("block"):
-                    log(f"[{symbol}] 🤖 ML BLOCK {ml['prob']:.0%}")
+                ml_result = ml_predict_signal(ml_features)
+                if ml_result.get("block"):
+                    log_btc(f"🤖 ML BLOCK P(win)={ml_result['prob']:.0%}")
                     continue
 
             # ── MAX TRADES / H ──
@@ -3466,45 +3462,61 @@ def processor_thread(symbol, sz_dec, px_dec):
                 t for t in _trades_today
                 if now - t.get("ts_close", t.get("ts", 0)) < 3600
             ])
-
             if trades_last_hour >= MAX_TRADES_PER_HOUR:
                 continue
 
-            # ── EXECUTE ──
-            log(f"[{symbol}] ⚡ EXEC {direction} @ {entry_px:,.0f}")
+            # ── EXECUTE: micro pullback entry ──
+            entry_exec = get_mid()
+            if entry_exec <= 0:
+                continue
+            if direction == "LONG":
+                entry_exec *= 0.999   # 0.1% sotto — aspetta micro dip
+            else:
+                entry_exec *= 1.001   # 0.1% sopra — aspetta micro bounce
+            entry_exec = rpx(entry_exec, px_dec)
 
-            success = open_trade(
-                symbol, direction, sl, tp, entry_px,
-                sl_dist, sz_dec, px_dec, size_mult, scalp_mode
+            log_btc(f"⚡ EXEC {direction} [{scalp_mode}] @ {entry_exec:,.0f}")
+
+            success = btc_open_trade(
+                direction, sl, tp, entry_exec, sl_dist,
+                sz_dec, px_dec, size_mult, scalp_mode
             )
 
             if success:
-                p = get_position(symbol)
-
+                p = get_position()
                 if p:
-                    pos_state = {
-                        "coin": symbol,
+                    _btc_current_signal = {"filled": True, "pos_state": {
+                        "coin": BTC_COIN,
                         "side": direction,
+                        "entry_px": p["entry"],
                         "entry": p["entry"],
                         "size": abs(p["szi"]),
-                        "sl": sl,
-                        "tp": tp,
-                        "tp1": tp1,
+                        "szi": p["szi"],
+                        "sl_px": sl,
+                        "tp_px": tp,
+                        "tp1_px": tp1,
+                        "sl_dist": sl_dist,
+                        "open_ts": time.time(),
                         "entry_time": time.time(),
                         "mode": scalp_mode,
-                        "ml_features": ml_features
-                    }
-
-                    save_pos_state(symbol, pos_state)
-
-                    _current_signal = {"filled": True}
-                    _last_trade_ts = time.time()
-
-                    log(f"[{symbol}] ✅ FILLED")
-
+                        "scalp_mode": scalp_mode,
+                        "type": sig_type,
+                        "regime": regime,
+                        "trailing_active": False,
+                        "trailing_moves": 0,
+                        "partial_done": False,
+                        "max_favorable_px": p["entry"],
+                        "atr": atr,
+                        "ml_features": ml_features,
+                        "close_reason": "",
+                        "last_trail_check": 0,
+                    }}
+                    _btc_last_trade_ts = time.time()
+                    log_btc(f"✅ FILLED {direction} @ {p['entry']:,.0f}")
+                    tg(f"{'🟢' if direction=='LONG' else '🔴'} <b>BTC {direction}</b> @ {p['entry']:,.0f}\nSL:{sl:,.0f} TP:{tp:,.0f} [{scalp_mode}]")
             else:
-                _last_trade_ts = time.time()
-                log(f"[{symbol}] ❌ FAILED")
+                _btc_last_trade_ts = time.time()
+                log_btc(f"❌ NOT FILLED")
 
         except Exception as e:
             log(f"[{symbol}] ERROR: {e}")
