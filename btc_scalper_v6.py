@@ -1654,8 +1654,8 @@ def run_backtest():
         return _btc_bt_results  # cache 1 ora
 
     log_btc("📊 Running backtest...")
-    df_1h = fetch_df("1h", 60)
-    df_5m = fetch_df("15m", 30)   # 30 giorni di 15m = ~2880 candele
+    df_1h = fetch_df(BTC_COIN, "1h", 60)
+    df_5m = fetch_df(BTC_COIN, "15m", 30)   # 30 giorni di 15m = ~2880 candele
     if df_1h is None or df_5m is None or len(df_5m) < 500 or len(df_1h) < 200:
         log_btc("📊 Backtest: insufficient data")
         return _btc_bt_results
