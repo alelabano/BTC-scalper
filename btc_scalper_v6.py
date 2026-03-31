@@ -3337,6 +3337,24 @@ def processor_thread(sz_dec, px_dec):
             if direction == "SHORT" and sent_score_now < 30:
                 log_btc(f"❌ SHORT ma sentiment {sent_score_now} < 30 (troppo fear) — skip")
                 continue
+            if last_candle_range < avg_range * 1.2:
+                continue
+            if last_candle_range < avg_range * 1.2:
+                continue
+            # ── MOMENTUM FILTER (NUOVO) ──
+            df = fetch_df("5m", 2)  # ultime candele BTC
+
+            if df is None or len(df) < 20:
+                continue
+
+            last = df.iloc[-1]
+            last_candle_range = last["high"] - last["low"]
+
+            avg_range = (df["high"] - df["low"]).iloc[-20:].mean()
+
+            if last_candle_range < avg_range * 1.2:
+                log_btc(f"❌ No momentum — range {last_candle_range:.1f} < avg {avg_range:.1f}")
+                continue
 
             # ── ML FILTER: blocca se ha dati sufficienti e P(win) bassa ──
             if ml_features:
