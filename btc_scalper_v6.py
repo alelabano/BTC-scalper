@@ -7442,9 +7442,9 @@ def btc_executor_loop(sz_dec, px_dec):
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
-                # ── 1. EARLY CUT: loss > -0.15% dopo 30s ──
+                # ── 1. FAST EXIT: loss > -4% ROE dopo 30s ──
                 pnl_ratio = pnl_pct / 100
-                if pnl_ratio < -0.0015 and time_in_trade > 30:
+                if pnl_ratio < -0.008 and time_in_trade > 40:  # -4% ROE con 5x, dopo 40s
                     log_btc(f"✂️ EARLY CUT {pnl_pct:+.2f}%")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
                     last_pos_state["close_reason"] = f"✂️ Cut {pnl_pct:+.2f}%"
