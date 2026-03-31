@@ -1560,7 +1560,7 @@ def build(df):
 
     return df.dropna(subset=['rsi','atr','ema200'])
 
-def fetch_df(coin, tf, days):
+def fetch_df(coin=BTC_COIN, tf="1m", days=1):
     now = int(time.time() * 1000)
     for _ in range(3):
         try:
