@@ -4961,7 +4961,7 @@ def run_processor():
                 continue
 
             # Volume minimo: usa 15m (più stabile) non 5m
-            if vol_rel_15m < 0.3:
+            if vol_rel_15m < 0.1:
                 skip_counts["vol_rel"] += 1
                 continue
 
