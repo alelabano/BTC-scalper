@@ -2029,7 +2029,39 @@ def check_signal():
     ema21_1h = float(h['ema21'])
     slope1h = float(h['ema_slope'])
     adx1h  = float(h.get('adx', 20))
+# --- AGGIUNTA: MOTORE DI ANTICIPAZIONE MATEMATICA ---
+def get_anticipation_score(coin):
+    """
+    Analizza divergenza OI e CVD per anticipare il movimento.
+    Ritorna: 1 (Long Imminente), -1 (Short Imminente), 0 (Neutrale)
+    """
+    try:
+        # Recupera le ultime candele a 1 minuto (molto veloci)
+        df = fetch_df(coin, "1m", 15) 
+        if df is None or len(df) < 10: return 0
 
+        # Verifichiamo se OI e CVD sono presenti nel tuo DF
+        # Se fetch_df non li ha, il bot userà i valori di default (0)
+        oi_col = 'oi' if 'oi' in df.columns else None
+        cvd_col = 'cvd' if 'cvd' in df.columns else None
+        
+        if not oi_col or not cvd_col:
+            return 0
+
+        # Calcolo variazioni ultime 5 candele (5 minuti)
+        oi_change = (df[oi_col].iloc[-1] - df[oi_col].iloc[-5]) / (df[oi_col].iloc[-5] + 1e-9)
+        cvd_change = df[cvd_col].iloc[-1] - df[cvd_col].iloc[-5]
+        price_range = (df['high'].rolling(5).max().iloc[-1] - df['low'].rolling(5).min().iloc[-1]) / df['close'].iloc[-5]
+
+        # LOGICA MATEMATICA:
+        # Se OI cresce > 1% e il prezzo è compresso (range < 0.2%), c'è una molla carica
+        if oi_change > 0.01 and price_range < 0.002:
+            if cvd_change > 0: return 1  # Accumulo Long (Absorption)
+            if cvd_change < 0: return -1 # Accumulo Short (Absorption)
+            
+        return 0
+    except:
+        return 0
     # ══════════════════════════════════════════════════════════
     # DETECT SCALP MODE
     # ══════════════════════════════════════════════════════════
