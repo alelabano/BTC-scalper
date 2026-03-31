@@ -7254,7 +7254,7 @@ def main():
     time.sleep(2)
 
     # Thread C — BTC Processor (signal check ogni 10s)
-    threading.Thread(target=processor_thread, args=(btc_sz_dec, btc_px_dec),
+    threading.Thread(target=processor_thread, args=(BTC_COIN, btc_sz_dec, btc_px_dec),
                      name="BTC-Proc", daemon=True).start()
     time.sleep(1)
 
