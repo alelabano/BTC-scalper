@@ -1256,8 +1256,8 @@ def compute_hourly_bias():
     """
     global _last_oi
     try:
-        df_15m = fetch_df("15m", 3)
-        df_1h = fetch_df("1h", 2)
+        df_15m = fetch_df(BTC_COIN, "15m", 3)
+        df_1h = fetch_df(BTC_COIN, "1h", 2)
     except:
         fleet_set_bias("NEUTRAL", "data error")
         return "NEUTRAL"
