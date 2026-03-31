@@ -3235,7 +3235,7 @@ def scanner_thread():
 
             adx_val = 20
             try:
-                df_1h = fetch_df("1h", 5)
+                df_1h = fetch_df(BTC_COIN, "1h", 5)
                 if df_1h is not None and len(df_1h) > 5 and 'adx' in df_1h.columns:
                     adx_val = float(df_1h.iloc[-1]['adx'])
             except: pass
@@ -3371,7 +3371,7 @@ def processor_thread(sz_dec, px_dec):
                 continue
 
             # ── MOMENTUM FILTER (FIX POSIZIONE) ──
-            df = fetch_df("5m", 20)
+            df = fetch_df(BTC_COIN, "5m", 20)
             if df is None or len(df) < 20:
                 continue
 
