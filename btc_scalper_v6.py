@@ -6826,7 +6826,7 @@ def scanner_thread_combined():
 def processor_thread_combined():
     log_alt("Thread avviato — attendo primo ciclo Scanner...")
     # Aspetta che lo Scanner abbia completato almeno un ciclo
-    _alt_btc_scanner_ready.wait()
+    _alt_scanner_ready.wait()
     log_alt("Scanner pronto — avvio cicli Processor")
 
     while True:
@@ -7283,7 +7283,7 @@ def btc_executor_loop(sz_dec, px_dec):
     global _btc_current_signal, _btc_last_trade_ts
 
     log_btc("Executor avviato — attendo Scanner...")
-    _btc_btc_scanner_ready.wait()
+    _btc_scanner_ready.wait()
     log_btc("Executor pronto")
 
     last_pos_state = load_pos_state()
