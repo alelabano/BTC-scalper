@@ -2779,7 +2779,7 @@ def recover_position(sz_dec, px_dec):
     if not has_tp:
         # Piazza TP a 2×ATR (o 2% se ATR non disponibile)
         try:
-            df_r = fetch_df("15m", 1)
+            df_r = fetch_df(BTC_COIN, "15m", 1)
             atr_r = float(df_r.iloc[-1]['atr']) if df_r is not None and len(df_r) >= 5 else entry * 0.02
         except:
             atr_r = entry * 0.02
