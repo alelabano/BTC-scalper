@@ -1608,7 +1608,7 @@ def update_regime():
     if time.time() - _btc_regime_ts < BTC_REGIME_INTERVAL:
         return _btc_regime
 
-    df = fetch_df("4h", 90)
+    df = fetch_df(BTC_COIN, "4h", 90)
     if df is None or len(df) < 60:
         return _btc_regime
 
