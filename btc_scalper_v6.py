@@ -7375,7 +7375,7 @@ def btc_executor_loop(sz_dec, px_dec):
 
                 # Update ATR ogni ~3 cicli
                 if cycle % 3 == 0:
-                    df_m = fetch_df("15m", 1)
+                    df_m = fetch_df(BTC_COIN, "15m", 1)
                     if df_m is not None and len(df_m) >= 5:
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
