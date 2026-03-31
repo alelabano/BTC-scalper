@@ -2250,9 +2250,10 @@ def get_anticipation_score(coin):
     # TP1 = ATR×0.8 → chiudi 50% (profitto veloce e sicuro)
     # TP2 = ATR×1.2 → chiudi resto (R:R 1:1)
     # Se il trend continua → il bot rientra al prossimo segnale
+    # TP fissi: 0.5% (TP1 → 50%) e 0.8% (TP2 → resto)
     sl_dist = atr5 * 1.2
-    tp1_dist = atr5 * 0.8
-    tp2_dist = atr5 * 1.2
+    tp1_dist = px * 0.005   # 0.5%
+    tp2_dist = px * 0.008   # 0.8%
 
     # Floor
     sl_dist = max(sl_dist, px * 0.003)
@@ -7442,36 +7443,93 @@ def btc_executor_loop(sz_dec, px_dec):
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
-                # ── 1. FAST EXIT: loss > -4% ROE dopo 30s ──
+                # ── 1a. EARLY FAIL: nei primi 15s, se già -4% ROE → chiudi subito ──
                 pnl_ratio = pnl_pct / 100
-                if pnl_ratio < -0.008 and time_in_trade > 40:  # -4% ROE con 5x, dopo 40s
-                    log_btc(f"✂️ EARLY CUT {pnl_pct:+.2f}%")
+                if time_in_trade < 15 and pnl_ratio < -0.008:
+                    log_btc(f"⚠️ EARLY FAIL {pnl_pct:+.2f}% in {time_in_trade:.0f}s")
+                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
+                    last_pos_state["close_reason"] = f"⚠️ Early fail {pnl_pct:+.2f}%"
+                    save_pos_state(last_pos_state)
+                    tg(f"⚠️ <b>BTC EARLY FAIL</b> {pnl_pct:+.2f}% in {time_in_trade:.0f}s")
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue
+
+                # ── 1b. FAST EXIT: dopo 40s, se -4% ROE → chiudi ──
+                if pnl_ratio < -0.008 and time_in_trade > 40:
+                    log_btc(f"✂️ FAST EXIT {pnl_pct:+.2f}%")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
                     last_pos_state["close_reason"] = f"✂️ Cut {pnl_pct:+.2f}%"
                     save_pos_state(last_pos_state)
                     tg(f"✂️ <b>BTC CUT</b> {pnl_pct:+.2f}%")
                     time.sleep(BTC_SCAN_INTERVAL)
-                    continue  # skip tutto il resto — posizione chiusa
+                    continue
 
-                # ── 2. MODE-SPECIFIC ──
-                if trade_mode == "RANGE" and pnl_pct > 0.15:
+                # ── 2. TIME STOP: dopo 45s se non in profitto → chiudi ──
+                if time_in_trade > 45 and pnl_ratio < 0.0005:  # < +0.05%
+                    log_btc(f"⏱️ TIME EXIT {pnl_pct:+.2f}% dopo {time_in_trade:.0f}s")
+                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
+                    last_pos_state["close_reason"] = f"⏱️ Time {pnl_pct:+.2f}%"
+                    save_pos_state(last_pos_state)
+                    tg(f"⏱️ <b>BTC TIME</b> {pnl_pct:+.2f}%")
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue
+
+                # ── 3. RANGE TP: profitto > 0.15% → chiudi ──
+                if trade_mode == "RANGE" and pnl_ratio > 0.0015:
                     log_btc(f"💰 RANGE TP +{pnl_pct:.2f}%")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
                     last_pos_state["close_reason"] = f"💰 RANGE TP"
                     save_pos_state(last_pos_state)
                     time.sleep(BTC_SCAN_INTERVAL)
-                    continue  # skip — posizione chiusa
+                    continue
 
-                elif trade_mode == "TREND":
-                    # TP1 partial close
+                # ── 3. TRAILING PROFIT: lock in profitto ──
+                # Track peak PnL
+                peak_pnl = last_pos_state.get("peak_pnl", 0)
+                if pnl_ratio > peak_pnl:
+                    last_pos_state["peak_pnl"] = pnl_ratio
+                    peak_pnl = pnl_ratio
+
+                # Se profitto > +0.15% e poi ritraccia di 0.10% dal picco → chiudi
+                if peak_pnl > 0.0015 and pnl_ratio < peak_pnl - 0.001:
+                    log_btc(f"🔒 TRAILING EXIT +{pnl_pct:.2f}% (peak:+{peak_pnl*100:.2f}%)")
+                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
+                    last_pos_state["close_reason"] = f"🔒 Trail {pnl_pct:+.2f}%"
+                    save_pos_state(last_pos_state)
+                    tg(f"🔒 <b>BTC TRAIL</b> +{pnl_pct:.2f}% (peak:+{peak_pnl*100:.2f}%)")
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue
+
+                # ── 4. BREAK EVEN: sposta SL a entry quando in profitto ──
+                if pnl_ratio > 0.0012 and not last_pos_state.get("be_active"):
+                    # Sposta SL sull'exchange a entry price (= zero risk)
+                    entry_be = last_pos_state.get("entry_px", last_pos_state.get("entry", 0))
+                    if entry_be > 0:
+                        try:
+                            # Cancel tutti gli SL esistenti
+                            orders = get_open_orders()
+                            for o in (orders or []):
+                                if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
+                                    try: call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
+                                    except: pass
+                            time.sleep(0.3)
+                            # Piazza nuovo SL a entry
+                            be_px = rpx(entry_be, px_dec)
+                            size_abs = rpx(abs(szi), sz_dec)
+                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, be_px,
+                                 {"trigger": {"triggerPx": be_px, "isMarket": True, "tpsl": "sl"}},
+                                 True, timeout=15)
+                            last_pos_state["be_active"] = True
+                            last_pos_state["sl_px"] = be_px
+                            save_pos_state(last_pos_state)
+                            log_btc(f"⚖️ BREAK EVEN @ {be_px:,.0f}")
+                        except Exception as e:
+                            log_btc(f"⚠️ BE failed: {e}")
+
+                # ── 5. TP1 partial close (TREND only) ──
+                if trade_mode == "TREND":
                     btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
-                    # Trailing
-                    if atr_now > 0:
-                        last_trail = last_pos_state.get("last_trail_check", 0)
-                        if time.time() - last_trail >= TRAILING_STOP_INTERVAL:
-                            last_pos_state["last_trail_check"] = time.time()
-                            update_trailing(last_pos_state, mid, atr_now, sz_dec, px_dec)
-                # FLASH: niente — SL/TP fissi
+                # FLASH/RANGE: SL/TP fissi sull'exchange
 
                 # ── 4. CHECK EXIT (fill reale) ──
                 closed, exit_px = check_btc_exit(last_pos_state)
