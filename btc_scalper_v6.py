@@ -3441,9 +3441,9 @@ def processor_thread_alt(sz_dec, px_dec, coin):
                     if not confirmed:
                         log_btc(f"[{coin}] ❌ Post-confirm fail (Price: {mid}) → emergency close")
                         if pos:
-                        actual_size = round_to_decimals(abs(float(pos.get('szi', 0))), sz_dec)
-                        side_to_close = direction != "LONG" # Se eri LONG, vendi (True = Sell)
-                        call(_exchange.order, coin, side_to_close, actual_size, mid, {"limit": {"tif": "Ioc"}}, False)
+                            actual_size = round_to_decimals(abs(float(pos.get('szi', 0))), sz_dec)
+                            side_to_close = direction != "LONG" # Se eri LONG, vendi (True = Sell)
+                            call(_exchange.order, coin, side_to_close, actual_size, mid, {"limit": {"tif": "Ioc"}}, False)
                         pending_confirm = None
                         continue
 
