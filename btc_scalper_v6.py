@@ -108,6 +108,9 @@ MIN_BACKTEST_TRADES = 20; VOLATILITY_MIN = 0.0015
 DEFAULT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL_USD", "1000"))
 API_TIMEOUT_SEC = 30; PROCESSOR_INTERVAL = 2 * 60
 ALT_FUNDING_HISTORY_LEN = 42
+FAST_EXIT_THRESHOLD_ALT = -0.05  # -5% ROE (approx)
+MOMENTUM_MULT_ALT = 1.2
+CONFIRMATION_SECONDS_ALT = 30    # Tempo per confermare la bontà dell'entry
 
 # ── Unified Executor Config ─────────────────────────────────────
 ALT_MAX_CONCURRENT = 2         # max altcoin positions
@@ -3398,6 +3401,142 @@ def processor_thread(sz_dec, px_dec):
 
         time.sleep(BTC_SCAN_INTERVAL)
 
+# ================================================================
+# ALTCOIN PROCESSOR V7.5 (FAST ENTRY + POST-CONFIRM)
+# ================================================================
+def processor_thread_alt(sz_dec, px_dec, coin):
+    """
+    Gestisce il ciclo di vita di una singola Altcoin:
+    Detection segnale -> Entry Immediata -> Conferma post-trade -> Gestione Posizione.
+    """
+    global _btc_last_trade_ts, _btc_is_trading
+
+    log_btc(f"[{coin}] Processor avviato") # Coerenza con il tuo sistema di log
+    pending_confirm = None
+
+    while True:
+        try:
+            # 1. Recupero stato corrente
+            pos = get_position(coin)
+            mid = get_mid(coin)
+            if mid <= 0:
+                time.sleep(1)
+                continue
+
+            # ── 2. POST-CONFIRM NON BLOCCANTE ──
+            # Se siamo entrati, verifichiamo dopo X secondi se il prezzo si è mosso a favore
+            if pending_confirm is not None:
+                now = time.time()
+                if now >= pending_confirm["deadline"]:
+                    direction = pending_confirm["direction"]
+                    entry_price = pending_confirm["price"]
+                    
+                    confirmed = True
+                    # Verifica se il prezzo è migliorato di almeno lo 0.05%
+                    if direction == "LONG":
+                        confirmed = mid > entry_price * 1.0005
+                    elif direction == "SHORT":
+                        confirmed = mid < entry_price * 0.9995
+
+                    if not confirmed:
+                        log_btc(f"[{coin}] ❌ Post-confirm fail (Price: {mid}) → emergency close")
+                        if pos:
+                            close_position(coin, pos) # Assicurati che close_position accetti (coin, pos)
+                        pending_confirm = None
+                        continue
+
+                    log_btc(f"[{coin}] ✅ Confirm OK: Momentum confermato")
+                    pending_confirm = None
+
+            # ── 3. GESTIONE POSIZIONE ATTIVA ──
+            if pos is not None and abs(float(pos.get('szi', 0))) > 0:
+                pnl = get_unrealized_pnl(pos) # Assicurati che questa funzione esista o calcolala
+
+                # FAST EXIT: se la posizione va male troppo velocemente
+                if pnl < FAST_EXIT_THRESHOLD_ALT:
+                    log_btc(f"[{coin}] ⚠️ Fast exit ALT (PnL: {pnl:.2%})")
+                    close_position(coin, pos)
+                    continue
+
+                time.sleep(1) # Slow loop se siamo già in posizione
+                continue
+
+            # ── 4. FILTRI DI COOLDOWN E LOCK ──
+            if time.time() - _btc_last_trade_ts < BTC_COOLDOWN_SEC:
+                time.sleep(0.5)
+                continue
+
+            if _btc_is_trading: # Evita di aprire ordini contemporanei a BTC
+                time.sleep(0.5)
+                continue
+
+            # ── 5. DETECTION SEGNALE ──
+            sig_ts = time.time()
+            sig = check_signal(coin) # Deve restituire la tupla completa definita nel bot
+
+            if sig is None:
+                time.sleep(1)
+                continue
+
+            # Unpacking del segnale (formato V7)
+            (direction, sig_type, sl, tp, entry_px, atr,
+             details, sl_dist, size_mult, sig_regime,
+             setup, scalp_mode, ml_features, tp1) = sig
+
+            # Filtro segnale vecchio (stale)
+            if time.time() - sig_ts > 20:
+                continue
+
+            # ── 6. FILTRI AVANZATI (Momentum, Flow, Sentiment, ML) ──
+            
+            # Momentum Filter: la candela attuale deve essere > media
+            df = fetch_df(coin, "5m", 20)
+            if df is None or len(df) < 20:
+                continue
+            last = df.iloc[-1]
+            avg_range = (df["high"] - df["low"]).mean()
+            if (last["high"] - last["low"]) < avg_range * MOMENTUM_MULT_ALT:
+                continue
+
+            # Order Flow Alignment
+            flow_now = get_flow_signal(coin)
+            if direction == "LONG" and flow_now.get("bias") == "SELL": continue
+            if direction == "SHORT" and flow_now.get("bias") == "BUY": continue
+
+            # Sentiment Alignment (V7 Module)
+            sent = get_sentiment_score()
+            if direction == "LONG" and sent > 75: continue # Contrarian: non comprare se troppo greed
+            if direction == "SHORT" and sent < 25: continue # Contrarian: non vendere se troppa fear
+
+            # Machine Learning Validator
+            if ml_features:
+                ml_result = ml_predict_signal(ml_features)
+                if ml_result.get("block"):
+                    continue
+
+            # ── 7. ESECUZIONE (FAST ENTRY) ──
+            log_btc(f"[{coin}] ⚡ FAST ENTRY {direction} @ {mid:.4f}")
+
+            # Nota: open_position deve gestire la size basata su sz_dec e il prezzo su px_dec
+            success = open_position(coin, direction, mid, sl, tp, sl_dist,
+                                   sz_dec, px_dec, size_mult)
+
+            if success:
+                log_btc(f"[{coin}] ✅ FILLED → monitoraggio conferma...")
+                pending_confirm = {
+                    "direction": direction,
+                    "price": mid,
+                    "deadline": time.time() + CONFIRMATION_SECONDS_ALT
+                }
+            else:
+                _btc_last_trade_ts = time.time() # Cooldown anche su fallimento
+                log_btc(f"[{coin}] ❌ Entry fail")
+
+        except Exception as e:
+            log_btc(f"[{coin}] Processor error: {e}")
+            import traceback; traceback.print_exc()
+
+        time.sleep(0.5)
 
 # ================================================================
 # ALTCOIN ENGINE (from combined_bot.py)
