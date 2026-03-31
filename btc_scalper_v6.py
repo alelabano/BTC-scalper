@@ -3322,11 +3322,27 @@ def processor_thread(sz_dec, px_dec):
 
             # ── DETECT ──
             sig_ts = time.time()
-            sig = check_signal()
+            sig = check_signal(coin)
+            anti_score = get_anticipation_score(coin) # <--- Nuova chiamata
+
+            # Se non c'è un segnale tecnico ma l'anticipatore è forte:
+            if sig is None and anti_score != 0:
+                # Creiamo un "Segnale Sintetico" basato sull'anticipazione
+                direction = "LONG" if anti_score > 1 else "SHORT"
+                log_btc(f"[{coin}] 🔥 ANTICIPATION ENTRY: {direction} (OI/CVD Bias)")
+                
+                # Recupera i dati minimi per l'entry
+                mid = get_mid(coin)
+                # Usiamo SL/TP standard basati sull'ATR o fissi
+                success = open_position(coin, direction, mid, mid*0.98, mid*1.05, 0.02, sz_dec, px_dec, 1.0)
+                if success:
+                    pending_confirm = {"direction": direction, "price": mid, "deadline": time.time() + 30}
+                continue 
+
             if sig is None:
-                log_btc(f"no signal | {_btc_regime} | BTC ${mid:,.0f}")
-                time.sleep(BTC_SCAN_INTERVAL)
+                time.sleep(0.3)
                 continue
+            # -------------------------------
 
             (direction, sig_type, sl, tp, entry_px, atr,
              details, sl_dist, size_mult, sig_regime,
