@@ -5083,10 +5083,10 @@ def run_processor():
                     "ts":               int(time.time())
                 })
 
-                # PF >= 1.3 → skip double confirmation
+                # PF >= 1.2 → skip double confirmation
                 if bt["profit_factor"] >= 1.2:
-                    log_alt(f"[{coin}] ⚡ PF:{bt["profit_factor"]:.2f} >= 1.2 — skip double confirm")
-                    # Fall through to "Seconda vista" below
+                    log_alt(f"[{coin}] ⚡ PF:{bt['profit_factor']:.2f} >= 1.2 — skip double confirm")
+                    candidate = get_candidate(coin)  # reload with backtest data
                 else:
                     log_alt(f"[{coin}] ⏳ Candidato salvato [{signal_type}] [{pre_mode}]")
                     continue
