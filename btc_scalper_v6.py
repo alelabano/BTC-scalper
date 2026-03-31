@@ -3100,15 +3100,20 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         try: call(_exchange.update_leverage, min(BTC_LEVERAGE, get_max_leverage()), BTC_COIN, is_cross=False, timeout=10)
         except: pass
 
-        # ── ENTRY: prezzo aggressivo ──
+        # ── ENTRY: micro-retrace limit + fallback aggressivo ──
         mid = get_mid()
         if mid <= 0:
             log_btc("❌ get_mid() failed"); return False
-        px = rpx(mid * (1.0003 if is_long else 0.9997), px_dec)
 
-        log_btc(f"{'🟢' if is_long else '🔴'} ORDER {direction} [{scalp_mode}] @ {px} size:{size}")
+        # Step 1: limit order al retrace (0.1% meglio del mid)
+        if is_long:
+            px = rpx(mid * 0.999, px_dec)   # 0.1% sotto — aspetta dip
+        else:
+            px = rpx(mid * 1.001, px_dec)   # 0.1% sopra — aspetta bounce
 
-        # ── PLACE ORDER + WAIT 2s ──
+        log_btc(f"{'🟢' if is_long else '🔴'} ORDER {direction} [{scalp_mode}] @ {px} (retrace) size:{size}")
+
+        # ── PLACE ORDER + WAIT 3s per fill ──
         res = call(_exchange.order, BTC_COIN, is_long, size, px,
                    {"limit": {"tif": "Gtc"}}, False, timeout=15)
 
@@ -3122,15 +3127,38 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
                     oid = s["resting"]["oid"]
 
         if not filled and oid:
-            for _ in range(4):
+            for _ in range(6):  # 3s polling
                 time.sleep(0.5)
                 p = get_position()
                 if p and abs(p.get("szi", 0)) > 0:
                     filled = True; break
+
+            # Step 2: fallback — cancel retrace, piazza aggressivo
             if not filled:
                 try: call(_exchange.cancel, BTC_COIN, oid, timeout=10)
                 except: pass
-                log_btc(f"❌ Not filled in 2s — cancelled"); return False
+                mid2 = get_mid()
+                if mid2 > 0:
+                    px2 = rpx(mid2 * (1.0003 if is_long else 0.9997), px_dec)
+                    log_btc(f"⚡ Retrace miss — fallback aggressivo @ {px2}")
+                    res = call(_exchange.order, BTC_COIN, is_long, size, px2,
+                               {"limit": {"tif": "Gtc"}}, False, timeout=15)
+                    if res and res.get("status") == "ok":
+                        for s in res.get("response", {}).get("data", {}).get("statuses", []):
+                            if "filled" in s:
+                                filled = True; break
+                            if "resting" in s:
+                                oid = s["resting"]["oid"]
+                    if not filled and oid:
+                        for _ in range(4):
+                            time.sleep(0.5)
+                            p = get_position()
+                            if p and abs(p.get("szi", 0)) > 0:
+                                filled = True; break
+                        if not filled:
+                            try: call(_exchange.cancel, BTC_COIN, oid, timeout=10)
+                            except: pass
+                            log_btc(f"❌ Not filled — cancelled"); return False
 
         if not filled:
             log_btc(f"❌ Order failed — res: {res}"); return False
