@@ -62,8 +62,8 @@ BTC_SCAN_INTERVAL = 5
 BTC_SIGNAL_MAX_AGE = 30
 BTC_REGIME_INTERVAL = 300
 
-# ROE-based SL/TP — SL minimo 0.3% per evitare noise stops
-ROE_TP = 0.06; ROE_SL = 0.06  # 0.3% SL, 0.3% TP base (R:R 1:1 minimo)
+# ROE-based SL/TP — SL 
+ROE_TP = 0.10; ROE_SL = 0.05  
 TP_PRICE_PCT = ROE_TP / BTC_LEVERAGE  # 0.003 = 0.3%
 SL_PRICE_PCT = ROE_SL / BTC_LEVERAGE  # 0.003 = 0.3%
 
