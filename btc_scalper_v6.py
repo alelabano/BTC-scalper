@@ -3284,7 +3284,7 @@ def processor_thread(symbol, sz_dec, px_dec):
     global _current_signal, _last_trade_ts, _is_trading
     global _start_balance, _kill_switch
 
-    log(f"[{symbol}] Processor avviato — attendo Scanner...")
+    log_btc(f"[{symbol}] Processor avviato — attendo Scanner...")
     _scanner_ready.wait()
     log(f"[{symbol}] Scanner pronto — avvio")
 
@@ -3369,7 +3369,7 @@ def processor_thread(symbol, sz_dec, px_dec):
 
             # ── PRICE CONFIRMATION ──
             price_at_signal = get_mid(symbol)
-            log(f"[{symbol}] Signal {direction} @ {price_at_signal:,.0f} — wait 8s")
+            log_btc(f"[{symbol}] Signal {direction} @ {price_at_signal:,.0f} — wait 8s")
 
             time.sleep(8)
             price_after = get_mid(symbol)
