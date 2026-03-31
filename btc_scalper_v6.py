@@ -3346,7 +3346,7 @@ def processor_thread(symbol, sz_dec, px_dec):
 
             # ── DETECT ──
             sig_ts = time.time()
-            sig = check_signal(symbol)
+            sig = check_signal()
 
             if sig is None:
                 log(f"[{symbol}] no signal | ${mid:,.0f}")
@@ -3549,7 +3549,7 @@ def processor_thread_alt(sz_dec, px_dec, coin):
 
             # ── 5. DETECTION SEGNALE ──
             sig_ts = time.time()
-            sig = check_signal(coin) # Deve restituire la tupla completa definita nel bot
+            sig = check_signal() # Deve restituire la tupla completa definita nel bot
 
             if sig is None:
                 time.sleep(1)
