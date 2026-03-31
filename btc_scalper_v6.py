@@ -3271,197 +3271,210 @@ def scanner_thread():
 # ================================================================
 # BTC THREAD B — PROCESSOR (check signal ogni 10s)
 # ================================================================
-def processor_thread(sz_dec, px_dec):
-    global _btc_current_signal, _btc_last_trade_ts, _btc_is_trading
+def processor_thread(symbol, sz_dec, px_dec):
+    """
+    Processor GENERICO (BTC + ALT)
 
-    CONFIRMATION_SECONDS = 2
+    - Detect + Execute nello stesso ciclo
+    - Filtri: Flow, Sentiment, Momentum, ML
+    - Kill switch + circuit breaker
+    - Pronto per multi-coin
+    """
 
-    log_btc("Processor avviato — attendo Scanner...")
-    _btc_scanner_ready.wait()
-    log_btc("Scanner pronto — avvio (detect+execute mode)")
+    global _current_signal, _last_trade_ts, _is_trading
+    global _start_balance, _kill_switch
 
-    pending_confirm = None  # 🔥 nuovo: stato conferma non bloccante
+    log(f"[{symbol}] Processor avviato — attendo Scanner...")
+    _scanner_ready.wait()
+    log(f"[{symbol}] Scanner pronto — avvio")
 
     while True:
         try:
-            pos = get_position()
-            mid = get_mid()
+            pos = get_position(symbol)
+            mid = get_mid(symbol)
 
-            # ── GESTIONE CONFIRM NON BLOCCANTE ──
-            if pending_confirm is not None:
-                now = time.time()
-
-                if now >= pending_confirm["deadline"]:
-                    price_now = get_mid()
-                    direction = pending_confirm["direction"]
-
-                    confirmed = True
-                    if direction == "LONG" and price_now < pending_confirm["price"]:
-                        confirmed = False
-                    elif direction == "SHORT" and price_now > pending_confirm["price"]:
-                        confirmed = False
-
-                    if not confirmed:
-                        log_btc(f"❌ Post-confirm failed → close")
-                        close_position(get_position())
-                        pending_confirm = None
-                        continue
-
-                    log_btc(f"✅ Post-confirm OK → hold")
-                    pending_confirm = None
-
-            # Se in posizione → executor gestisce
+            # ── SE IN POSIZIONE ──
             if pos is not None:
-                time.sleep(BTC_SCAN_INTERVAL)
+                time.sleep(SCAN_INTERVAL)
                 continue
 
-            # ── KILL / CB ──
+            # ── KILL SWITCH / CIRCUIT BREAKER ──
             ks, _ = fleet_check_kill_switch()
             if ks:
-                time.sleep(BTC_SCAN_INTERVAL)
+                time.sleep(SCAN_INTERVAL)
                 continue
 
             cb, _ = check_circuit_breaker()
             if cb:
-                time.sleep(BTC_SCAN_INTERVAL)
+                time.sleep(SCAN_INTERVAL)
                 continue
 
-            if time.time() - _btc_last_trade_ts < BTC_COOLDOWN_SEC:
-                time.sleep(BTC_SCAN_INTERVAL)
+            # ── COOLDOWN ──
+            if time.time() - _last_trade_ts < COOLDOWN_SEC:
+                time.sleep(SCAN_INTERVAL)
                 continue
 
-            if _btc_is_trading:
-                time.sleep(BTC_SCAN_INTERVAL)
+            if _is_trading:
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            # ── DAILY LOSS KILL SWITCH ──
+            bal = get_balance()
+
+            if _start_balance is None:
+                _start_balance = bal
+                log(f"[{symbol}] Start balance: ${bal:.2f}")
+
+            if bal > 0 and _start_balance > 0:
+                loss_pct = (1 - bal / _start_balance) * 100
+
+                if loss_pct >= MAX_DAILY_LOSS_PCT:
+                    if not _kill_switch:
+                        _kill_switch = True
+                        log(f"[{symbol}] 🛑 KILL SWITCH {loss_pct:.1f}%")
+
+            if _kill_switch:
+                time.sleep(300)
+
+                now = datetime.now(timezone.utc)
+                if now.hour == 0 and now.minute < 5:
+                    _kill_switch = False
+                    _start_balance = bal
+                    log(f"[{symbol}] Kill switch reset")
+
                 continue
 
             # ── DETECT ──
             sig_ts = time.time()
-            sig = check_signal(coin)
-            anti_score = get_anticipation_score(coin) # <--- Nuova chiamata
-
-            # Se non c'è un segnale tecnico ma l'anticipatore è forte:
-            if sig is None and anti_score != 0:
-                # Creiamo un "Segnale Sintetico" basato sull'anticipazione
-                direction = "LONG" if anti_score > 1 else "SHORT"
-                log_btc(f"[{coin}] 🔥 ANTICIPATION ENTRY: {direction} (OI/CVD Bias)")
-                
-                # Recupera i dati minimi per l'entry
-                mid = get_mid(coin)
-                # Usiamo SL/TP standard basati sull'ATR o fissi
-                success = open_position(coin, direction, mid, mid*0.98, mid*1.05, 0.02, sz_dec, px_dec, 1.0)
-                if success:
-                    pending_confirm = {"direction": direction, "price": mid, "deadline": time.time() + 30}
-                continue 
+            sig = check_signal(symbol)
 
             if sig is None:
-                time.sleep(0.3)
+                log(f"[{symbol}] no signal | ${mid:,.0f}")
+                time.sleep(SCAN_INTERVAL)
                 continue
-            # -------------------------------
 
-            (direction, sig_type, sl, tp, entry_px, atr,
-             details, sl_dist, size_mult, sig_regime,
-             setup, scalp_mode, ml_features, tp1) = sig
+            (
+                direction, sig_type, sl, tp, entry_px, atr,
+                details, sl_dist, size_mult, regime,
+                setup, scalp_mode, ml_features, tp1
+            ) = sig
 
-            # ── STALE CHECK ──
+            # ── STALE SIGNAL ──
             if time.time() - sig_ts > 25:
-                log_btc(f"⚠️ Signal stale — skip")
+                log(f"[{symbol}] ⚠️ Signal stale")
                 continue
 
-            if not is_funding_ok(direction):
+            if not is_funding_ok(symbol, direction):
                 continue
 
-            # ── MOMENTUM FILTER (FIX POSIZIONE) ──
-            df = fetch_df(BTC_COIN, "5m", 20)
+            # ── PRICE CONFIRMATION ──
+            price_at_signal = get_mid(symbol)
+            log(f"[{symbol}] Signal {direction} @ {price_at_signal:,.0f} — wait 8s")
+
+            time.sleep(8)
+            price_after = get_mid(symbol)
+
+            if price_after <= 0:
+                continue
+
+            if direction == "LONG" and price_after < price_at_signal:
+                continue
+
+            if direction == "SHORT" and price_after > price_at_signal:
+                continue
+
+            # ── FLOW FILTER ──
+            flow = get_flow_signal(symbol)
+
+            if direction == "LONG" and flow.get("bias") == "SELL":
+                continue
+
+            if direction == "SHORT" and flow.get("bias") == "BUY":
+                continue
+
+            # ── SENTIMENT FILTER ──
+            sentiment = get_sentiment_score(symbol)
+
+            if direction == "LONG" and sentiment > 70:
+                continue
+
+            if direction == "SHORT" and sentiment < 30:
+                continue
+
+            # ── MOMENTUM (FIXED) ──
+            df = fetch_df(symbol, "5m", 20)
+
             if df is None or len(df) < 20:
                 continue
 
             last = df.iloc[-1]
-            last_candle_range = last["high"] - last["low"]
+            last_range = last["high"] - last["low"]
             avg_range = (df["high"] - df["low"]).mean()
 
-            if last_candle_range < avg_range * 1.2:
-                log_btc(f"❌ No momentum — skip")
-                continue
-
-            # ── FLOW CHECK ──
-            flow_now = get_flow_signal()
-            if direction == "LONG" and flow_now.get("bias") == "SELL":
-                continue
-            if direction == "SHORT" and flow_now.get("bias") == "BUY":
-                continue
-
-            # ── SENTIMENT CHECK ──
-            sent = get_sentiment_score()
-            if direction == "LONG" and sent > 70:
-                continue
-            if direction == "SHORT" and sent < 30:
+            if last_range < avg_range * 1.2:
+                log(f"[{symbol}] ❌ No momentum")
                 continue
 
             # ── ML FILTER ──
             if ml_features:
-                ml_result = ml_predict_signal(ml_features)
-                if ml_result.get("block"):
-                    log_btc(f"🤖 ML BLOCK")
+                ml = ml_predict_signal(ml_features)
+
+                if ml.get("block"):
+                    log(f"[{symbol}] 🤖 ML BLOCK {ml['prob']:.0%}")
                     continue
 
-            # ── MAX TRADES ──
+            # ── MAX TRADES / H ──
             now = time.time()
             trades_last_hour = len([
-                t for t in _btc_trades_today
+                t for t in _trades_today
                 if now - t.get("ts_close", t.get("ts", 0)) < 3600
             ])
+
             if trades_last_hour >= MAX_TRADES_PER_HOUR:
                 continue
 
-            # 🔥 ENTRY IMMEDIATA (NO WAIT)
-            price_now = get_mid()
+            # ── EXECUTE ──
+            log(f"[{symbol}] ⚡ EXEC {direction} @ {entry_px:,.0f}")
 
-            log_btc(f"⚡ FAST ENTRY {direction} @ {price_now:,.0f}")
-
-            success = btc_open_trade(direction, sl, tp, price_now,
-                                     sl_dist, sz_dec, px_dec, size_mult, scalp_mode)
+            success = open_trade(
+                symbol, direction, sl, tp, entry_px,
+                sl_dist, sz_dec, px_dec, size_mult, scalp_mode
+            )
 
             if success:
-                p = get_position()
+                p = get_position(symbol)
+
                 if p:
                     pos_state = {
-                        "coin": BTC_COIN,
+                        "coin": symbol,
                         "side": direction,
-                        "entry_px": p["entry"],
+                        "entry": p["entry"],
                         "size": abs(p["szi"]),
+                        "sl": sl,
+                        "tp": tp,
+                        "tp1": tp1,
                         "entry_time": time.time(),
-                        "sl_px": sl,
-                        "tp_px": tp,
-                        "tp1_px": tp1,
-                        "sl_dist": sl_dist,
                         "mode": scalp_mode,
-                        "type": sig_type,
-                        "regime": sig_regime,
-                        "ml_features": ml_features,
+                        "ml_features": ml_features
                     }
 
-                    save_pos_state(pos_state)
+                    save_pos_state(symbol, pos_state)
 
-                    _btc_current_signal = {"filled": True, "pos_state": pos_state}
+                    _current_signal = {"filled": True}
+                    _last_trade_ts = time.time()
 
-                    log_btc(f"✅ FILLED → avvio confirm")
-
-                    # 🔥 POST-CONFIRM NON BLOCCANTE
-                    pending_confirm = {
-                        "direction": direction,
-                        "price": price_now,
-                        "deadline": time.time() + CONFIRMATION_SECONDS
-                    }
+                    log(f"[{symbol}] ✅ FILLED")
 
             else:
-                _btc_last_trade_ts = time.time()
-                log_btc(f"❌ Trade fallito")
+                _last_trade_ts = time.time()
+                log(f"[{symbol}] ❌ FAILED")
 
         except Exception as e:
-            log_btc(f"Processor error: {e}")
-            import traceback; traceback.print_exc()
+            log(f"[{symbol}] ERROR: {e}")
+            import traceback
+            traceback.print_exc()
 
-        time.sleep(BTC_SCAN_INTERVAL)
+        time.sleep(SCAN_INTERVAL)
 
 # ================================================================
 # ALTCOIN PROCESSOR V7.5 (FAST ENTRY + POST-CONFIRM)
