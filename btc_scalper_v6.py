@@ -1560,16 +1560,30 @@ def build(df):
 
     return df.dropna(subset=['rsi','atr','ema200'])
 
-def fetch_df(tf, days):
+def fetch_df(coin, tf, days):
     now = int(time.time() * 1000)
     for _ in range(3):
         try:
-            c = call(_info.candles_snapshot, BTC_COIN, tf, now - 86400000*days, now, timeout=15)
+            # 1. Recupero Candele
+            c = call(_info.candles_snapshot, coin, tf, now - 86400000*days, now, timeout=15)
             if c and len(c) > 50:
                 df = pd.DataFrame(c)
                 df.columns = ['t','T','s','i','o','c','h','l','v','n']
                 df[['o','c','h','l','v']] = df[['o','c','h','l','v']].astype(float)
                 df.rename(columns={'o':'open','c':'close','h':'high','l':'low','v':'volume'}, inplace=True)
+                
+                # 2. Integrazione Open Interest (Dato "Leading")
+                # Recuperiamo il contesto live per l'OI attuale
+                meta = call(_info.meta_and_asset_ctxs)
+                asset_index = next((i for i, m in enumerate(meta[0]['universe']) if m['name'] == coin), None)
+                if asset_index is not None:
+                    current_oi = float(meta[1][asset_index]['openInterest'])
+                    # Approssimiamo l'OI storico (o usiamo il corrente per l'ultima riga)
+                    df['oi'] = current_oi 
+                
+                # 3. Calcolo CVD approssimato dai tick (Cumulative Volume Delta)
+                df['cvd'] = (df['volume'] * ( (df['close'] - df['low']) - (df['high'] - df['close']) ) / (df['high'] - df['low'] + 1e-9)).cumsum()
+                
                 return build(df)
         except: pass
         time.sleep(2)
