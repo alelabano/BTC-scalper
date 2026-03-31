@@ -58,7 +58,7 @@ BTC_MAX_POSITIONS = 2
 BTC_COOLDOWN_SEC = 180
 BTC_COOLDOWN_AFTER_LOSS = 900  # 5 min dopo un loss
 MAX_TRADES_PER_HOUR = 2
-BTC_SCAN_INTERVAL = 5
+BTC_SCAN_INTERVAL = 10
 BTC_SIGNAL_MAX_AGE = 30
 BTC_REGIME_INTERVAL = 300
 
@@ -122,7 +122,7 @@ META_REFRESH_CYCLES = 20
 ENTRY_POLL_ATTEMPTS = 8; ENTRY_POLL_INTERVAL = 0.5
 COIN_COOLDOWN_MR = 3600; COIN_COOLDOWN_TREND = 14400; COIN_COOLDOWN = 3600
 SETUP_SCORE_MIN = 20
-TRAILING_STOP_INTERVAL = 5 * 60
+ALT_TRAILING_INTERVAL = 30  # ALT trailing check ogni 30s
 SCANNER_INTERVAL = 10 * 60; SCANNER_MAX_UNIVERSE = 229
 PROCESSOR_MAX_COINS = 30
 CORRELATION_THRESHOLD = 0.55
@@ -2268,7 +2268,7 @@ def get_anticipation_score(coin):
     fee_cost = px * 0.001  # 0.05% × 2 lati
     effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
     if effective_rr < 0.8:
-        log_btc(f"❌ R:R {effective_rr:.2f} < 1.3 — skip"); return None
+        log_btc(f"❌ R:R {effective_rr:.2f} < 0.8 — skip"); return None
 
     if direction == "LONG":
         sl = px - sl_dist
