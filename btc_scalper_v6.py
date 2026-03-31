@@ -3367,21 +3367,30 @@ def processor_thread(symbol, sz_dec, px_dec):
             if not is_funding_ok(symbol, direction):
                 continue
 
-            # ── PRICE CONFIRMATION ──
+            # ── PRICE CONFIRMATION: polling ogni 0.5s, max 8s ──
             price_at_signal = get_mid(symbol)
-            log_btc(f"[{symbol}] Signal {direction} @ {price_at_signal:,.0f} — wait 8s")
+            log_btc(f"[{symbol}] Signal {direction} @ {price_at_signal:,.0f} — confirming...")
 
-            time.sleep(8)
+            confirm_ok = False
+            confirm_start = time.time()
+            while time.time() - confirm_start < 8:
+                px_now = get_mid(symbol)
+                if px_now <= 0:
+                    time.sleep(0.5)
+                    continue
+                if direction == "LONG" and px_now > price_at_signal:
+                    confirm_ok = True
+                    break
+                elif direction == "SHORT" and px_now < price_at_signal:
+                    confirm_ok = True
+                    break
+                time.sleep(0.5)
+
+            if not confirm_ok:
+                log_btc(f"[{symbol}] ❌ Price not confirmed in {time.time()-confirm_start:.1f}s")
+                continue
+
             price_after = get_mid(symbol)
-
-            if price_after <= 0:
-                continue
-
-            if direction == "LONG" and price_after < price_at_signal:
-                continue
-
-            if direction == "SHORT" and price_after > price_at_signal:
-                continue
 
             # ── FLOW FILTER ──
             flow = get_flow_signal(symbol)
