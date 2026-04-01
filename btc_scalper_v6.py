@@ -2995,7 +2995,7 @@ def processor_thread(symbol, sz_dec, px_dec):
             # ── MAX TRADES / H ──
             now = time.time()
             trades_last_hour = len([
-                t for t in _trades_today
+                t for t in _btc_trades_today
                 if now - t.get("ts_close", t.get("ts", 0)) < 3600
             ])
             if trades_last_hour >= MAX_TRADES_PER_HOUR:
