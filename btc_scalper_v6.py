@@ -2789,7 +2789,7 @@ def processor_thread(symbol, sz_dec, px_dec):
     - Pronto per multi-coin
     """
 
-    global _btc_current_signal, _btc_last_trade_ts, _btc_is_trading
+    global _btc_current_signal, _btc_last_trade_ts, _btc_is_trading, _btc_last_check_price
     global _btc_start_balance, _btc_kill_switch
 
     log_btc(f"[{symbol}] Processor avviato — attendo Scanner...")
