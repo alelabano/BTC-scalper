@@ -6724,28 +6724,7 @@ def btc_executor_loop(sz_dec, px_dec):
                 if pnl_ratio < last_pos_state["worst_pnl"]:
                     last_pos_state["worst_pnl"] = pnl_ratio   # MAE
 
-                # ── 1. HARD FAIL: primi 20s, loss > -5% ROE → chiudi subito ──
-                if time_in_trade < 20 and pnl_ratio < -0.01:  # -5% ROE @ 5x
-                    log_btc(f"❌ HARD FAIL {pnl_pct:+.2f}% in {time_in_trade:.0f}s")
-                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"❌ Hard fail {pnl_pct:+.2f}%"
-                    save_pos_state(last_pos_state)
-                    tg(f"❌ <b>BTC HARD FAIL</b> {pnl_pct:+.2f}%")
-                    time.sleep(BTC_SCAN_INTERVAL)
-                    continue
-
-                # ── 1b. PROGRESSIVE EXIT: 20-60s, loss crescente → chiudi ──
-                # Se dopo 30s sei a -0.3% o dopo 45s sei a -0.15% → non sta andando
-                if time_in_trade > 30 and pnl_ratio < -0.003:
-                    log_btc(f"📉 PROGRESSIVE EXIT {pnl_pct:+.2f}% dopo {time_in_trade:.0f}s")
-                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"📉 Progressive {pnl_pct:+.2f}%"
-                    save_pos_state(last_pos_state)
-                    tg(f"📉 <b>BTC EXIT</b> {pnl_pct:+.2f}%")
-                    time.sleep(BTC_SCAN_INTERVAL)
-                    continue
-
-                # ── 2. BREAK EVEN: +0.15% → sposta SL a entry ──
+                # ── 1. BREAK EVEN: +0.15% → sposta SL a entry (zero risk) ──
                 if pnl_ratio > 0.0015 and not last_pos_state["be_active"]:
                     entry_be = last_pos_state.get("entry_px", last_pos_state.get("entry", 0))
                     if entry_be > 0:
@@ -6783,17 +6762,11 @@ def btc_executor_loop(sz_dec, px_dec):
                     time.sleep(BTC_SCAN_INTERVAL)
                     continue
 
-                # ── 5. TIME STOP: dopo 60s se PnL < +0.1% → trade morto ──
-                if time_in_trade > 60 and pnl_ratio < 0.001:
-                    log_btc(f"⏱️ TIME EXIT {pnl_pct:+.2f}% dopo {time_in_trade:.0f}s")
-                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"⏱️ Time {pnl_pct:+.2f}%"
-                    save_pos_state(last_pos_state)
-                    tg(f"⏱️ <b>BTC TIME</b> {pnl_pct:+.2f}%")
-                    time.sleep(BTC_SCAN_INTERVAL)
-                    continue
+                # Exchange SL (-0.8%) e TP (+0.8%) gestiscono il resto
+                # Nessun hard fail, progressive exit, time stop
+                # Il trade respira — SL protegge, trailing lock profitto
 
-                # ── 4. CHECK EXIT (fill reale) ──
+                # ── CHECK EXIT (fill reale da exchange) ──
                 closed, exit_px = check_btc_exit(last_pos_state)
                 if closed and exit_px:
                     pnl_real = ((exit_px - entry)/entry if d == "LONG" else (entry - exit_px)/entry) * 100
