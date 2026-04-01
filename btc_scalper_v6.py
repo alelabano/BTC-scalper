@@ -2051,8 +2051,8 @@ def check_signal():
     oi_chg = get_oi_change()
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
-    # TP fissi: 0.5% e 0.8%
-    sl_dist = atr5 * 1.2
+    # TP fissi: 0.5% e 0.8%, SL fisso: 0.8% (R:R 1:1 con TP2)
+    sl_dist = px * 0.008    # 0.8% — stessa distanza del TP2
     tp1_dist = px * 0.005   # 0.5%
     tp2_dist = px * 0.008   # 0.8%
 
@@ -6693,6 +6693,17 @@ def btc_executor_loop(sz_dec, px_dec):
                     last_pos_state["close_reason"] = f"❌ Hard fail {pnl_pct:+.2f}%"
                     save_pos_state(last_pos_state)
                     tg(f"❌ <b>BTC HARD FAIL</b> {pnl_pct:+.2f}%")
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue
+
+                # ── 1b. PROGRESSIVE EXIT: 20-60s, loss crescente → chiudi ──
+                # Se dopo 30s sei a -0.3% o dopo 45s sei a -0.15% → non sta andando
+                if time_in_trade > 30 and pnl_ratio < -0.003:
+                    log_btc(f"📉 PROGRESSIVE EXIT {pnl_pct:+.2f}% dopo {time_in_trade:.0f}s")
+                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
+                    last_pos_state["close_reason"] = f"📉 Progressive {pnl_pct:+.2f}%"
+                    save_pos_state(last_pos_state)
+                    tg(f"📉 <b>BTC EXIT</b> {pnl_pct:+.2f}%")
                     time.sleep(BTC_SCAN_INTERVAL)
                     continue
 
