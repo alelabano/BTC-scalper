@@ -1186,6 +1186,8 @@ _btc_is_trading = False
 _btc_start_balance = None
 _btc_kill_switch = False
 _btc_pending_order = {}
+_btc_sig_stable = {"key": None, "ts": 0}
+_btc_last_check_price = 0
 _btc_regime = "RANGE"
 _btc_regime_ts = 0
 _btc_bt_results = {}
@@ -2850,6 +2852,14 @@ def processor_thread(symbol, sz_dec, px_dec):
 
                 continue
 
+            # ── VOLATILITY FILTER: skip se mercato morto ──
+            if _btc_last_check_price > 0:
+                delta = abs(mid - _btc_last_check_price) / mid
+                if delta < 0.0005:  # < 0.05% = chop
+                    time.sleep(BTC_SCAN_INTERVAL)
+                    continue
+            _btc_last_check_price = mid
+
             # ── DETECT ──
             sig_ts = time.time()
             sig = check_signal()
@@ -2864,6 +2874,17 @@ def processor_thread(symbol, sz_dec, px_dec):
                 details, sl_dist, size_mult, regime,
                 setup, scalp_mode, ml_features, tp1
             ) = sig
+
+            # ── SIGNAL STABILITY: segnale deve persistere 6s (anti fake breakout) ──
+            sig_key = f"{direction}_{sig_type}"
+            if _btc_sig_stable.get("key") != sig_key:
+                _btc_sig_stable["key"] = sig_key
+                _btc_sig_stable["ts"] = time.time()
+                time.sleep(BTC_SCAN_INTERVAL)
+                continue
+            if time.time() - _btc_sig_stable.get("ts", 0) < 6:
+                time.sleep(BTC_SCAN_INTERVAL)
+                continue
 
             # ── STALE SIGNAL ──
             if time.time() - sig_ts > 25:
@@ -6634,29 +6655,67 @@ def btc_executor_loop(sz_dec, px_dec):
                         atr_now = float(df_m.iloc[-1]['atr'])
                         last_pos_state["atr"] = atr_now
 
-                # ── 1a. EARLY FAIL: nei primi 15s, se già -4% ROE → chiudi subito ──
-                pnl_ratio = pnl_pct / 100
-                if time_in_trade < 15 and pnl_ratio < -0.008:
-                    log_btc(f"⚠️ EARLY FAIL {pnl_pct:+.2f}% in {time_in_trade:.0f}s")
+                # ══════════════════════════════════════════════════════
+                # BTC EXIT LOGIC V2
+                # ══════════════════════════════════════════════════════
+                pnl_ratio = pnl_pct / 100  # price-based (not ROE)
+
+                # Init state fields if missing
+                if "peak_pnl" not in last_pos_state:
+                    last_pos_state["peak_pnl"] = 0
+                if "be_active" not in last_pos_state:
+                    last_pos_state["be_active"] = False
+
+                # ── 1. HARD FAIL: primi 20s, loss > -5% ROE → chiudi subito ──
+                if time_in_trade < 20 and pnl_ratio < -0.01:  # -5% ROE @ 5x
+                    log_btc(f"❌ HARD FAIL {pnl_pct:+.2f}% in {time_in_trade:.0f}s")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"⚠️ Early fail {pnl_pct:+.2f}%"
+                    last_pos_state["close_reason"] = f"❌ Hard fail {pnl_pct:+.2f}%"
                     save_pos_state(last_pos_state)
-                    tg(f"⚠️ <b>BTC EARLY FAIL</b> {pnl_pct:+.2f}% in {time_in_trade:.0f}s")
+                    tg(f"❌ <b>BTC HARD FAIL</b> {pnl_pct:+.2f}%")
                     time.sleep(BTC_SCAN_INTERVAL)
                     continue
 
-                # ── 1b. FAST EXIT: dopo 40s, se -4% ROE → chiudi ──
-                if pnl_ratio < -0.008 and time_in_trade > 40:
-                    log_btc(f"✂️ FAST EXIT {pnl_pct:+.2f}%")
+                # ── 2. BREAK EVEN: +0.15% → sposta SL a entry ──
+                if pnl_ratio > 0.0015 and not last_pos_state["be_active"]:
+                    entry_be = last_pos_state.get("entry_px", last_pos_state.get("entry", 0))
+                    if entry_be > 0:
+                        try:
+                            orders = get_open_orders()
+                            for o in (orders or []):
+                                if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
+                                    try: call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
+                                    except: pass
+                            time.sleep(0.3)
+                            be_px = rpx(entry_be, px_dec)
+                            size_abs = rpx(abs(szi), sz_dec)
+                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, be_px,
+                                 {"trigger": {"triggerPx": be_px, "isMarket": True, "tpsl": "sl"}},
+                                 True, timeout=15)
+                            last_pos_state["be_active"] = True
+                            save_pos_state(last_pos_state)
+                            log_btc(f"⚖️ BREAK EVEN @ {be_px:,.0f}")
+                        except Exception as e:
+                            log_btc(f"⚠️ BE failed: {e}")
+
+                # ── 3. TRACK PEAK PNL ──
+                if pnl_ratio > last_pos_state["peak_pnl"]:
+                    last_pos_state["peak_pnl"] = pnl_ratio
+                peak = last_pos_state["peak_pnl"]
+
+                # ── 4. TRAILING: dinamico in base al peak ──
+                trail_dist = 0.001 if peak < 0.003 else 0.0015  # 0.10% o 0.15%
+                if peak > 0.0015 and pnl_ratio < peak - trail_dist:
+                    log_btc(f"🔒 TRAILING EXIT +{pnl_pct:.2f}% (peak:+{peak*100:.2f}%)")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"✂️ Cut {pnl_pct:+.2f}%"
+                    last_pos_state["close_reason"] = f"🔒 Trail {pnl_pct:+.2f}%"
                     save_pos_state(last_pos_state)
-                    tg(f"✂️ <b>BTC CUT</b> {pnl_pct:+.2f}%")
+                    tg(f"🔒 <b>BTC TRAIL</b> +{pnl_pct:.2f}%")
                     time.sleep(BTC_SCAN_INTERVAL)
                     continue
 
-                # ── 2. TIME STOP: dopo 45s se non in profitto → chiudi ──
-                if time_in_trade > 45 and pnl_ratio < 0.0005:  # < +0.05%
+                # ── 5. TIME STOP: dopo 60s se PnL < +0.1% → trade morto ──
+                if time_in_trade > 60 and pnl_ratio < 0.001:
                     log_btc(f"⏱️ TIME EXIT {pnl_pct:+.2f}% dopo {time_in_trade:.0f}s")
                     btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
                     last_pos_state["close_reason"] = f"⏱️ Time {pnl_pct:+.2f}%"
@@ -6664,63 +6723,6 @@ def btc_executor_loop(sz_dec, px_dec):
                     tg(f"⏱️ <b>BTC TIME</b> {pnl_pct:+.2f}%")
                     time.sleep(BTC_SCAN_INTERVAL)
                     continue
-
-                # ── 3. RANGE TP: profitto > 0.15% → chiudi ──
-                if trade_mode == "RANGE" and pnl_ratio > 0.0015:
-                    log_btc(f"💰 RANGE TP +{pnl_pct:.2f}%")
-                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"💰 RANGE TP"
-                    save_pos_state(last_pos_state)
-                    time.sleep(BTC_SCAN_INTERVAL)
-                    continue
-
-                # ── 3. TRAILING PROFIT: lock in profitto ──
-                # Track peak PnL
-                peak_pnl = last_pos_state.get("peak_pnl", 0)
-                if pnl_ratio > peak_pnl:
-                    last_pos_state["peak_pnl"] = pnl_ratio
-                    peak_pnl = pnl_ratio
-
-                # Se profitto > +0.15% e poi ritraccia di 0.10% dal picco → chiudi
-                if peak_pnl > 0.0015 and pnl_ratio < peak_pnl - 0.001:
-                    log_btc(f"🔒 TRAILING EXIT +{pnl_pct:.2f}% (peak:+{peak_pnl*100:.2f}%)")
-                    btc_market_close(d, abs(szi), mid, sz_dec, px_dec)
-                    last_pos_state["close_reason"] = f"🔒 Trail {pnl_pct:+.2f}%"
-                    save_pos_state(last_pos_state)
-                    tg(f"🔒 <b>BTC TRAIL</b> +{pnl_pct:.2f}% (peak:+{peak_pnl*100:.2f}%)")
-                    time.sleep(BTC_SCAN_INTERVAL)
-                    continue
-
-                # ── 4. BREAK EVEN: sposta SL a entry quando in profitto ──
-                if pnl_ratio > 0.0012 and not last_pos_state.get("be_active"):
-                    # Sposta SL sull'exchange a entry price (= zero risk)
-                    entry_be = last_pos_state.get("entry_px", last_pos_state.get("entry", 0))
-                    if entry_be > 0:
-                        try:
-                            # Cancel tutti gli SL esistenti
-                            orders = get_open_orders()
-                            for o in (orders or []):
-                                if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
-                                    try: call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
-                                    except: pass
-                            time.sleep(0.3)
-                            # Piazza nuovo SL a entry
-                            be_px = rpx(entry_be, px_dec)
-                            size_abs = rpx(abs(szi), sz_dec)
-                            call(_exchange.order, BTC_COIN, d != "LONG", size_abs, be_px,
-                                 {"trigger": {"triggerPx": be_px, "isMarket": True, "tpsl": "sl"}},
-                                 True, timeout=15)
-                            last_pos_state["be_active"] = True
-                            last_pos_state["sl_px"] = be_px
-                            save_pos_state(last_pos_state)
-                            log_btc(f"⚖️ BREAK EVEN @ {be_px:,.0f}")
-                        except Exception as e:
-                            log_btc(f"⚠️ BE failed: {e}")
-
-                # ── 5. TP1 partial close (TREND only) ──
-                if trade_mode == "TREND":
-                    btc_check_partial_close(last_pos_state, mid, sz_dec, px_dec)
-                # FLASH/RANGE: SL/TP fissi sull'exchange
 
                 # ── 4. CHECK EXIT (fill reale) ──
                 closed, exit_px = check_btc_exit(last_pos_state)
