@@ -136,7 +136,6 @@ MAX_DAILY_LOSS_PCT = 15.0
 MAX_CONSECUTIVE_LOSSES = 4
 
 def log_err(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  {msg}", flush=True)
-def log_p(msg): log("ALT-P", msg)
 def log_e(msg): log("ALT-E", msg)
 def round_to_decimals(val, decimals):
     if decimals == 0: return int(round(float(val)))
@@ -231,13 +230,6 @@ def min_decimals_for_price(px):
         rounded = round(px, d)
         if rounded > 0 and abs(rounded - px) / px < 0.005: return d
     return 6
-
-def effective_price_dec(px, sl, tp, base_px_dec):
-    dec = max(base_px_dec, min_decimals_for_price(px))
-    e = rpx(px, dec); s = rpx(sl, dec); t = rpx(tp, dec)
-    if s == e or t == e: dec = min(dec + 2, 8)
-    return dec
-
 # ================================================================
 # REDIS (shared)
 # ================================================================
@@ -256,14 +248,6 @@ def _rset(key, val):
         requests.post(f"{REDIS_URL}/set/{key}/{requests.utils.quote(json.dumps(val))}",
             headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=5)
     except: pass
-
-def _rdel(key):
-    if not REDIS_URL: return
-    try:
-        requests.get(f"{REDIS_URL}/del/{key}",
-            headers={"Authorization": f"Bearer {REDIS_TOKEN}"}, timeout=5)
-    except: pass
-
 # ================================================================
 # FLEET SYSTEM — INTERNO (BTC → ALT in-memory)
 # ================================================================
@@ -317,16 +301,6 @@ def fleet_get_btc_position():
 def fleet_check_kill_switch():
     with _fleet_lock:
         return _fleet["kill_switch"], _fleet["kill_reason"]
-
-def fleet_set_kill_switch(active, reason=""):
-    with _fleet_lock:
-        _fleet["kill_switch"] = active
-        _fleet["kill_reason"] = reason
-    if active:
-        _rset("fleet:kill_switch", {"active": True, "reason": reason, "ts": time.time()})
-        log_btc("FLEET", f"🚨 KILL SWITCH: {reason}")
-        tg(f"🚨 <b>KILL SWITCH</b>: {reason}")
-
 # ================================================================
 # MODULE 1: SENTIMENT ANALYSIS (V7.2 — Free APIs)
 # ================================================================
@@ -363,22 +337,6 @@ _BEARISH_WORDS = {
     "fear", "panic", "liquidat", "capitulat", "reject", "resistance",
     "bubble", "scam", "fraud", "ban", "regulation", "downtrend", "broke"
 }
-
-
-def _score_title(title):
-    """
-    Score un titolo Reddit: +1 per word bullish, -1 per bearish.
-    Returns: float in [-1, +1] normalizzato.
-    """
-    words = set(title.lower().split())
-    bull = sum(1 for w in words if any(bw in w for bw in _BULLISH_WORDS))
-    bear = sum(1 for w in words if any(bw in w for bw in _BEARISH_WORDS))
-    total = bull + bear
-    if total == 0:
-        return 0.0
-    return (bull - bear) / total  # [-1, +1]
-
-
 def _fetch_social_sentiment():
     """
     Sostituto gratuito di LunarCrush — combina:
@@ -678,72 +636,6 @@ def get_sentiment_score():
 def get_sentiment_detail():
     """Ritorna i componenti dettagliati dell'ultimo calcolo sentiment."""
     return _sentiment_cache.get("components", {})
-
-
-def get_sentiment_bias():
-    """
-    Returns sentiment-based directional bias:
-    - score < 20: EXTREME_FEAR → contrarian LONG bias
-    - score < 35: FEAR → slight LONG bias
-    - score > 80: EXTREME_GREED → contrarian SHORT bias
-    - score > 65: GREED → slight SHORT bias
-    - else: NEUTRAL
-
-    V7.2: conferma anche con Reddit sentiment per extreme levels.
-    """
-    s = get_sentiment_score()
-    social = _social_cache
-
-    # Reddit bearish > 60% dei post rinforza fear
-    reddit_extreme = False
-    sc = social.get("components", {})
-    r_bull = sc.get("reddit_bullish", 0)
-    r_bear = sc.get("reddit_bearish", 0)
-    if r_bull + r_bear > 5:  # almeno 5 post classificati
-        if r_bear / (r_bull + r_bear) > 0.6:
-            reddit_extreme = True  # extreme bearish on Reddit
-
-    if s < 20:
-        return "EXTREME_FEAR", s
-    if s < 35:
-        if reddit_extreme:
-            return "EXTREME_FEAR", s
-        return "FEAR", s
-    if s > 80:
-        return "EXTREME_GREED", s
-    if s > 65:
-        return "GREED", s
-    return "NEUTRAL", s
-
-
-def get_sentiment_adjustment():
-    """
-    Returns (size_mult_adj, sl_adj, confidence_adj) based on sentiment.
-    V7.2: modulato anche da Reddit activity spike.
-    """
-    s = get_sentiment_score()
-    sc = _social_cache.get("components", {})
-
-    # Reddit activity spike: se i commenti 48h sono molto alti → mercato rumoroso
-    reddit_comments = sc.get("cg_reddit_comments_48h", 0)
-    vol_penalty = 1.0
-    if reddit_comments > 5000:  # spike di attività
-        vol_penalty = 0.85
-        log_btc(f"[SENT] Reddit activity spike: {reddit_comments} comments/48h → size ×0.85")
-
-    if s < 15:
-        return 0.7 * vol_penalty, 1.3, 2
-    elif s < 30:
-        return 0.85 * vol_penalty, 1.15, 1
-    elif s > 85:
-        return 0.7 * vol_penalty, 1.3, 2
-    elif s > 70:
-        return 0.85 * vol_penalty, 1.15, 1
-    return 1.0 * vol_penalty, 1.0, 0
-
-
-# ================================================================
-# MODULE 2: ORDER FLOW ANALYSIS
 # ================================================================
 # CVD (Cumulative Volume Delta), OI Momentum, Liquidation Proximity,
 # Delta Divergence detection.
@@ -1174,26 +1066,6 @@ def encode_regime(regime):
 
 def encode_mode(mode):
     return {"TREND": 1.0, "RANGE": 0.0, "FLASH": 2.0}.get(mode, 0.0)
-
-
-def build_ml_features(rsi_15m, rsi_1h, macd_hist, adx_1h, vol_rel,
-                       funding_z, sentiment, ob_imbalance, cvd_slope,
-                       regime, scalp_mode, setup_score, oi_change_pct,
-                       bb_pos=0, ema_slope=0, spread=0):
-    """
-    Costruisce il vettore di features per il modello ML.
-    Ordine DEVE corrispondere a FEATURE_NAMES.
-    """
-    return [
-        float(rsi_15m), float(rsi_1h), float(macd_hist), float(adx_1h),
-        float(vol_rel), float(funding_z), float(sentiment),
-        float(ob_imbalance), float(cvd_slope),
-        encode_regime(regime), encode_mode(scalp_mode),
-        float(setup_score), float(oi_change_pct),
-        float(bb_pos), float(ema_slope), float(spread)
-    ]
-
-
 def ml_predict_signal(features):
     """
     ML filter:
@@ -1493,11 +1365,6 @@ def _update_adaptive_params():
     }
     _rset("btc6:params", _btc_params)
     log_btc(f"📊 Stats: WR:{wr:.0%} PF:{pf:.2f} PnL:${total_pnl:.2f} SLadj:{sl_adj} TPadj:{tp_adj}")
-
-def get_sl_tp_adjustments():
-    """Returns (sl_mult, tp_mult) from adaptive params."""
-    return _btc_params.get("sl_adj", 1.0), _btc_params.get("tp_adj", 1.0)
-
 def check_circuit_breaker():
     now = time.time()
     daily_pnl = sum(t["pnl"] for t in _btc_trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400)
@@ -1838,25 +1705,6 @@ def run_backtest():
     _rset("btc6:backtest", results)
     log_btc(f"📊 Backtest done: {len(results)} signal types tested")
     return results
-
-def is_signal_allowed(sig_type, direction):
-    """Backtest gate — recent PF >= 0.9 passa sempre, PF < 0.6 su entrambi blocca."""
-    key = f"{sig_type}_{direction}"
-    bt = _btc_bt_results.get(key, {})
-    pf = bt.get("pf", 0)
-    pf_recent = bt.get("pf_recent", 0)
-    n = bt.get("n", 0)
-    if n < 10:
-        return True
-    if pf_recent >= 0.9:
-        return True
-    if pf < 0.6 and pf_recent < 0.6:
-        return False
-    return True
-    # Edge debole — permetti ma il setup score + ML scaleranno la size
-    if pf >= 0.6 or pf_recent >= 0.6:
-        return True
-    return True  # nel dubbio, permetti — il mercato cambia
 def flow_trigger(flow_data, regime, allow_long=True, allow_short=True):
     """
     Flow trigger a 2 livelli.
@@ -2003,14 +1851,56 @@ def technical_trigger(r, r_prev, h_1h, allow_long=True, allow_short=True):
     return None
 
 
+def get_anticipation_score():
+    """
+    Anticipa il prossimo move usando divergenza OI/CVD + prezzo compresso.
+    
+    OI cresce + prezzo fermo = "molla carica" → move imminente
+    CVD indica la direzione: positivo = LONG, negativo = SHORT
+    
+    Returns: 1 (LONG imminente), -1 (SHORT imminente), 0 (neutrale)
+    """
+    try:
+        flow = _flow_cache.get("data", {})
+        if not flow:
+            return 0
+
+        cvd_data = flow.get("cvd_trend", {})
+        oi_data = flow.get("oi_momentum", {})
+
+        cvd = cvd_data.get("cvd", 0)
+        cvd_slope = cvd_data.get("cvd_slope", 0)
+        oi_change = oi_data.get("oi_change_pct", 0)  # già in %
+        oi_signal = oi_data.get("signal", "NEUTRAL")
+
+        # Serve OI in crescita (nuovi contratti = conviction)
+        if oi_change < 0.5:  # meno di 0.5% crescita OI
+            return 0
+
+        # Prezzo compresso? Check ATR vs media
+        mid = get_mid()
+        if mid <= 0:
+            return 0
+
+        # Se OI cresce e CVD ha direzione chiara → anticipa
+        if oi_signal in ("CONVICTION", "BUILDING"):
+            if cvd > 0 and cvd_slope > 0:
+                return 1   # LONG imminente
+            elif cvd < 0 and cvd_slope < 0:
+                return -1  # SHORT imminente
+
+        return 0
+    except:
+        return 0
+
+
 def check_signal():
     """
-    Returns: (direction, signal_type, sl, tp, entry_px, atr, details) or None
-    Fetch 1h e 5m in PARALLELO per ridurre latenza.
+    Returns: (direction, signal_type, sl, tp, entry_px, atr, details, sl_dist,
+              size_mult, regime, setup, scalp_mode, ml_features, tp1) or None
     """
     regime = update_regime()
 
-    # Fetch 1h (setup) e 15m (entry) in parallelo
     f_1h  = _pool.submit(fetch_df, "1h", 30)
     f_15m = _pool.submit(fetch_df, "15m", 14)
     try:
@@ -2022,9 +1912,9 @@ def check_signal():
     if df_1h is None or len(df_1h) < 50: return None
     if df_15m is None or len(df_15m) < 50: return None
 
-    h = df_1h.iloc[-1]     # 1h setup
-    r = df_15m.iloc[-1]    # 15m entry
-    r2 = df_15m.iloc[-2]   # 15m precedente
+    h = df_1h.iloc[-1]
+    r = df_15m.iloc[-1]
+    r2 = df_15m.iloc[-2]
 
     px    = float(r['close'])
     atr5  = float(r['atr'])
@@ -2037,60 +1927,21 @@ def check_signal():
     adx15 = float(r.get('adx', 20))
 
     rsi1h  = float(h['rsi'])
-    rsi1h  = float(h['rsi'])
     macd1h = float(h['macd_hist'])
     ema9_1h = float(h['ema9'])
     ema21_1h = float(h['ema21'])
     slope1h = float(h['ema_slope'])
     adx1h  = float(h.get('adx', 20))
-# --- AGGIUNTA: MOTORE DI ANTICIPAZIONE MATEMATICA ---
-def get_anticipation_score(coin):
-    """
-    Analizza divergenza OI e CVD per anticipare il movimento.
-    Ritorna: 1 (Long Imminente), -1 (Short Imminente), 0 (Neutrale)
-    """
-    try:
-        # Recupera le ultime candele a 1 minuto (molto veloci)
-        df = fetch_df(coin, "1m", 15) 
-        if df is None or len(df) < 10: return 0
 
-        # Verifichiamo se OI e CVD sono presenti nel tuo DF
-        # Se fetch_df non li ha, il bot userà i valori di default (0)
-        oi_col = 'oi' if 'oi' in df.columns else None
-        cvd_col = 'cvd' if 'cvd' in df.columns else None
-        
-        if not oi_col or not cvd_col:
-            return 0
-
-        # Calcolo variazioni ultime 5 candele (5 minuti)
-        oi_change = (df[oi_col].iloc[-1] - df[oi_col].iloc[-5]) / (df[oi_col].iloc[-5] + 1e-9)
-        cvd_change = df[cvd_col].iloc[-1] - df[cvd_col].iloc[-5]
-        price_range = (df['high'].rolling(5).max().iloc[-1] - df['low'].rolling(5).min().iloc[-1]) / df['close'].iloc[-5]
-
-        # LOGICA MATEMATICA:
-        # Se OI cresce > 1% e il prezzo è compresso (range < 0.2%), c'è una molla carica
-        if oi_change > 0.01 and price_range < 0.002:
-            if cvd_change > 0: return 1  # Accumulo Long (Absorption)
-            if cvd_change < 0: return -1 # Accumulo Short (Absorption)
-            
-        return 0
-    except:
-        return 0
-    # ══════════════════════════════════════════════════════════
-    # DETECT SCALP MODE
-    # ══════════════════════════════════════════════════════════
     fz = get_funding_z()
 
-    # MODE 3: FLASH — volume spike >3x O funding z-score estremo (>2.5)
+    # ── SCALP MODE ──
     if vol5 >= 3.0 or abs(fz) > 2.5:
         scalp_mode = "FLASH"
-    # MODE 2: TREND — ADX > 25 e regime direzionale
     elif adx1h > 25 and regime in ("BULL", "BEAR"):
         scalp_mode = "TREND"
-    # MODE 1: RANGE — ADX < 20, prezzo tra le BB
     elif adx1h < 20 and -0.8 < bb5 < 0.8:
         scalp_mode = "RANGE"
-    # Fallback: TREND se ADX > 20, RANGE altrimenti
     elif adx1h >= 20:
         scalp_mode = "TREND"
     else:
@@ -2099,23 +1950,19 @@ def get_anticipation_score(coin):
     direction = None
     sig_type = None
     details = ""
+    size_mult = 1.0
 
-    # RANGE_LOW_VOL: non tradare — spread mangia il TP
     if regime == "RANGE_LOW_VOL":
         return None
 
-    # ── ENVIRONMENT CHECK: blocca se tutto è neutro ──
-    # Se flow NEUTRAL + sentiment 40-60 + ADX < 20 → mercato morto, non tradare
+    # Environment check
     flow_sig_check = get_flow_signal()
     flow_neutral = flow_sig_check.get("bias", "NEUTRAL") == "NEUTRAL"
     sent = get_sentiment_score()
     sent_neutral = 40 <= sent <= 60
-    adx_low = adx1h < 20
+    if flow_neutral and sent_neutral and adx1h < 20:
+        return None
 
-    if flow_neutral and sent_neutral and adx_low:
-        return None  # mercato morto — nessun edge
-
-    # ATR troppo basso → volatilità insufficiente per raggiungere TP
     atr_pct = atr5 / px if px > 0 else 0
     if atr_pct < 0.0015:
         return None
@@ -2123,43 +1970,42 @@ def get_anticipation_score(coin):
     allow_long = True
     allow_short = True
 
-    # ══════════════════════════════════════════════════════════
-    # TRIPLE TRIGGER: Flow (master) → Tech (fallback) → Momentum (catch-all)
-    # + RANGE TRIGGER: Bollinger Band mean reversion
-    # ══════════════════════════════════════════════════════════
-
+    # ── TRIGGERS ──
     flow_sig = flow_trigger(_flow_cache.get("data", {}), regime, allow_long, allow_short)
     tech_sig = technical_trigger(r, r2, h, allow_long, allow_short)
     mom_sig = momentum_trigger(df_15m, allow_long, allow_short)
 
-    # ── RANGE TRIGGER: mean reversion alle Bollinger Bands ──
-    # In RANGE: compra quando tocca BB bassa, vendi quando tocca BB alta
+    # RANGE mean reversion trigger
     range_sig = None
     if scalp_mode == "RANGE":
-        rsi_15m = float(r['rsi'])
-        bb_pos_now = float(r['bb_pos'])  # -1 = sotto BB bassa, +1 = sopra BB alta
-
-        # LONG: prezzo alla BB bassa + RSI oversold
-        if allow_long and bb_pos_now < -0.7 and rsi_15m < 35:
+        if allow_long and bb5 < -0.7 and rsi5 < 35:
             range_sig = {"direction": "LONG", "type": "RANGE_REV",
-                        "details": f"BB:{bb_pos_now:.2f} RSI:{rsi_15m:.0f} (mean reversion)"}
-        # SHORT: prezzo alla BB alta + RSI overbought
-        elif allow_short and bb_pos_now > 0.7 and rsi_15m > 65:
+                        "details": f"BB:{bb5:.2f} RSI:{rsi5:.0f}"}
+        elif allow_short and bb5 > 0.7 and rsi5 > 65:
             range_sig = {"direction": "SHORT", "type": "RANGE_REV",
-                        "details": f"BB:{bb_pos_now:.2f} RSI:{rsi_15m:.0f} (mean reversion)"}
+                        "details": f"BB:{bb5:.2f} RSI:{rsi5:.0f}"}
 
+    # ── ANTICIPATION SCORE: booster ──
+    antic = get_anticipation_score()
+
+    # Priority: flow > anticipation > range > tech > momentum
     if flow_sig:
         direction = flow_sig["direction"]
         sig_type = flow_sig["sig_type"]
         details = flow_sig["details"]
         if tech_sig and tech_sig["direction"] == direction:
             sig_type += "+TECH"
-            details += f" +{tech_sig['type']}"
         if mom_sig and mom_sig["direction"] == direction:
             sig_type += "+MOM"
-            details += f" +{mom_sig['details']}"
+        if antic != 0 and ((antic > 0 and direction == "LONG") or (antic < 0 and direction == "SHORT")):
+            sig_type += "+ANTIC"
+            size_mult = 1.0  # max conviction
+    elif antic != 0:
+        # Anticipation come trigger autonomo
+        direction = "LONG" if antic > 0 else "SHORT"
+        sig_type = "ANTICIPATION"
+        details = f"OI+CVD divergence → {'LONG' if antic > 0 else 'SHORT'}"
     elif range_sig:
-        # RANGE mean reversion ha priorità su tech/momentum in RANGE mode
         direction = range_sig["direction"]
         sig_type = range_sig["type"]
         details = range_sig["details"]
@@ -2169,7 +2015,6 @@ def get_anticipation_score(coin):
         details = tech_sig["details"]
         if mom_sig and mom_sig["direction"] == direction:
             sig_type += "+MOM"
-            details += f" +{mom_sig['details']}"
     elif mom_sig:
         direction = mom_sig["direction"]
         sig_type = mom_sig["type"]
@@ -2177,99 +2022,51 @@ def get_anticipation_score(coin):
     else:
         return None
 
-    # ══════════════════════════════════════════════════════════
-    # SIZE SCALING per signal quality
-    # FLOW_STRONG+TECH+MOM = 1.0x (massima conviction)
-    # FLOW_STRONG          = 1.0x
-    # FLOW_WEAK+TECH       = 0.8x
-    # FLOW_WEAK            = 0.7x
-    # PULLBACK (tech)      = 0.5x
-    # MOMENTUM (solo)      = 0.5x (no flow)
-    # ══════════════════════════════════════════════════════════
-
-    # Size fissa $5 — con questo capitale non si scala
-    size_mult = 1.0
-
-    # Spread check
+    # ── SPREAD CHECK ──
     liq = fetch_liquidity()
     if liq.get("spread") is not None and liq["spread"] > 0.0008:
-        log_btc(f"⚠️ Spread {liq['spread']:.4%} > 0.08% — skip")
         return None
 
-    # ML: log only, no block (0 samples)
     ml_features = []
-    details += f" sent:{get_sentiment_score()}"
-
+    details += f" sent:{sent}"
     log_btc(f"[SIGNAL] {direction} {sig_type} | {details}")
 
-    # ══════════════════════════════════════════════════════════
-    # EXPECTATION: il regime crea l'aspettativa, la strategia SL/TP si adatta
-    #
-    # Prezzo scende da giorni (TREND down) → aspetto inversione LONG
-    #   → SHORT nel frattempo: TP stretto, SL veloce (prendi profitto rapido)
-    #   → LONG quando arriva: TP largo, trailing attivo (lascia correre)
-    #
-    # Prezzo sale da giorni (TREND up) → aspetto continuazione o inversione SHORT
-    #   → LONG nel frattempo: TP stretto (potrebbe invertire)
-    #   → SHORT se inverte: TP largo (il move ribassista è potente)
-    # ══════════════════════════════════════════════════════════
-
+    # ── EXPECTATION ──
     trend_dir = "UP" if ema9_1h > ema21_1h else "DOWN"
-    trade_aligns_with_trend = (
-        (trend_dir == "UP" and direction == "LONG") or
-        (trend_dir == "DOWN" and direction == "SHORT")
-    )
+    trade_aligns = (trend_dir == "UP" and direction == "LONG") or \
+                   (trend_dir == "DOWN" and direction == "SHORT")
 
-    # Aspettativa = inversione del trend attuale
-    # Se il trade è CONTRO il trend → è il trade che segue il trend in corso
-    #   = TP stretto (il trend sta per finire)
-    # Se il trade è CON il trend atteso dell'inversione → TP largo
-    #   = ovvero: controtendenza = il trade che aspettavamo
-
-    if trade_aligns_with_trend:
-        # Segui il trend in corso — TP stretto, SL stretto, prendi profitto rapido
+    if trade_aligns:
         strategy = "FOLLOW"
-        tp_mult = 0.7    # TP 30% più stretto
-        sl_mult = 0.8    # SL 20% più stretto (esci veloce se gira)
-        details += f" [FOLLOW trend:{trend_dir}]"
+        tp_mult = 0.7; sl_mult = 0.8
     else:
-        # Controtendenza = possibile inversione — TP largo, trailing, lascia correre
         strategy = "REVERSAL"
-        tp_mult = 1.5    # TP 50% più largo
-        sl_mult = 1.0    # SL normale (dai spazio all'inversione)
-        scalp_mode = "TREND"  # forza trailing attivo
-        details += f" [REVERSAL vs trend:{trend_dir}]"
+        tp_mult = 1.5; sl_mult = 1.0
+        scalp_mode = "TREND"
 
-    # ── SL / TP — ATR-based, pulito ──
+    # ── SL / TP ──
     update_funding_oi()
     oi_chg = get_oi_change()
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
-    # SL = 1.2× ATR
-    # SL = ATR×1.2 — respira col mercato
-    # TP1 = ATR×0.8 → chiudi 50% (profitto veloce e sicuro)
-    # TP2 = ATR×1.2 → chiudi resto (R:R 1:1)
-    # Se il trend continua → il bot rientra al prossimo segnale
-    # TP fissi: 0.5% (TP1 → 50%) e 0.8% (TP2 → resto)
+    # TP fissi: 0.5% e 0.8%
     sl_dist = atr5 * 1.2
     tp1_dist = px * 0.005   # 0.5%
     tp2_dist = px * 0.008   # 0.8%
 
-    # Floor
     sl_dist = max(sl_dist, px * 0.003)
     tp1_dist = max(tp1_dist, px * 0.003)
     tp2_dist = max(tp2_dist, px * 0.005)
 
-    # Expectation strategy
     sl_dist *= sl_mult
     tp1_dist *= tp_mult
     tp2_dist *= tp_mult
 
-    # R:R check: TP2 deve essere almeno 1.5× SL dopo fee
-    fee_cost = px * 0.001  # 0.05% × 2 lati
+    fee_cost = px * 0.001
     effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
     if effective_rr < 0.8:
-        log_btc(f"❌ R:R {effective_rr:.2f} < 0.8 — skip"); return None
+        log_btc(f"❌ R:R {effective_rr:.2f} < 0.8 — skip")
+        return None
 
     if direction == "LONG":
         sl = px - sl_dist
@@ -2283,11 +2080,10 @@ def get_anticipation_score(coin):
     sl_pct = sl_dist / px * 100
     tp1_pct = tp1_dist / px * 100
     tp2_pct = tp2_dist / px * 100
-    log_btc(f"SL:{sl_pct:.2f}% TP1:{tp1_pct:.2f}%(50%) TP2:{tp2_pct:.2f}%(rest) R:R={effective_rr:.1f} [{strategy}]")
+    log_btc(f"SL:{sl_pct:.2f}% TP1:{tp1_pct:.2f}% TP2:{tp2_pct:.2f}% R:R={effective_rr:.1f} [{strategy}]")
 
     return (direction, sig_type, sl, tp, px, atr5, details, sl_dist,
             size_mult, regime, 50, scalp_mode, ml_features, tp1)
-
 # ================================================================
 # EXECUTION
 # ================================================================
@@ -2350,22 +2146,6 @@ def get_position():
         _pos_cache = {"ts": time.time(), "value": None}
     except: pass
     return _pos_cache.get("value")
-
-def get_effective_lev():
-    try:
-        s = call(_info.user_state, _account.address, timeout=10)
-        for p in s.get("assetPositions", []):
-            pp = p.get("position", {})
-            if pp.get("coin") == BTC_COIN:
-                lev = pp.get("leverage", {})
-                if isinstance(lev, dict):
-                    return int(lev.get("value", BTC_LEVERAGE))
-                if isinstance(lev, (int, float)):
-                    return int(lev)
-        return BTC_LEVERAGE
-    except:
-        return BTC_LEVERAGE
-
 def get_balance():
     global _bal_cache
     if time.time() - _bal_cache["ts"] < API_CACHE_TTL:
@@ -2492,67 +2272,6 @@ def fetch_liquidity():
 # ================================================================
 # SETUP SCORE (from V4 — adapted for BTC-only)
 # ================================================================
-def btc_compute_setup_score(direction, px, ema50, ema200, rsi, ai_score,
-                        funding_z, liq=None):
-    """
-    Score composito 0-100. Combina trend, RSI, AI, funding z-score, liquidità.
-    """
-    score = 0
-
-    # Trend Confluence (30%)
-    if direction == "LONG":
-        if px > ema200 and ema50 > ema200: score += 30
-        elif px > ema200 or ema50 > ema200: score += 15
-    else:
-        if px < ema200 and ema50 < ema200: score += 30
-        elif px < ema200 or ema50 < ema200: score += 15
-
-    # RSI zone (20%)
-    if direction == "LONG":
-        if 40 <= rsi <= 60: score += 20
-        elif rsi > 60: score += 10
-    else:
-        if 40 <= rsi <= 60: score += 20
-        elif rsi < 40: score += 10
-
-    # AI confidence (25%)
-    score += int((ai_score / 10) * 25)
-
-    # Funding z-score (10%)
-    if direction == "LONG":
-        if funding_z < -1.0: score += 10    # ti pagano per long
-        elif funding_z < 0: score += 5
-        elif funding_z > 2.0: score -= 10   # crowded long = pericolo
-    else:
-        if funding_z > 1.0: score += 10
-        elif funding_z > 0: score += 5
-        elif funding_z < -2.0: score -= 10
-
-    # Liquidity (15% + bonus/penalty)
-    if liq and liq.get("spread") is not None:
-        sp = liq["spread"]
-        if sp < 0.0003: score += 15       # < 0.03% tight
-        elif sp < 0.0008: score += 10     # < 0.08%
-        elif sp > 0.001: score -= 40      # > 0.1% danger
-
-        imb = liq.get("imbalance", 0.5)
-        if direction == "LONG" and imb > 0.60: score += 15
-        elif direction == "SHORT" and imb < 0.40: score += 15
-
-        cd = liq.get("cluster_dist")
-        cs = liq.get("cluster_side")
-        if cd is not None and cd < 0.03:
-            if (direction == "LONG" and cs == "above") or \
-               (direction == "SHORT" and cs == "below"):
-                score += 30    # liquidation magnet
-
-        if liq.get("aggressive"):
-            if direction == "LONG": score += 10
-    else:
-        score += 8  # no data = neutral
-
-    return max(0, min(100, score))
-
 # ================================================================
 # REAL EXIT PRICE (from V4 — precise PnL from fills)
 # ================================================================
@@ -2644,93 +2363,12 @@ def cleanup_orphan_orders():
         tg(f"🧹 Cancellati {len(triggers)} ordini BTC orfani", silent=True)
 
 # ================================================================
-# PENDING ORDERS TRACKING (from V4)
 # ================================================================
 _btc_pending_order = {}  # {"oid": X, "placed_at": T, "sl": S, "tp": T, "direction": D, "sl_dist": SD}
-
-def set_pending(oid, sl, tp, direction, sl_dist, sig_type="", regime=""):
-    """Registra un ordine GTC che non è stato fillato immediatamente."""
-    global _btc_pending_order
-    _btc_pending_order = {
-        "oid": oid, "placed_at": time.time(),
-        "sl": sl, "tp": tp, "direction": direction,
-        "sl_dist": sl_dist, "type": sig_type, "regime": regime
-    }
-    _rset("btc6:pending", _btc_pending_order)
-    log_btc(f"⏳ Ordine pendente registrato (oid={oid})")
-
 def clear_pending():
     global _btc_pending_order
     _btc_pending_order = {}
     _rset("btc6:pending", None)
-
-def check_pending(sz_dec, px_dec):
-    """
-    Controlla se un ordine pendente è stato fillato o è scaduto.
-    Se fillato → piazza SL/TP.
-    Se scaduto → cancella.
-    """
-    global _btc_pending_order
-    if not _btc_pending_order:
-        return None
-
-    oid = _btc_pending_order.get("oid")
-    placed_at = _btc_pending_order.get("placed_at", 0)
-    now = time.time()
-
-    # Check se è stato fillato (posizione aperta)
-    pos = get_position()
-    if pos is not None:
-        direction = _btc_pending_order["direction"]
-        is_buy = direction == "LONG"
-        sl_px = rpx(_btc_pending_order["sl"], px_dec)
-        tp_px = rpx(_btc_pending_order["tp"], px_dec)
-        actual_size = rpx(abs(pos["szi"]), sz_dec)
-
-        log_btc(f"✅ Pendente fillato → piazzo SL/TP")
-        try:
-            call(_exchange.order, BTC_COIN, not is_buy, actual_size, sl_px,
-                 {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
-                 True, timeout=15)
-            time.sleep(0.3)
-            call(_exchange.order, BTC_COIN, not is_buy, actual_size, tp_px,
-                 {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
-                 True, timeout=15)
-
-            entry = pos["entry"]
-            sl_pct = abs(entry - sl_px) / entry * 100
-            tp_pct = abs(tp_px - entry) / entry * 100
-            log_btc(f"🔒 Pendente protetto: SL:{sl_px}({sl_pct:.1f}%) TP:{tp_px}({tp_pct:.1f}%)")
-            tg(f"🔒 <b>BTC</b> pendente fillato | SL:{sl_px} TP:{tp_px}", silent=True)
-        except Exception as e:
-            log_btc(f"🚨 SL/TP pendente error: {e}")
-            tg(f"🚨 BTC pendente SL/TP ERROR!")
-
-        result = _btc_pending_order.copy()
-        result["entry"] = pos["entry"]
-        result["szi"] = pos["szi"]
-        clear_pending()
-        return result
-
-    # Check se è scaduto
-    if now - placed_at > PENDING_ORDER_TTL:
-        log_btc(f"⏱ Pendente scaduto dopo {PENDING_ORDER_TTL}s — cancello")
-        try:
-            if oid:
-                call(_exchange.cancel, BTC_COIN, oid, timeout=10)
-                log_btc(f"  Cancelled GTC #{oid}")
-        except Exception as e:
-            log_btc(f"  Cancel error: {e}")
-        tg(f"⏱ BTC ordine scaduto — cancellato", silent=True)
-        clear_pending()
-        return None
-
-    # Ancora in attesa
-    elapsed = int(now - placed_at)
-    if elapsed % 30 == 0:  # log ogni 30s
-        log_btc(f"⏳ Pendente in attesa... {elapsed}s/{PENDING_ORDER_TTL}s")
-    return None
-
 # ================================================================
 # STARTUP RECOVERY
 # ================================================================
@@ -2837,100 +2475,6 @@ def recover_position(sz_dec, px_dec):
 # ================================================================
 # TRAILING STOP MECCANICO
 # ================================================================
-def update_trailing(pos_state, mid, atr, sz_dec, px_dec):
-    """
-    Trailing stop pulito:
-    - Traccia max_favorable_px
-    - Attiva a +0.3% di profitto
-    - Trail a 0.7×ATR dal massimo
-    - Cancel vecchio SL per OID, piazza nuovo
-    """
-    global _btc_sl_oid
-    if atr <= 0:
-        return
-
-    is_long = pos_state.get("side", "LONG" if pos_state.get("szi", 0) > 0 else "SHORT") == "LONG"
-    entry = pos_state.get("entry_px", pos_state.get("entry", 0))
-
-    # Aggiorna max favorevole
-    if is_long:
-        pos_state["max_favorable_px"] = max(pos_state.get("max_favorable_px", entry), mid)
-    else:
-        pos_state["max_favorable_px"] = min(pos_state.get("max_favorable_px", entry), mid)
-
-    # Profitto corrente
-    move = (mid - entry) / entry if is_long else (entry - mid) / entry
-
-    # Attiva trailing solo dopo +0.3%
-    if move < 0.003:
-        return
-
-    if not pos_state.get("trailing_active"):
-        pos_state["trailing_active"] = True
-        pos_state["trailing_moves"] = 0
-        log_btc(f"📈 Trailing ON at {mid:.0f} (+{move:.2%})")
-
-    # Nuovo SL dal max favorevole
-    max_px = pos_state["max_favorable_px"]
-    if is_long:
-        new_sl = rpx(max_px - atr * 0.7, px_dec)
-    else:
-        new_sl = rpx(max_px + atr * 0.7, px_dec)
-
-    # Mai peggiorare lo SL
-    old_sl = pos_state.get("sl_px", 0)
-    if is_long and new_sl <= old_sl:
-        return
-    if not is_long and (new_sl >= old_sl and old_sl > 0):
-        return
-
-    # Cancel TUTTI gli SL esistenti prima di piazzarne uno nuovo
-    try:
-        # Prima: cancel per OID se disponibile
-        cancelled = False
-        if _btc_sl_oid:
-            try:
-                call(_exchange.cancel, BTC_COIN, _btc_sl_oid, timeout=10)
-                cancelled = True
-            except:
-                pass
-
-        # Poi: scan e cancel tutti gli Stop Market rimasti (cleanup)
-        try:
-            orders = get_open_orders()
-            for o in (orders or []):
-                if o.get("coin") == BTC_COIN and o.get("orderType") == "Stop Market":
-                    try:
-                        call(_exchange.cancel, BTC_COIN, o["oid"], timeout=10)
-                        cancelled = True
-                    except:
-                        pass
-        except:
-            pass
-
-        if not cancelled:
-            log_btc(f"⚠️ Trailing: nessun SL cancellato — NON piazzo nuovo")
-            return
-
-        time.sleep(0.3)
-
-        size_abs = rpx(pos_state.get("size", abs(pos_state.get("szi", 0))), sz_dec)
-        sl_res = call(_exchange.order, BTC_COIN, not is_long, size_abs, new_sl,
-                     {"trigger": {"triggerPx": new_sl, "isMarket": True, "tpsl": "sl"}},
-                     True, timeout=15)
-        if sl_res and sl_res.get("status") == "ok":
-            for s in sl_res.get("response", {}).get("data", {}).get("statuses", []):
-                if "resting" in s:
-                    _btc_sl_oid = s["resting"]["oid"]
-
-        pos_state["sl_px"] = new_sl
-        pos_state["sl_oid"] = _btc_sl_oid
-        pos_state["trailing_moves"] = pos_state.get("trailing_moves", 0) + 1
-        log_btc(f"📈 Trailing SL → {new_sl} (max:{max_px:.0f} trail:{atr*0.7:.0f}) [#{pos_state['trailing_moves']}]")
-        save_pos_state(pos_state)
-    except Exception as e:
-        log_btc(f"Trailing error: {e}")
-
 # ================================================================
 # PARTIAL CLOSE
 # ================================================================
@@ -3004,73 +2548,6 @@ def is_funding_ok(direction):
 # DAILY REPORT
 # ================================================================
 _btc_last_report_ts = 0
-
-def maybe_send_daily_report():
-    global _btc_last_report_ts
-    now = time.time()
-    if now - _btc_last_report_ts < 82800:  # max once per 23h
-        return
-
-    utc_hour = datetime.now(timezone.utc).hour
-    if utc_hour != DAILY_REPORT_HOUR:
-        return
-
-    _btc_last_report_ts = now
-    trades = [t for t in _btc_trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400]
-    if not trades:
-        tg("📊 <b>Daily Report</b>\nNo trades today")
-        return
-
-    wins = [t for t in trades if t["pnl"] > 0]
-    losses = [t for t in trades if t["pnl"] <= 0]
-    total = sum(t["pnl"] for t in trades)
-    wr = len(wins)/len(trades)*100 if trades else 0
-    avg_w = np.mean([t["pnl"] for t in wins]) if wins else 0
-    avg_l = np.mean([t["pnl"] for t in losses]) if losses else 0
-    best = max(trades, key=lambda t: t["pnl"])
-    worst = min(trades, key=lambda t: t["pnl"])
-
-    by_type = {}
-    for t in trades:
-        tp = t.get("type", "?")
-        if tp not in by_type: by_type[tp] = []
-        by_type[tp].append(t["pnl"])
-
-    type_str = "\n".join(f"  {k}: {len(v)} trades ${sum(v):+.2f}"
-                         for k,v in by_type.items())
-
-    bal = get_balance()
-    # V7.2: Sentiment + ML stats for report
-    ml_acc = _ml_model.get_accuracy()
-    ml_n = _ml_model.n_samples
-    sent = get_sentiment_score()
-    sd = get_sentiment_detail()
-    lc_info = f"CG_Up:{sd.get('cg_sent_up','off')}% Reddit:+{sd.get('reddit_bullish','?')}/-{sd.get('reddit_bearish','?')}"
-    cc_info = f"Bull:{sd.get('cc_bull_pct','off')}%"
-    report = (
-        f"📊 <b>BTC Scalper V7.2 Daily Report</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 PnL: <b>${total:+.2f}</b>\n"
-        f"📈 Trades: {len(trades)} (W:{len(wins)} L:{len(losses)})\n"
-        f"🎯 Win Rate: {wr:.0f}%\n"
-        f"📊 Avg Win: ${avg_w:+.2f} | Avg Loss: ${avg_l:+.2f}\n"
-        f"🏆 Best: ${best['pnl']:+.2f} ({best.get('type','?')})\n"
-        f"💀 Worst: ${worst['pnl']:+.2f} ({worst.get('type','?')})\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"By signal type:\n{type_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>V7.2 Analytics</b>\n"
-        f"  ML: {ml_n} samples, acc:{ml_acc:.0%}\n"
-        f"  Sentiment: {sent}/100\n"
-        f"  🌐 Social: {lc_info}\n"
-        f"  📊 CryptoCompare: {cc_info}\n"
-        f"  FGI: {sd.get('fgi','?')} | Funding: {sd.get('funding_sent','?')}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💼 Balance: ${bal:.2f}"
-    )
-    tg(report)
-    log_btc(f"📊 Daily report sent: {len(trades)} trades ${total:+.2f}")
-
 def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mult=1.0, scalp_mode="TREND"):
     """
     Entry pulita: prezzo aggressivo → wait 2s → SL/TP da ATR → return pos_state o False
@@ -3529,142 +3006,6 @@ def processor_thread(symbol, sz_dec, px_dec):
 # ================================================================
 # ALTCOIN PROCESSOR V7.5 (FAST ENTRY + POST-CONFIRM)
 # ================================================================
-def processor_thread_alt(sz_dec, px_dec, coin):
-    """
-    Gestisce il ciclo di vita di una singola Altcoin:
-    Detection segnale -> Entry Immediata -> Conferma post-trade -> Gestione Posizione.
-    """
-    global _btc_last_trade_ts, _btc_is_trading
-
-    log_btc(f"[{coin}] Processor avviato") # Coerenza con il tuo sistema di log
-    pending_confirm = None
-
-    while True:
-        try:
-            # 1. Recupero stato corrente
-            pos = get_position(coin)
-            mid = get_mid(coin)
-            if mid <= 0:
-                time.sleep(1)
-                continue
-
-            # ── 2. POST-CONFIRM NON BLOCCANTE ──
-            # Se siamo entrati, verifichiamo dopo X secondi se il prezzo si è mosso a favore
-            if pending_confirm is not None:
-                now = time.time()
-                if now >= pending_confirm["deadline"]:
-                    direction = pending_confirm["direction"]
-                    entry_price = pending_confirm["price"]
-                    
-                    confirmed = True
-                    # Verifica se il prezzo è migliorato di almeno lo 0.05%
-                    if direction == "LONG":
-                        confirmed = mid > entry_price * 1.0005
-                    elif direction == "SHORT":
-                        confirmed = mid < entry_price * 0.9995
-
-                    if not confirmed:
-                        log_btc(f"[{coin}] ❌ Post-confirm fail (Price: {mid}) → emergency close")
-                        if pos:
-                            actual_size = round_to_decimals(abs(float(pos.get('szi', 0))), sz_dec)
-                            side_to_close = direction != "LONG" # Se eri LONG, vendi (True = Sell)
-                            call(_exchange.order, coin, side_to_close, actual_size, mid, {"limit": {"tif": "Ioc"}}, False)
-                        pending_confirm = None
-                        continue
-
-                    log_btc(f"[{coin}] ✅ Confirm OK: Momentum confermato")
-                    pending_confirm = None
-
-            # ── 3. GESTIONE POSIZIONE ATTIVA ──
-            if pos is not None and abs(float(pos.get('szi', 0))) > 0:
-                pnl = get_unrealized_pnl(pos) # Assicurati che questa funzione esista o calcolala
-
-                # FAST EXIT: se la posizione va male troppo velocemente
-                if pnl < FAST_EXIT_THRESHOLD_ALT:
-                    log_btc(f"[{coin}] ⚠️ Fast exit ALT (PnL: {pnl:.2%})")
-                    close_position(coin, pos)
-                    continue
-
-                time.sleep(1) # Slow loop se siamo già in posizione
-                continue
-
-            # ── 4. FILTRI DI COOLDOWN E LOCK ──
-            if time.time() - _btc_last_trade_ts < BTC_COOLDOWN_SEC:
-                time.sleep(0.5)
-                continue
-
-            if _btc_is_trading: # Evita di aprire ordini contemporanei a BTC
-                time.sleep(0.5)
-                continue
-
-            # ── 5. DETECTION SEGNALE ──
-            sig_ts = time.time()
-            sig = check_signal() # Deve restituire la tupla completa definita nel bot
-
-            if sig is None:
-                time.sleep(1)
-                continue
-
-            # Unpacking del segnale (formato V7)
-            (direction, sig_type, sl, tp, entry_px, atr,
-             details, sl_dist, size_mult, sig_regime,
-             setup, scalp_mode, ml_features, tp1) = sig
-
-            # Filtro segnale vecchio (stale)
-            if time.time() - sig_ts > 20:
-                continue
-
-            # ── 6. FILTRI AVANZATI (Momentum, Flow, Sentiment, ML) ──
-            
-            # Momentum Filter: la candela attuale deve essere > media
-            df = fetch_df(coin, "5m", 20)
-            if df is None or len(df) < 20:
-                continue
-            last = df.iloc[-1]
-            avg_range = (df["high"] - df["low"]).mean()
-            if (last["high"] - last["low"]) < avg_range * MOMENTUM_MULT_ALT:
-                continue
-
-            # Order Flow Alignment
-            flow_now = get_flow_signal(coin)
-            if direction == "LONG" and flow_now.get("bias") == "SELL": continue
-            if direction == "SHORT" and flow_now.get("bias") == "BUY": continue
-
-            # Sentiment Alignment (V7 Module)
-            sent = get_sentiment_score()
-            if direction == "LONG" and sent > 75: continue # Contrarian: non comprare se troppo greed
-            if direction == "SHORT" and sent < 25: continue # Contrarian: non vendere se troppa fear
-
-            # Machine Learning Validator
-            if ml_features:
-                ml_result = ml_predict_signal(ml_features)
-                if ml_result.get("block"):
-                    continue
-
-            # ── 7. ESECUZIONE (FAST ENTRY) ──
-            log_btc(f"[{coin}] ⚡ FAST ENTRY {direction} @ {mid:.4f}")
-
-            # Nota: open_position deve gestire la size basata su sz_dec e il prezzo su px_dec
-            success = open_position(coin, direction, mid, sl, tp, sl_dist,
-                                   sz_dec, px_dec, size_mult)
-
-            if success:
-                log_btc(f"[{coin}] ✅ FILLED → monitoraggio conferma...")
-                pending_confirm = {
-                    "direction": direction,
-                    "price": mid,
-                    "deadline": time.time() + CONFIRMATION_SECONDS_ALT
-                }
-            else:
-                _btc_last_trade_ts = time.time() # Cooldown anche su fallimento
-                log_btc(f"[{coin}] ❌ Entry fail")
-
-        except Exception as e:
-            log_btc(f"[{coin}] Processor error: {e}")
-            import traceback; traceback.print_exc()
-
-        time.sleep(0.5)
-
 # ================================================================
 # ALTCOIN ENGINE (from combined_bot.py)
 # ================================================================
@@ -3691,8 +3032,6 @@ _oi_prev_cache = {}     # {coin: previous_oi}
 _alt_trade_history = []
 _alt_daily_pnl = 0.0
 _alt_consec_losses = 0
-ALT_SIGNAL_MAX_AGE = 3 * 60
-SIGNAL_MAX_AGE = ALT_SIGNAL_MAX_AGE  # alias for ALT engine
 
 # ── Carica stato da Redis all'avvio ─────────────────────────────
 
@@ -4110,28 +3449,6 @@ def detect_scalp_mode(adx_1h, vol_rel, bb_pos, regime, funding_z=0):
     elif adx_1h >= 20:
         return "TREND"
     return "RANGE"
-
-def get_mode_sl_tp(scalp_mode, px, atr, direction, lev_scale=1.0):
-    """Calcola SL/TP per la scalp mode. Ritorna (sl_px, tp_px, sl_dist, tp_dist)."""
-    if scalp_mode == "FLASH":
-        sl_dist = max(atr * FLASH_SL_ATR * lev_scale, px * FLASH_SL_MIN * lev_scale)
-        sl_dist = min(sl_dist, px * FLASH_SL_MAX * lev_scale)
-        tp_dist = px * FLASH_TP_PCT
-    elif scalp_mode == "RANGE":
-        sl_dist = max(atr * RANGE_SL_ATR * lev_scale, px * RANGE_SL_MIN * lev_scale)
-        sl_dist = min(sl_dist, px * RANGE_SL_MAX * lev_scale)
-        tp_dist = px * RANGE_TP_PCT
-    else:  # TREND
-        sl_dist = max(atr * TREND_SL_ATR * lev_scale, px * TREND_SL_MIN * lev_scale)
-        sl_dist = min(sl_dist, px * TREND_SL_MAX * lev_scale)
-        tp_dist = sl_dist * TREND_TP_RR / lev_scale
-    tp_dist = max(tp_dist, px * TP_PRICE_PCT * 0.8)  # floor 80% del TP target
-
-    if direction == "LONG":
-        return round(px - sl_dist, 6), round(px + tp_dist, 6), sl_dist, tp_dist
-    else:
-        return round(px + sl_dist, 6), round(px - tp_dist, 6), sl_dist, tp_dist
-
 def check_margin_ok(coin, size, entry_px):
     """Verifica margine sufficiente prima di inviare ordine."""
     try:
@@ -4215,41 +3532,6 @@ def update_mechanical_trailing(coin, pos, mid, atr, direction, open_trade_meta,
         log_exec(f"[{coin}] 📈 Trailing → {new_ts} ({trail_pct:.2f}% from entry)")
     except Exception as e:
         log_err(f"[{coin}] trailing error: {e}")
-
-def check_partial_close(coin, pos, mid, open_trade_meta, sz_dec, px_dec):
-    """Chiudi 50% della posizione al 60% del TP (solo TREND mode)."""
-    meta = open_trade_meta.get(coin, {})
-    if meta.get("partial_done"):
-        return
-    sig = meta.get("signal", {})
-    sl_dist = float(sig.get("sl_dist", 0))
-    scalp_mode = sig.get("scalp_mode", "TREND")
-    if sl_dist <= 0 or scalp_mode != "TREND":
-        return
-
-    entry = meta.get("entry_px", 0)
-    szi = pos.get("szi", 0)
-    is_long = szi > 0
-    tp_dist = sl_dist * TREND_TP_RR
-
-    profit_dist = (mid - entry) if is_long else (entry - mid)
-    if profit_dist < tp_dist * TREND_PARTIAL:
-        return
-
-    close_size = round_to_decimals(abs(szi) * 0.5, sz_dec.get(coin, 2))
-    if close_size <= 0:
-        return
-    try:
-        close_px = round_to_decimals(mid * (0.998 if is_long else 1.002), px_dec.get(coin, 2))
-        call(_exchange.order, str(coin), not is_long, close_size, close_px,
-             {"limit": {"tif": "Ioc"}}, False, timeout=15, label=f'partial_{coin}')
-        meta["partial_done"] = True
-        pnl = profit_dist / entry * 100
-        log_exec(f"[{coin}] 💰 PARTIAL 50% @ {mid:.1f} PnL:{pnl:+.2f}%")
-        tg(f"💰 <b>{coin}</b> partial 50% PnL:{pnl:+.1f}%", silent=True)
-    except Exception as e:
-        log_err(f"[{coin}] partial error: {e}")
-
 def detect_market_regime() -> str:
     def _regime(coin):
         try:
@@ -4877,15 +4159,6 @@ def quick_backtest(df: pd.DataFrame, direction: str, coin: str = "",
         return {"win_rate": 0.0, "win_rate_recent": 0.0, "profit_factor": 0.0,
                 "profit_factor_recent": 0.0, "n_trades": 0, "n_trades_recent": 0,
                 "valid": True, "mode": mode, "avg_return": 0.0, "avg_return_recent": 0.0}
-
-def quick_backtest_dual(df: pd.DataFrame, direction: str, coin: str = "",
-                        strategy: str = "MEAN_REV") -> dict:
-    """Esegue backtest in entrambe le modalità con la strategia corretta."""
-    bt_scalping = quick_backtest(df, direction, coin, mode="SCALPING", strategy=strategy)
-    bt_swing    = quick_backtest(df, direction, coin, mode="SWING",    strategy=strategy)
-    return {"SCALPING": bt_scalping, "SWING": bt_swing}
-
-
 # ================================================================
 # PROCESSOR — RUN FUNCTION
 # ================================================================
@@ -6386,21 +5659,6 @@ def minutes_until_pause() -> int:
     if cycle >= 55:
         return 0
     return 55 - cycle
-
-def should_abort_cycle(prefix: str = "") -> bool:
-    """
-    Controlla se la finestra sta per chiudersi (< 2 min).
-    Usato dal Processor per interrompere un ciclo lungo prima della pausa.
-    """
-    remaining = minutes_until_pause()
-    if remaining == 0:
-        if prefix:
-            log(prefix, f"⏰ Finestra chiude tra {remaining}min — interrompo ciclo")
-        return True
-    if remaining == 0:
-        return True
-    return False
-
 def wait_for_window(prefix: str):
     """Blocca il thread durante i 20 minuti di pausa."""
     while not is_active_window():
@@ -7206,73 +6464,6 @@ def executor_thread_alt():
 # ================================================================
 # RECOVERY — POSIZIONI SENZA PROTEZIONE AL RIAVVIO
 # ================================================================
-
-def _recover_unprotected_positions():
-    """
-    Al riavvio, verifica che ogni posizione aperta abbia almeno uno SL attivo.
-    Se manca, piazza uno SL di emergenza a 2×ATR stimato dal prezzo corrente.
-    """
-    try:
-        positions = get_open_positions()
-        if not positions:
-            log("MAIN", "Recovery: nessuna posizione aperta")
-            return
-
-        mids = call(_info.all_mids, label='recovery_mids', timeout=15)
-        if not mids:
-            log_err("Recovery: impossibile ottenere prezzi — skip")
-            return
-
-        _, px_decimals_r = fetch_meta()
-        sz_decimals_r, _ = fetch_meta()
-
-        for coin, pos in positions.items():
-            try:
-                trigger_orders = get_open_trigger_orders(coin)
-                has_sl = any(o.get("orderType") == "Stop Market" for o in trigger_orders)
-
-                if has_sl:
-                    continue  # protetto, ok
-
-                szi      = float(pos["szi"])
-                direction = "LONG" if szi > 0 else "SHORT"
-                is_buy   = direction == "LONG"
-                mid_px   = float(mids.get(coin, 0) or 0)
-                entry_px = float(pos.get("entry_px", mid_px) or mid_px)
-
-                if mid_px <= 0:
-                    log_err(f"[{coin}] Recovery: prezzo non disponibile — CHIUDI MANUALMENTE")
-                    tg(f"🚨 <b>{coin}</b> posizione senza SL e prezzo non disponibile!")
-                    continue
-
-                # SL emergenza: 3% dal prezzo corrente (conservativo)
-                emergency_dist = mid_px * 0.01  # 1%
-                if direction == "LONG":
-                    sl_px = mid_px - emergency_dist
-                else:
-                    sl_px = mid_px + emergency_dist
-
-                px_d = px_decimals_r.get(coin, 4)
-                sz_d = sz_decimals_r.get(coin, 4)
-                sl_px       = round_to_decimals(sl_px, px_d)
-                actual_size = round_to_decimals(abs(szi), sz_d)
-
-                call(_exchange.order, str(coin), not is_buy, actual_size, sl_px,
-                     {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
-                     True, timeout=15, label=f'recovery_sl_{coin}')
-
-                log("MAIN", f"[{coin}] 🛡️ Recovery SL emergenza @ {sl_px} ({direction}, size:{actual_size})")
-                tg(f"🛡️ <b>{coin}</b> [{direction}] Recovery SL emergenza @ {sl_px}")
-                time.sleep(0.5)
-
-            except Exception as e:
-                log_err(f"[{coin}] Recovery fallita: {e}")
-                tg(f"🚨 <b>{coin}</b> RECOVERY SL FALLITA — verifica manualmente!")
-
-    except Exception as e:
-        log_err(f"Recovery globale: {e}")
-
-
 # ================================================================
 # ENTRY POINT
 # ================================================================
