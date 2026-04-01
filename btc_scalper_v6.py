@@ -2964,6 +2964,14 @@ def processor_thread(symbol, sz_dec, px_dec):
             if trades_last_hour >= MAX_TRADES_PER_HOUR:
                 continue
 
+            # ── MAX TRADES / DAY (20) ──
+            trades_today_count = len([
+                t for t in _btc_trades_today
+                if now - t.get("ts_close", t.get("ts", 0)) < 86400
+            ])
+            if trades_today_count >= 20:
+                continue
+
             # ── EXECUTE: micro pullback entry ──
             entry_exec = get_mid()
             if entry_exec <= 0:
