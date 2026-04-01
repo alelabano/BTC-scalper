@@ -2852,14 +2852,6 @@ def processor_thread(symbol, sz_dec, px_dec):
 
                 continue
 
-            # ── VOLATILITY FILTER: skip se mercato morto ──
-            if _btc_last_check_price > 0:
-                delta = abs(mid - _btc_last_check_price) / mid
-                if delta < 0.0005:  # < 0.05% = chop
-                    time.sleep(BTC_SCAN_INTERVAL)
-                    continue
-            _btc_last_check_price = mid
-
             # ── DETECT ──
             sig_ts = time.time()
             sig = check_signal()
@@ -2875,90 +2867,15 @@ def processor_thread(symbol, sz_dec, px_dec):
                 setup, scalp_mode, ml_features, tp1
             ) = sig
 
-            # ── SIGNAL STABILITY: segnale deve persistere 6s (anti fake breakout) ──
-            sig_key = f"{direction}_{sig_type}"
-            if _btc_sig_stable.get("key") != sig_key:
-                _btc_sig_stable["key"] = sig_key
-                _btc_sig_stable["ts"] = time.time()
-                _btc_sig_stable["ref_price"] = mid  # reset ref price per nuovo segnale
-                time.sleep(BTC_SCAN_INTERVAL)
-                continue
-            if time.time() - _btc_sig_stable.get("ts", 0) < 6:
-                time.sleep(BTC_SCAN_INTERVAL)
-                continue
-
-            # ── SIGNAL CLEAN: prezzo non deve muoversi contro durante conferma ──
-            ref_px = _btc_sig_stable.get("ref_price", mid)
-            if ref_px > 0:
-                move = (mid - ref_px) / ref_px
-                if direction == "LONG" and move < -0.0007:
-                    log_btc(f"❌ Price moved against LONG ({move:+.2%}) — skip")
-                    continue
-                if direction == "SHORT" and move > 0.0007:
-                    log_btc(f"❌ Price moved against SHORT ({move:+.2%}) — skip")
-                    continue
-
             # ── STALE SIGNAL ──
             if time.time() - sig_ts > 25:
-                log_btc(f"[{symbol}] ⚠️ Signal stale")
+                log_btc(f"⚠️ Signal stale ({time.time()-sig_ts:.0f}s)")
                 continue
 
             if not is_funding_ok(direction):
                 continue
 
-            # ── PRICE CONFIRMATION V2 (robusta) ──
-            price_at_signal = get_mid()
-            if price_at_signal <= 0:
-                continue
-            log_btc(f"📡 Signal {direction} {sig_type} @ {price_at_signal:,.0f} — confirming...")
-
-            confirm_ok = False
-            best_price = price_at_signal
-            confirm_start = time.time()
-            while time.time() - confirm_start < 10:
-                px_now = get_mid()
-                if px_now <= 0:
-                    time.sleep(0.5)
-                    continue
-                # Track best price per anti-chasing
-                if direction == "LONG":
-                    best_price = max(best_price, px_now)
-                else:
-                    best_price = min(best_price, px_now)
-                # Conferma direzionale: prezzo si muove nella direzione del segnale
-                if direction == "LONG" and px_now > price_at_signal * 1.0003:
-                    confirm_ok = True
-                    break
-                if direction == "SHORT" and px_now < price_at_signal * 0.9997:
-                    confirm_ok = True
-                    break
-                time.sleep(0.5)
-
-            if not confirm_ok:
-                log_btc(f"❌ No confirmation in {time.time()-confirm_start:.1f}s")
-                continue
-
-            # ── ANTI-CHASING: se il prezzo è già scappato troppo, non inseguire ──
-            drift = abs(best_price - price_at_signal) / price_at_signal
-            if drift > 0.002:
-                log_btc(f"❌ Too late — drift {drift:.2%}")
-                continue
-
-            # ── FLOW FILTER ──
-            flow = get_flow_signal()
-            if direction == "LONG" and flow.get("bias") == "SELL":
-                log_btc(f"❌ {direction} vs Flow {flow.get('bias')} — skip")
-                continue
-            if direction == "SHORT" and flow.get("bias") == "BUY":
-                log_btc(f"❌ {direction} vs Flow {flow.get('bias')} — skip")
-                continue
-
-            # ── SENTIMENT FILTER ──
-            sentiment = get_sentiment_score()
-            if direction == "LONG" and sentiment > 70:
-                continue
-            if direction == "SHORT" and sentiment < 30:
-                continue
+            log_btc(f"📡 Signal {direction} {sig_type} @ {mid:,.0f}")
 
             # ── ML TRACKING (solo log, non blocca) ──
             if ml_features:
