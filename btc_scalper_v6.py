@@ -1287,6 +1287,8 @@ def save_trade(pnl, direction, entry, exit_px, sig_type="", sl_dist=0, regime=""
         "setup_score":          ex.get("setup_score", 0),
         "close_reason":         ex.get("close_reason", ""),
         "duration_s":           round(ex.get("duration_s", 0), 0),
+        "mfe":                  ex.get("mfe", 0),
+        "mae":                  ex.get("mae", 0),
         "ts_open":      ex.get("ts_open", 0),
         "ts_close":     time.time(),
     }
@@ -1312,13 +1314,19 @@ def load_pos_state():
 
 def _update_adaptive_params():
     """
-    Calcola stats rolling e adatta parametri in base alla performance.
-    Salvato in Redis → persiste tra restart.
+    AI-driven SL/TP optimization basata su MFE/MAE reali.
+    
+    Dopo 10+ trade:
+    - Analizza MAE dei trade vincenti → SL ottimale (quanto serve per non uscire troppo presto)
+    - Analizza MFE dei trade perdenti → quanto arrivano in profitto prima di girare
+    - Analizza MFE dei trade vincenti → TP ottimale (dove prendere profitto)
+    
+    Salva su Redis → persiste tra restart.
     """
     global _btc_params
     now = time.time()
     recent = [t for t in _btc_trades_today if now - t.get("ts_close", t.get("ts", 0)) < 86400]
-    if len(recent) < 3:
+    if len(recent) < 5:
         return
 
     wins = [t for t in recent if t["pnl"] > 0]
@@ -1329,40 +1337,51 @@ def _update_adaptive_params():
     pf = avg_win * len(wins) / (avg_loss * len(losses)) if losses else 10
     total_pnl = sum(t["pnl"] for t in recent)
 
-    # WR per tipo di segnale
-    by_type = {}
-    for t in recent:
-        tp = t.get("type", "?")
-        if tp not in by_type: by_type[tp] = {"w": 0, "l": 0}
-        if t["pnl"] > 0: by_type[tp]["w"] += 1
-        else: by_type[tp]["l"] += 1
-
-    # WR per regime
-    by_regime = {}
-    for t in recent:
-        rg = t.get("regime", "?")
-        if rg not in by_regime: by_regime[rg] = {"w": 0, "l": 0}
-        if t["pnl"] > 0: by_regime[rg]["w"] += 1
-        else: by_regime[rg]["l"] += 1
-
-    # Adaptive: se WR < 35% → allarga SL (troppo stretto), restringi TP (troppo ambizioso)
-    # Se WR > 55% → stringi SL (cattura più profitto), allarga TP
+    # ── MFE/MAE ANALYSIS ──
     sl_adj = 1.0
     tp_adj = 1.0
-    if len(recent) >= 5:
-        if wr < 0.35:
-            sl_adj = 1.15    # +15% SL (più spazio)
-            tp_adj = 0.85    # -15% TP (più realistico)
-        elif wr > 0.55:
-            sl_adj = 0.9     # -10% SL
-            tp_adj = 1.15    # +15% TP
+    optimal_sl = None
+    optimal_tp = None
+
+    # Trade con MFE/MAE disponibili
+    trades_with_mfe = [t for t in recent if t.get("mfe", 0) != 0 or t.get("mae", 0) != 0]
+
+    if len(trades_with_mfe) >= 10:
+        win_maes = [abs(t.get("mae", 0)) for t in trades_with_mfe if t["pnl"] > 0]
+        win_mfes = [t.get("mfe", 0) for t in trades_with_mfe if t["pnl"] > 0]
+        loss_mfes = [t.get("mfe", 0) for t in trades_with_mfe if t["pnl"] < 0]
+
+        # SL ottimale = percentile 90 del MAE dei trade vincenti
+        # = quanto drawdown sopportano i trade che poi vincono
+        if win_maes:
+            optimal_sl = round(float(np.percentile(win_maes, 90)), 3)
+            # Se il SL attuale (0.8%) è molto più largo del necessario → stringi
+            if optimal_sl > 0 and optimal_sl < 0.8:
+                sl_adj = max(0.5, optimal_sl / 0.8)  # min 50% del SL attuale
+
+        # TP ottimale = percentile 50 del MFE dei trade vincenti
+        # = dove arriva il 50% dei trade prima di ritracciare
+        if win_mfes:
+            optimal_tp = round(float(np.percentile(win_mfes, 50)), 3)
+            if optimal_tp > 0 and optimal_tp < 0.8:
+                tp_adj = max(0.5, optimal_tp / 0.8)
+
+        log_btc(f"🧠 AI PARAMS | WR:{wr:.0%} PF:{pf:.1f} | "
+                f"OptSL:{optimal_sl}% OptTP:{optimal_tp}% | "
+                f"SL_adj:{sl_adj:.2f} TP_adj:{tp_adj:.2f}")
+    else:
+        # Fallback: adaptive semplice basato su WR
+        if len(recent) >= 5:
+            if wr < 0.35:
+                sl_adj = 1.15; tp_adj = 0.85
+            elif wr > 0.55:
+                sl_adj = 0.9; tp_adj = 1.15
 
     _btc_params = {
         "wr": round(wr, 3), "pf": round(pf, 2), "total_pnl": round(total_pnl, 2),
         "n_trades": len(recent), "avg_win": round(avg_win, 2), "avg_loss": round(avg_loss, 2),
         "sl_adj": sl_adj, "tp_adj": tp_adj,
-        "by_type": {k: round(v["w"]/(v["w"]+v["l"]), 2) for k,v in by_type.items() if v["w"]+v["l"]>0},
-        "by_regime": {k: round(v["w"]/(v["w"]+v["l"]), 2) for k,v in by_regime.items() if v["w"]+v["l"]>0},
+        "optimal_sl": optimal_sl, "optimal_tp": optimal_tp,
         "ts": time.time()
     }
     _rset("btc6:params", _btc_params)
@@ -2063,6 +2082,12 @@ def check_signal():
     sl_dist *= sl_mult
     tp1_dist *= tp_mult
     tp2_dist *= tp_mult
+
+    # ── AI ADAPTIVE: applica ottimizzazioni da MFE/MAE ──
+    if _btc_params.get("optimal_sl") is not None:
+        sl_dist *= _btc_params.get("sl_adj", 1.0)
+        tp1_dist *= _btc_params.get("tp_adj", 1.0)
+        tp2_dist *= _btc_params.get("tp_adj", 1.0)
 
     fee_cost = px * 0.001
     effective_rr = (tp2_dist - fee_cost) / (sl_dist + fee_cost)
@@ -6633,17 +6658,21 @@ def btc_executor_loop(sz_dec, px_dec):
                 duration_s = time.time() - open_ts
                 dur_str = f"{duration_s:.0f}s" if duration_s < 60 else f"{duration_s/60:.0f}min"
 
+                mfe = last_pos_state.get("peak_pnl", 0) * 100  # MFE in %
+                mae = last_pos_state.get("worst_pnl", 0) * 100  # MAE in %
+
                 save_trade(pnl_usd, d, entry, exit_px,
                            sig_type=last_pos_state.get("type", "?"),
                            sl_dist=last_pos_state.get("sl_dist", 0),
                            regime=last_pos_state.get("regime", "?"),
                            extra={"pnl_pct": pnl_pct, "duration_s": duration_s,
                                   "close_reason": close_reason, "ts_open": open_ts,
-                                  "trailing_moves": last_pos_state.get("trailing_moves", 0)})
+                                  "trailing_moves": last_pos_state.get("trailing_moves", 0),
+                                  "mfe": round(mfe, 3), "mae": round(mae, 3)})
                 save_pos_state(None)
 
-                log_btc(f"{emoji} CLOSED {d} | {close_reason} | ${pnl_usd:+.2f} ({pnl_pct:+.2f}%) | {dur_str}")
-                tg(f"{emoji} <b>BTC {d} CLOSED</b>\n${pnl_usd:+.2f} ({pnl_pct:+.2f}%)\n{close_reason}")
+                log_btc(f"{emoji} CLOSED {d} | {close_reason} | ${pnl_usd:+.2f} ({pnl_pct:+.2f}%) | MFE:+{mfe:.2f}% MAE:{mae:.2f}% | {dur_str}")
+                tg(f"{emoji} <b>BTC {d} CLOSED</b>\n${pnl_usd:+.2f} ({pnl_pct:+.2f}%)\nMFE:+{mfe:.2f}% MAE:{mae:.2f}%\n{close_reason}")
 
                 # Cooldown più lungo dopo un loss
                 if pnl_usd < 0:
@@ -6683,8 +6712,16 @@ def btc_executor_loop(sz_dec, px_dec):
                 # Init state fields if missing
                 if "peak_pnl" not in last_pos_state:
                     last_pos_state["peak_pnl"] = 0
+                if "worst_pnl" not in last_pos_state:
+                    last_pos_state["worst_pnl"] = 0
                 if "be_active" not in last_pos_state:
                     last_pos_state["be_active"] = False
+
+                # ── MFE/MAE TRACKING ──
+                if pnl_ratio > last_pos_state["peak_pnl"]:
+                    last_pos_state["peak_pnl"] = pnl_ratio   # MFE
+                if pnl_ratio < last_pos_state["worst_pnl"]:
+                    last_pos_state["worst_pnl"] = pnl_ratio   # MAE
 
                 # ── 1. HARD FAIL: primi 20s, loss > -5% ROE → chiudi subito ──
                 if time_in_trade < 20 and pnl_ratio < -0.01:  # -5% ROE @ 5x
