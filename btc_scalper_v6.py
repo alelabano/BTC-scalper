@@ -2880,11 +2880,23 @@ def processor_thread(symbol, sz_dec, px_dec):
             if _btc_sig_stable.get("key") != sig_key:
                 _btc_sig_stable["key"] = sig_key
                 _btc_sig_stable["ts"] = time.time()
+                _btc_sig_stable["ref_price"] = mid  # reset ref price per nuovo segnale
                 time.sleep(BTC_SCAN_INTERVAL)
                 continue
             if time.time() - _btc_sig_stable.get("ts", 0) < 6:
                 time.sleep(BTC_SCAN_INTERVAL)
                 continue
+
+            # ── SIGNAL CLEAN: prezzo non deve muoversi contro durante conferma ──
+            ref_px = _btc_sig_stable.get("ref_price", mid)
+            if ref_px > 0:
+                move = (mid - ref_px) / ref_px
+                if direction == "LONG" and move < -0.0007:
+                    log_btc(f"❌ Price moved against LONG ({move:+.2%}) — skip")
+                    continue
+                if direction == "SHORT" and move > 0.0007:
+                    log_btc(f"❌ Price moved against SHORT ({move:+.2%}) — skip")
+                    continue
 
             # ── STALE SIGNAL ──
             if time.time() - sig_ts > 25:
