@@ -63,14 +63,14 @@ BTC_SIGNAL_MAX_AGE = 30
 BTC_REGIME_INTERVAL = 300
 
 # ROE-based SL/TP — SL 
-ROE_TP = 0.15; ROE_SL = 0.10  
+ROE_TP = 0.10; ROE_SL = 0.05  
 TP_PRICE_PCT = ROE_TP / BTC_LEVERAGE  # 0.003 = 0.3%
 SL_PRICE_PCT = ROE_SL / BTC_LEVERAGE  # 0.003 = 0.3%
 
 RANGE_SL_ATR = 1.2; RANGE_TP_PCT = TP_PRICE_PCT
 RANGE_SL_MIN = 0.003; RANGE_SL_MAX = 0.006  # 0.3% - 0.6%
 TREND_SL_ATR = 1.2; TREND_TP_RR = 1.5  # R:R 1:1.5
-TREND_SL_MIN = 0.008; TREND_SL_MAX = 0.01
+TREND_SL_MIN = 0.004; TREND_SL_MAX = 0.008
 TREND_TRAIL_ATR = 0.7; TREND_PARTIAL = 0.4
 FLASH_SL_ATR = 1.0; FLASH_TP_PCT = TP_PRICE_PCT
 FLASH_SL_MIN = 0.002; FLASH_SL_MAX = 0.004  # 0.2% - 0.4% (flash = più stretto)
@@ -2071,12 +2071,15 @@ def check_signal():
     oi_chg = get_oi_change()
     details += f" FZ:{fz:+.1f} OI:{oi_chg:+.2%} [{scalp_mode}]"
 
-    # TP fissi: 0.5% e 0.8%, SL fisso: 0.8% (R:R 1:1 con TP2)
-    sl_dist = px * 0.008    # 0.8% — stessa distanza del TP2
+    # SL: ATR-based (rispetta il rumore reale del mercato)
+    # TP: fissi 0.5% e 0.8%
+    # SL = max(ATR×1.2, 0.4%) — mai più stretto del rumore, mai più largo di 1.5%
+    sl_dist = atr5 * 1.2
+    sl_dist = max(sl_dist, px * 0.004)   # floor 0.4% — minimo assoluto
+    sl_dist = min(sl_dist, px * 0.015)   # cap 1.5% — non troppo largo
     tp1_dist = px * 0.005   # 0.5%
     tp2_dist = px * 0.008   # 0.8%
 
-    sl_dist = max(sl_dist, px * 0.003)
     tp1_dist = max(tp1_dist, px * 0.003)
     tp2_dist = max(tp2_dist, px * 0.005)
 
@@ -2606,20 +2609,14 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
         try: call(_exchange.update_leverage, min(BTC_LEVERAGE, get_max_leverage()), BTC_COIN, is_cross=False, timeout=10)
         except: pass
 
-        # ── ENTRY: micro-retrace limit + fallback aggressivo ──
+        # ── ENTRY: aggressivo al mid — filla subito ──
         mid = get_mid()
         if mid <= 0:
             log_btc("❌ get_mid() failed"); return False
 
-        # Step 1: limit order al retrace (0.1% meglio del mid)
-        if is_long:
-            px = rpx(mid * 0.999, px_dec)   # 0.1% sotto — aspetta dip
-        else:
-            px = rpx(mid * 1.001, px_dec)   # 0.1% sopra — aspetta bounce
+        px = rpx(mid * (1.0003 if is_long else 0.9997), px_dec)
+        log_btc(f"{'🟢' if is_long else '🔴'} ORDER {direction} [{scalp_mode}] @ {px} size:{size}")
 
-        log_btc(f"{'🟢' if is_long else '🔴'} ORDER {direction} [{scalp_mode}] @ {px} (retrace) size:{size}")
-
-        # ── PLACE ORDER + WAIT 3s per fill ──
         res = call(_exchange.order, BTC_COIN, is_long, size, px,
                    {"limit": {"tif": "Gtc"}}, False, timeout=15)
 
@@ -2633,38 +2630,15 @@ def btc_open_trade(direction, sl, tp, entry_px, sl_dist, sz_dec, px_dec, size_mu
                     oid = s["resting"]["oid"]
 
         if not filled and oid:
-            for _ in range(6):  # 3s polling
+            for _ in range(4):
                 time.sleep(0.5)
                 p = get_position()
                 if p and abs(p.get("szi", 0)) > 0:
                     filled = True; break
-
-            # Step 2: fallback — cancel retrace, piazza aggressivo
             if not filled:
                 try: call(_exchange.cancel, BTC_COIN, oid, timeout=10)
                 except: pass
-                mid2 = get_mid()
-                if mid2 > 0:
-                    px2 = rpx(mid2 * (1.0003 if is_long else 0.9997), px_dec)
-                    log_btc(f"⚡ Retrace miss — fallback aggressivo @ {px2}")
-                    res = call(_exchange.order, BTC_COIN, is_long, size, px2,
-                               {"limit": {"tif": "Gtc"}}, False, timeout=15)
-                    if res and res.get("status") == "ok":
-                        for s in res.get("response", {}).get("data", {}).get("statuses", []):
-                            if "filled" in s:
-                                filled = True; break
-                            if "resting" in s:
-                                oid = s["resting"]["oid"]
-                    if not filled and oid:
-                        for _ in range(4):
-                            time.sleep(0.5)
-                            p = get_position()
-                            if p and abs(p.get("szi", 0)) > 0:
-                                filled = True; break
-                        if not filled:
-                            try: call(_exchange.cancel, BTC_COIN, oid, timeout=10)
-                            except: pass
-                            log_btc(f"❌ Not filled — cancelled"); return False
+                log_btc(f"❌ Not filled in 2s — cancelled"); return False
 
         if not filled:
             log_btc(f"❌ Order failed — res: {res}"); return False
@@ -2986,12 +2960,10 @@ def processor_thread(symbol, sz_dec, px_dec):
             if direction == "SHORT" and sentiment < 30:
                 continue
 
-            # ── ML FILTER ──
+            # ── ML TRACKING (solo log, non blocca) ──
             if ml_features:
                 ml_result = ml_predict_signal(ml_features)
-                if ml_result.get("block"):
-                    log_btc(f"🤖 ML BLOCK P(win)={ml_result['prob']:.0%}")
-                    continue
+                log_btc(f"🤖 ML: P(win)={ml_result.get('prob',0):.0%} samples:{ml_result.get('n_samples',0)}")
 
             # ── MAX TRADES / H ──
             now = time.time()
@@ -3010,14 +2982,10 @@ def processor_thread(symbol, sz_dec, px_dec):
             if trades_today_count >= 20:
                 continue
 
-            # ── EXECUTE: micro pullback entry ──
+            # ── EXECUTE: entry aggressivo al mid ──
             entry_exec = get_mid()
             if entry_exec <= 0:
                 continue
-            if direction == "LONG":
-                entry_exec *= 0.999   # 0.1% sotto — aspetta micro dip
-            else:
-                entry_exec *= 1.001   # 0.1% sopra — aspetta micro bounce
             entry_exec = rpx(entry_exec, px_dec)
 
             log_btc(f"⚡ EXEC {direction} [{scalp_mode}] @ {entry_exec:,.0f}")
