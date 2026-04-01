@@ -3310,8 +3310,8 @@ def processor_thread(symbol, sz_dec, px_dec):
     - Pronto per multi-coin
     """
 
-    global _current_signal, _last_trade_ts, _is_trading
-    global _start_balance, _kill_switch
+    global _btc_current_signal, _btc_last_trade_ts, _btc_is_trading
+    global _btc_start_balance, _btc_kill_switch
 
     log_btc(f"[{symbol}] Processor avviato — attendo Scanner...")
     _btc_scanner_ready.wait()
@@ -3319,56 +3319,56 @@ def processor_thread(symbol, sz_dec, px_dec):
 
     while True:
         try:
-            pos = get_position(symbol)
-            mid = get_mid(symbol)
+            pos = get_position()
+            mid = get_mid()
 
             # ── SE IN POSIZIONE ──
             if pos is not None:
-                time.sleep(SCAN_INTERVAL)
+                time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
             # ── KILL SWITCH / CIRCUIT BREAKER ──
             ks, _ = fleet_check_kill_switch()
             if ks:
-                time.sleep(SCAN_INTERVAL)
+                time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
             cb, _ = check_circuit_breaker()
             if cb:
-                time.sleep(SCAN_INTERVAL)
+                time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
             # ── COOLDOWN ──
-            if time.time() - _last_trade_ts < COOLDOWN_SEC:
-                time.sleep(SCAN_INTERVAL)
+            if time.time() - _btc_last_trade_ts < BTC_COOLDOWN_SEC:
+                time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
-            if _is_trading:
-                time.sleep(SCAN_INTERVAL)
+            if _btc_is_trading:
+                time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
             # ── DAILY LOSS KILL SWITCH ──
             bal = get_balance()
 
-            if _start_balance is None:
-                _start_balance = bal
+            if _btc_start_balance is None:
+                _btc_start_balance = bal
                 log_btc(f"[{symbol}] Start balance: ${bal:.2f}")
 
-            if bal > 0 and _start_balance > 0:
-                loss_pct = (1 - bal / _start_balance) * 100
+            if bal > 0 and _btc_start_balance > 0:
+                loss_pct = (1 - bal / _btc_start_balance) * 100
 
                 if loss_pct >= MAX_DAILY_LOSS_PCT:
-                    if not _kill_switch:
-                        _kill_switch = True
+                    if not _btc_kill_switch:
+                        _btc_kill_switch = True
                         log_btc(f"[{symbol}] 🛑 KILL SWITCH {loss_pct:.1f}%")
 
-            if _kill_switch:
+            if _btc_kill_switch:
                 time.sleep(300)
 
                 now = datetime.now(timezone.utc)
                 if now.hour == 0 and now.minute < 5:
-                    _kill_switch = False
-                    _start_balance = bal
+                    _btc_kill_switch = False
+                    _btc_start_balance = bal
                     log_btc(f"[{symbol}] Kill switch reset")
 
                 continue
@@ -3379,7 +3379,7 @@ def processor_thread(symbol, sz_dec, px_dec):
 
             if sig is None:
                 log_btc(f"[{symbol}] no signal | ${mid:,.0f}")
-                time.sleep(SCAN_INTERVAL)
+                time.sleep(BTC_SCAN_INTERVAL)
                 continue
 
             (
@@ -3393,7 +3393,7 @@ def processor_thread(symbol, sz_dec, px_dec):
                 log_btc(f"[{symbol}] ⚠️ Signal stale")
                 continue
 
-            if not is_funding_ok(symbol, direction):
+            if not is_funding_ok(direction):
                 continue
 
             # ── PRICE CONFIRMATION V2 (robusta) ──
@@ -3524,7 +3524,7 @@ def processor_thread(symbol, sz_dec, px_dec):
             import traceback
             traceback.print_exc()
 
-        time.sleep(SCAN_INTERVAL)
+        time.sleep(BTC_SCAN_INTERVAL)
 
 # ================================================================
 # ALTCOIN PROCESSOR V7.5 (FAST ENTRY + POST-CONFIRM)
