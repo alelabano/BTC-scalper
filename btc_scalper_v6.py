@@ -85,7 +85,7 @@ FUNDING_BLOCK_THRESH = 0.0003
 SLIPPAGE = 0.001; GTC_TIMEOUT = 6
 DRIFT_MAX_FAVORABLE = 0.004; DRIFT_MAX_ADVERSE = 0.008
 PENDING_ORDER_TTL = 120
-MAX_DAILY_LOSS = 20.0; MAX_CONSEC_LOSS = 2
+MAX_DAILY_LOSS = 20.0; MAX_CONSEC_LOSS = 4
 DAILY_REPORT_HOUR = 0
 CONFIRMATION_SECONDS = 2
 
@@ -114,7 +114,7 @@ CONFIRMATION_SECONDS_ALT = 30    # Tempo per confermare la bontà dell'entry
 
 # ── Unified Executor Config ─────────────────────────────────────
 ALT_MAX_CONCURRENT = 2         # max altcoin positions
-ALT_TRADE_SIZE_USD = 2.5  # overridden by balance % in execute
+ALT_TRADE_SIZE_USD = 5.0  # overridden by balance % in execute
 ALT_LEVERAGE = 5
 ALT_CHECK_INTERVAL = 2
 ALT_SIGNAL_MAX_AGE = 3 * 60
