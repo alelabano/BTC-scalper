@@ -1594,22 +1594,22 @@ def run_backtest():
         # PULLBACK LONG: BULL setup + RSI pullback + MACD accelera
         ("PULLBACK_LONG", "LONG", lambda i: (
             ema9_1h[i] > ema21_1h[i] and
-            35 <= rsi5[i] <= 62 and macd5[i] > macd5[i-1] and slope5[i] > 0 and vol5[i] >= 0.3
+            44 <= rsi5[i] <= 58 and macd5[i] > macd5[i-1] and slope5[i] > 0 and vol5[i] >= 0.3
         )),
         # BREAKOUT LONG: BULL setup + HH + volume
         ("BREAKOUT_LONG", "LONG", lambda i: (
             ema9_1h[i] > ema21_1h[i] and
-            rsi5[i] > 50 and rsi5[i] < 80 and macd5[i] > 0 and hh[i] > 0 and vol5[i] >= 0.8
+            rsi5[i] > 55 and rsi5[i] < 70 and macd5[i] > 0 and hh[i] > 0 and vol5[i] >= 0.8
         )),
         # PULLBACK SHORT: BEAR setup + RSI rally + MACD decelera
         ("PULLBACK_SHORT", "SHORT", lambda i: (
             ema9_1h[i] < ema21_1h[i] and
-            38 <= rsi5[i] <= 65 and macd5[i] < macd5[i-1] and slope5[i] < 0 and vol5[i] >= 0.3
+            42 <= rsi5[i] <= 56 and macd5[i] < macd5[i-1] and slope5[i] < 0 and vol5[i] >= 0.3
         )),
         # BREAKDOWN SHORT: BEAR setup + LL + volume
         ("BREAKDOWN_SHORT", "SHORT", lambda i: (
             ema9_1h[i] < ema21_1h[i] and
-            rsi5[i] < 50 and rsi5[i] > 20 and macd5[i] < 0 and ll[i] > 0 and vol5[i] >= 0.8
+            rsi5[i] < 45 and rsi5[i] > 30 and macd5[i] < 0 and ll[i] > 0 and vol5[i] >= 0.8
         )),
         # REVERSAL LONG: RSI 1h basso + 5m inversione
         ("REVERSAL_LONG", "LONG", lambda i: (
@@ -1617,7 +1617,7 @@ def run_backtest():
         )),
         # REVERSAL SHORT: RSI 1h alto + 5m inversione
         ("REVERSAL_SHORT", "SHORT", lambda i: (
-            rsi1h[i] > 62 and rsi5[i] > 65 and macd5[i] < macd5[i-1] and slope5[i] < 0.001
+            rsi1h[i] > 65 and rsi5[i] > 75 and macd5[i] < macd5[i-1] and slope5[i] < 0.001
         )),
     ]:
         trades = []
