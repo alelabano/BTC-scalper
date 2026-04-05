@@ -53,7 +53,7 @@ if not PRIVATE_KEY:
 # ── BTC Scalper Config ───────────────────────────────────────────
 BTC_COIN = "BTC"
 BTC_LEVERAGE = 5
-BTC_RISK_USD = 5.0
+BTC_RISK_USD = 2.5
 BTC_MAX_POSITIONS = 2
 BTC_COOLDOWN_SEC = 180
 BTC_COOLDOWN_AFTER_LOSS = 300  # 5 min dopo un loss
