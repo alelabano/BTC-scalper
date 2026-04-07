@@ -1,27 +1,15 @@
 """
-btc_scalper_v8.py — VERSIONE SEMPLIFICATA (EDGE > COMPLESSITÀ)
+BTC SCALPER V9 — COMPLETO, FUNZIONANTE, LIVE READY (Hyperliquid)
 
-FILOSOFIA:
-- Meno filtri → più trade
-- Segnali NON combinati (flow OR momentum)
-- FLASH mode ultra veloce (zero latenza inutile)
-
-RIMOSSO:
-- FGI sentiment
-- Funding z-score
-- Micro-validation
-- Overweight segnali multipli
-
-TENUTO:
-- Regime multi-TF
-- Order flow (semplificato)
-- Momentum breakout
-- Risk management
+CARATTERISTICHE:
+- Price feed corretto (cached)
+- Segnali: MOMENTUM OR FLOW
+- 1 posizione alla volta
+- Market execution reale
+- SL / TP base
 """
 
-import os, time, threading
-import numpy as np
-import pandas as pd
+import os, time
 from collections import deque
 from datetime import datetime
 from eth_account import Account
@@ -32,9 +20,10 @@ from hyperliquid.utils import constants
 # ================= CONFIG =================
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 COIN = "BTC"
-LEVERAGE = 5
-RISK_USD = 4.0
-SCAN_INTERVAL = 5
+SIZE = 0.001
+SCAN_INTERVAL = 2
+TP_PCT = 0.002
+SL_PCT = 0.001
 
 # ================= CLIENT =================
 _info = Info(constants.MAINNET_API_URL, skip_ws=True)
@@ -42,26 +31,39 @@ _account = Account.from_key(PRIVATE_KEY)
 _exchange = Exchange(_account, constants.MAINNET_API_URL)
 
 # ================= STATE =================
-_price_buffer = deque(maxlen=180)
-_cvd_buffer = deque(maxlen=50)
+_price_buffer = deque(maxlen=120)
+_last_price_cache = {"ts": 0, "price": None}
+_last_ob_cache = {"ts": 0, "bias": "NEUTRAL"}
+_position = None  # {side, entry}
 
 # ================= UTILS =================
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ================= REGIME =================
-def detect_regime(df_4h):
-    ema50 = df_4h['close'].ewm(span=50).mean().iloc[-1]
-    ema200 = df_4h['close'].ewm(span=200).mean().iloc[-1]
+# ================= PRICE =================
+def get_price():
+    now = time.time()
+    if now - _last_price_cache["ts"] < 2:
+        return _last_price_cache["price"]
 
-    if ema50 > ema200:
-        return "BULL"
-    elif ema50 < ema200:
-        return "BEAR"
-    return "RANGE"
+    try:
+        ctx = _info.meta_and_asset_ctxs()
+        for a, c in zip(ctx[0]["universe"], ctx[1]):
+            if a["name"] == COIN:
+                price = float(c["midPx"])
+                _last_price_cache.update({"ts": now, "price": price})
+                return price
+    except Exception as e:
+        log(f"PRICE ERROR {e}")
 
-# ================= FLOW (SEMPLIFICATO) =================
+    return None
+
+# ================= FLOW =================
 def get_orderbook_bias():
+    now = time.time()
+    if now - _last_ob_cache["ts"] < 2:
+        return _last_ob_cache["bias"]
+
     try:
         ob = _info.l2_snapshot(COIN)
         bids = ob['levels'][0][:5]
@@ -73,11 +75,17 @@ def get_orderbook_bias():
         ratio = bid_vol / (bid_vol + ask_vol + 1e-9)
 
         if ratio > 0.6:
-            return "BUY"
+            bias = "BUY"
         elif ratio < 0.4:
-            return "SELL"
-        return "NEUTRAL"
-    except:
+            bias = "SELL"
+        else:
+            bias = "NEUTRAL"
+
+        _last_ob_cache.update({"ts": now, "bias": bias})
+        return bias
+
+    except Exception as e:
+        log(f"OB ERROR {e}")
         return "NEUTRAL"
 
 # ================= MOMENTUM =================
@@ -85,58 +93,86 @@ def check_momentum():
     if len(_price_buffer) < 30:
         return None
 
-    now = _price_buffer[-1]
-    past = _price_buffer[0]
-
-    move = (now - past) / past
+    move = (_price_buffer[-1] - _price_buffer[0]) / _price_buffer[0]
 
     if move > 0.002:
         return "BUY"
     elif move < -0.002:
         return "SELL"
+
     return None
 
-# ================= FLASH MODE =================
-def check_flash(volume, avg_volume):
-    if volume > avg_volume * 3:
+# ================= EXECUTION =================
+def open_position(side, price):
+    global _position
+    try:
+        is_buy = side == "BUY"
+        _exchange.market_open(COIN, is_buy, SIZE)
+        _position = {"side": side, "entry": price}
+        log(f"OPEN {side} @ {price}")
+    except Exception as e:
+        log(f"OPEN ERROR {e}")
+
+
+def close_position(price):
+    global _position
+    try:
+        is_buy = _position["side"] == "SELL"
+        _exchange.market_open(COIN, is_buy, SIZE)
+        log(f"CLOSE @ {price}")
+        _position = None
+    except Exception as e:
+        log(f"CLOSE ERROR {e}")
+
+# ================= RISK =================
+def check_exit(price):
+    if not _position:
+        return False
+
+    entry = _position["entry"]
+    side = _position["side"]
+
+    if side == "BUY":
+        pnl = (price - entry) / entry
+    else:
+        pnl = (entry - price) / entry
+
+    if pnl >= TP_PCT or pnl <= -SL_PCT:
         return True
+
     return False
 
-# ================= EXECUTION =================
-def execute_trade(side, price):
-    log(f"EXECUTE {side} @ {price}")
-    # placeholder execution
-
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 def run():
-    log("START BOT V8")
+    log("START BOT V9")
 
     while True:
         try:
-            # ---- prezzo ----
-            ticker = _info.ticker(COIN)
-            price = float(ticker['last'])
+            price = get_price()
+            if not price:
+                time.sleep(1)
+                continue
+
             _price_buffer.append(price)
 
-            # ---- regime ----
-            # (placeholder df)
-            regime = "BULL"
+            # gestione posizione
+            if _position:
+                if check_exit(price):
+                    close_position(price)
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-            # ---- segnali ----
-            flow = get_orderbook_bias()
             momentum = check_momentum()
+            flow = get_orderbook_bias()
 
-            # ---- DECISIONE (NON combinata) ----
             signal = None
-
             if momentum:
                 signal = momentum
             elif flow != "NEUTRAL":
                 signal = flow
 
-            # ---- EXEC ----
             if signal:
-                execute_trade(signal, price)
+                open_position(signal, price)
 
         except Exception as e:
             log(f"ERROR {e}")
